@@ -7,7 +7,7 @@ from pyrogram import ContinuePropagation, StopPropagation
 from pyrogram import Client, filters
 from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton,
-    CallbackQuery, LinkPreviewOptions
+    CallbackQuery
 )
 from database.db import db
 from plugins.state import get_state as _get_state_fn, set_state as _set_state_fn, clear_state as _clear_state_fn
@@ -24,9 +24,6 @@ ADMIN_ID = [int(x.strip()) for x in os.getenv("ADMIN_ID", "0").split(",") if x.s
 _BACK_BTN = InlineKeyboardMarkup([
     [InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="back_to_admin")]
 ])
-
-# link_preview_options replacement for deprecated disable_web_page_preview
-_NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 
 def _get_state(admin_id):
@@ -48,9 +45,6 @@ async def get_admin_menu_data():
     fsub_status = f"✅ Active ({fsub_count} ch)" if fsub_count > 0 else "⚫ Disabled"
 
     # BUG FIX #1 + #7: Unified single read per field.
-    # Previously the status check used config.get('log_channel') which returns 0 for
-    # unset, and 0 is falsy — so it showed ❌ Missing even after saving a valid ID.
-    # Now we explicitly check for None/0/"" so a real channel ID always shows ✅.
     log_val = config.get('log_channel')
     log_display = f"`{log_val}`" if log_val not in [None, 0, ""] else "`Not Set`"
     log_status = "✅ Set" if log_val not in [None, 0, ""] else "❌ Missing"
@@ -107,10 +101,9 @@ async def get_admin_menu_data():
 @Client.on_message(filters.command("admin") & filters.private & filters.user(ADMIN_ID))
 async def admin_panel(client: Client, message: Message):
     text, markup = await get_admin_menu_data()
-    # FIX: replaced deprecated disable_web_page_preview with link_preview_options
     await message.reply_text(
         text=text, reply_markup=markup, quote=True,
-        link_preview_options=_NO_PREVIEW
+        disable_web_page_preview=True
     )
 
 
@@ -120,13 +113,13 @@ async def back_to_admin(client: Client, callback: CallbackQuery):
     try:
         await callback.message.edit_text(
             text=text, reply_markup=markup,
-            link_preview_options=_NO_PREVIEW
+            disable_web_page_preview=True
         )
     except Exception:
         # If the message is a media type (photo/video) we can't edit_text — send fresh
         await callback.message.reply_text(
             text=text, reply_markup=markup,
-            link_preview_options=_NO_PREVIEW
+            disable_web_page_preview=True
         )
     await callback.answer()
 
@@ -375,7 +368,6 @@ async def catch_admin_input(client: Client, message: Message):
 
     if state == "maingroup":
         await db.update_config("main_group", message.text.strip())
-        # DEAD END FIX #2: back button on every success reply
         await message.reply_text(
             "✅ **Main Group Link Successfully Updated!**",
             reply_markup=_BACK_BTN
@@ -399,7 +391,6 @@ async def catch_admin_input(client: Client, message: Message):
                 reply_markup=_BACK_BTN
             )
         except Exception as e:
-            # DEAD END FIX #4: back button on error replies too
             await message.reply_text(
                 f"❌ **Failed!** Make sure I am an Admin in that channel.\nError: `{e}`",
                 reply_markup=_BACK_BTN
@@ -434,11 +425,9 @@ async def catch_admin_input(client: Client, message: Message):
         )
 
     elif state == "addfsub":
-        # Join channel: admin sends the channel ID — verify bot is admin there
         try:
             raw = message.text.strip()
             ch_val = int(raw) if raw.lstrip('-').isdigit() else raw
-            # Verify bot is an admin in the channel
             member = await client.get_chat_member(ch_val, client.me.id)
             if member.status.name not in ["ADMINISTRATOR", "CREATOR"]:
                 await message.reply_text(
@@ -561,10 +550,6 @@ async def catch_admin_input(client: Client, message: Message):
     raise StopPropagation
 
 
-# ── EXPLICIT /cancel COMMAND ─────────────────────────────────────────────────
-# Handles /cancel as a real command so it NEVER leaks to filter.py as a search query.
-# This is registered with group=0 (highest priority) so it fires first.
-
 @Client.on_message(filters.command("cancel") & filters.private & filters.user(ADMIN_ID), group=0)
 async def cancel_cmd(client: Client, message: Message):
     from plugins.state import clear_state as _cs
@@ -572,8 +557,6 @@ async def cancel_cmd(client: Client, message: Message):
     await message.reply_text("🚫 **Cancelled.**", reply_markup=_BACK_BTN)
     raise StopPropagation
 
-
-# ── SECURITY COMMANDS ─────────────────────────────────────────────────────────
 
 @Client.on_message(filters.command("ban") & filters.private & filters.user(ADMIN_ID))
 async def ban_user_cmd(client: Client, message: Message):
@@ -593,12 +576,6 @@ async def unban_user_cmd(client: Client, message: Message):
     await message.reply_text(f"✅ **User `{user_id}` has been unbanned.**")
 
 
-# ── DELETION COMMANDS ─────────────────────────────────────────────────────────
-
-# /purge_cams removed — use File Manager → Bulk Delete with pattern "CAM|PreDVD|HDCAM"
-# A "Quick Purge CAMs" shortcut is available in the File Manager for one-tap CAM purge.
-
-
 @Client.on_message(filters.command("reset_db") & filters.private & filters.user(ADMIN_ID))
 async def reset_db_cmd(client: Client, message: Message):
     await message.reply_text(
@@ -615,11 +592,6 @@ async def confirm_reset_cmd(client: Client, message: Message):
     await db.reset_database()
     await status.edit_text("✅ **Database has been completely wiped.** You now have a clean slate.")
 
-
-
-
-# ── /stats COMMAND ────────────────────────────────────────────────────────────
-# Quick stats for admin — works instantly on mobile without opening the full panel
 
 @Client.on_message(filters.command("stats") & filters.private & filters.user(ADMIN_ID))
 async def stats_cmd(client: Client, message: Message):
@@ -641,9 +613,6 @@ async def stats_cmd(client: Client, message: Message):
 
     await msg.edit_text(text)
 
-
-# ── /help COMMAND ─────────────────────────────────────────────────────────────
-# Works in both PM and groups. In groups it auto-deletes after 30 seconds.
 
 @Client.on_message(filters.command("help"))
 async def help_cmd(client: Client, message: Message):
@@ -679,8 +648,6 @@ async def help_cmd(client: Client, message: Message):
         quote=True
     )
 
-    # Auto-delete in groups after 30 seconds — fire-and-forget so the
-    # handler returns immediately instead of blocking for 30 seconds
     if is_group:
         async def _delete_help(hm, om):
             await asyncio.sleep(30)
@@ -690,10 +657,6 @@ async def help_cmd(client: Client, message: Message):
             except Exception:
                 pass
         asyncio.create_task(_delete_help(help_msg, message))
-# ── FSub REFRESH JOIN LINKS ──────────────────────────────────────────────────
-# Forces regeneration of join channel invite links.
-# Use this if a join channel's link has expired or been manually revoked.
-# Note: this will revoke the current stored link and create a new one.
 
 @Client.on_callback_query(filters.regex(r"^fsub_refresh_links$") & filters.user(ADMIN_ID))
 async def fsub_refresh_links(client: Client, callback: CallbackQuery):
@@ -718,9 +681,6 @@ async def fsub_refresh_links(client: Client, callback: CallbackQuery):
 
         ch_str = str(ch_id).strip()
 
-        # Public @username channels never need invite links — skip them.
-        # export_chat_invite_link on a public channel stores a private invite
-        # link which can expire, replacing the working @username link.
         if ch_str.startswith("@") or not ch_str.startswith("-100"):
             skipped += 1
             continue
@@ -746,11 +706,8 @@ async def fsub_refresh_links(client: Client, callback: CallbackQuery):
     )
 
 
-# ── CHANNEL HEALTH CHECK ──────────────────────────────────────────────────────
-
 @Client.on_callback_query(filters.regex(r"^channel_health_check$") & filters.user(ADMIN_ID))
 async def channel_health_check(client: Client, callback: CallbackQuery):
-    """Uses shared check_all_channels() from health_monitor — no duplicate logic."""
     from plugins.health_monitor import check_all_channels
     await callback.message.edit_text("🔍 **Running channel health check...**")
     await callback.answer()
@@ -767,23 +724,16 @@ async def channel_health_check(client: Client, callback: CallbackQuery):
         await callback.message.edit_text(report_text[:4000] + "\n...", reply_markup=markup)
 
 
-# ── CLOSE PANEL ───────────────────────────────────────────────────────────────
-# FIX #8: Only ONE close_data handler exists now — the duplicate in index.py is removed.
-
-# ── C1: MAINTENANCE MODE TOGGLE ──────────────────────────────────────────────
-
 @Client.on_callback_query(filters.regex(r"^admin_toggle_maintenance$") & filters.user(ADMIN_ID))
 async def toggle_maintenance(client: Client, callback: CallbackQuery):
     config = await db.get_config()
     current = config.get("maintenance_mode", False)
     new_val = not current
     await db.update_config("maintenance_mode", new_val)
-    status = "🔧 **Maintenance Mode ON**\n\nUsers will see the maintenance message."         if new_val else "✅ **Maintenance Mode OFF**\n\nBot is live again."
+    status = "🔧 **Maintenance Mode ON**\n\nUsers will see the maintenance message." if new_val else "✅ **Maintenance Mode OFF**\n\nBot is live again."
     await callback.answer(f"{'ON' if new_val else 'OFF'}", show_alert=False)
     await callback.message.reply_text(status, reply_markup=_BACK_BTN)
 
-
-# ── C9: EXPORT CONFIG ─────────────────────────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^admin_export_config$") & filters.user(ADMIN_ID))
 async def export_config(client: Client, callback: CallbackQuery):
@@ -799,8 +749,6 @@ async def export_config(client: Client, callback: CallbackQuery):
                 "Use Restore Config to apply it."
     )
 
-
-# ── C10: RESTORE CONFIG ───────────────────────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^admin_restore_config$") & filters.user(ADMIN_ID))
 async def restore_config_prompt(client: Client, callback: CallbackQuery):
@@ -852,8 +800,6 @@ async def handle_config_restore_file(client: Client, message: Message):
             reply_markup=_BACK_BTN
         )
 
-
-# ── CLOSE PANEL ───────────────────────────────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^close_data$") & filters.user(ADMIN_ID))
 async def close_callback(client: Client, callback: CallbackQuery):
