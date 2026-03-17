@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://files.catbox.moe/e3b5ym.mp4" alt="MCCxBot Banner" width="600"/>
+<img src="https://files.catbox.moe/4efq8t.jpg" alt="MCCxBot Banner" width="600"/>
 
 # 🎬 MCCxBot
 ### Malayalam Cinema Club — Auto Filter & File Delivery Bot
@@ -204,7 +204,7 @@ After deploying, do these steps once:
 
 ## 🙏 Credits
 
-**Built by:** [joe7](https://t.me/joe7) — Malayalam Cinema Club
+**Built by:** [joe7](https://t.me/meencurry) — Malayalam Cinema Club
 
 **Powered by:**
 - [Pyrogram](https://pyrogram.org) — Telegram MTProto framework
