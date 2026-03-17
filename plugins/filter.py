@@ -12,7 +12,7 @@ from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
 from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton,
-    CallbackQuery, LinkPreviewOptions
+    CallbackQuery
 )
 from database.db import db
 from utils import is_subscribed, is_subscribed_join_only, send_fsub_message
@@ -22,30 +22,22 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# MISSED_CACHE removed — db.log_missed_search() now handles deduplication
-# with a per-query 1-hour cooldown stored in MongoDB.
-MISSED_CACHE = set()  # kept as empty set — group_connect.py imports it
+MISSED_CACHE = set()  
 
 IGNORE_WORDS = {"hi", "hello", "bro", "pls", "plz", "bot", "help", "admin", "sir"}
 
-# FIX #16: USER_SEARCH_COOLDOWN capped to prevent unbounded RAM growth.
 _COOLDOWN_MAX = 10000
 USER_SEARCH_COOLDOWN = {}
 COOLDOWN_TIME = 2
-
-# Replaces deprecated disable_web_page_preview throughout this file
-_NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
-
 
 async def send_smart_log(client, text):
     try:
         config = await db.get_config()
         log_chat = config.get("log_channel", 0)
         if log_chat:
-            # FIX deprecated: replaced disable_web_page_preview with link_preview_options
             await client.send_message(
                 log_chat, text,
-                link_preview_options=_NO_PREVIEW
+                disable_web_page_preview=True
             )
     except FloodWait:
         pass
@@ -90,7 +82,6 @@ def extract_attributes(filename):
     return lang, qual
 
 
-# FIX #3 & #4: Background tasks for auto-delete — no longer block the event loop.
 async def _auto_delete_search(status_msg, original_msg, manual_query):
     await asyncio.sleep(300)
     try:
@@ -105,11 +96,6 @@ async def _auto_delete_search(status_msg, original_msg, manual_query):
 
 
 async def _auto_delete_file(sent_msg, file_name, bot_username, delete_seconds=300):
-    """
-    Auto-deletes a sent file after delete_seconds.
-    Shows a 1-minute warning before deletion using the actual configured time.
-    """
-    # Sleep for (total - 60) seconds, then warn, then delete after 60 more
     warn_sleep = max(delete_seconds - 60, 30)
     await asyncio.sleep(warn_sleep)
     try:
@@ -131,8 +117,6 @@ async def _auto_delete_file(sent_msg, file_name, bot_username, delete_seconds=30
         pass
 
 
-# ── PRIVATE SEARCH HANDLER ────────────────────────────────────────────────────
-
 @Client.on_message(
     filters.text & filters.private &
     ~filters.command(["start", "help", "about", "admin", "broadcast", "ban", "unban", "purge_cams", "reset_db"])
@@ -140,11 +124,9 @@ async def _auto_delete_file(sent_msg, file_name, bot_username, delete_seconds=30
 async def auto_filter(client: Client, message: Message, manual_query=None):
     user_id = message.from_user.id
 
-    # FIX #20: Ban enforcement — was completely missing before
     if await db.is_banned(user_id):
         return await message.reply_text("🚫 **You are banned from using this bot.**", quote=True)
 
-    # C1: Maintenance mode — admin exempt
     _cm_config = await db.get_config()
     if _cm_config.get("maintenance_mode") and user_id != int(os.getenv("ADMIN_ID", 0)):
         return await message.reply_text(
@@ -152,12 +134,10 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
             quote=True
         )
 
-    # Gate 1: join channels only — user must join public/private channels to search
     if not await is_subscribed_join_only(client, message):
         await send_fsub_message(client, message)
         return
 
-    # Anti-Spam Rate Limiter
     current_time = time.time()
     if user_id in USER_SEARCH_COOLDOWN:
         time_passed = current_time - USER_SEARCH_COOLDOWN[user_id]
@@ -173,7 +153,6 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
                 pass
             return
 
-    # FIX #16: Cap dict to prevent unbounded RAM growth
     if len(USER_SEARCH_COOLDOWN) >= _COOLDOWN_MAX:
         USER_SEARCH_COOLDOWN.clear()
     USER_SEARCH_COOLDOWN[user_id] = current_time
@@ -201,7 +180,6 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
             )
             return
 
-    # S4: Extract quality/language preset from raw query
     raw_query_text = manual_query or (message.text if message.text else "")
     preset_qual = None
     preset_lang = None
@@ -228,8 +206,6 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
         google_url = f"https://www.google.com/search?q={quote(query)}"
         safe_query = query[:40]
 
-        # F9: Log to MongoDB — returns True if log channel alert should be sent
-        # (deduplicates alerts with 1-hour cooldown, replaces old MISSED_CACHE RAM set)
         should_alert = await db.log_missed_search(query)
         if should_alert:
             asyncio.create_task(send_smart_log(
@@ -238,7 +214,6 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
                 f"👤 **Requested by:** {message.from_user.mention}\n📍 **Where:** Private Chat\n"
             ))
 
-        # S10: Spell correction — suggest similar titles via prefix match
         suggestions = await db.get_prefix_suggestions(query, limit=3)
         suggestion_buttons = []
         for sug in suggestions:
@@ -262,7 +237,7 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
         )
         return await message.reply_text(
             text, reply_markup=InlineKeyboardMarkup(suggestion_buttons),
-            link_preview_options=_NO_PREVIEW,
+            disable_web_page_preview=True,
             parse_mode=ParseMode.HTML
         )
 
@@ -281,19 +256,12 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
     await db.save_search(session_id, session_data)
 
     status_msg = await message.reply_text("🔍", quote=True)
-    # S4: pass presets. If only quality is preset (no lang), use MIXED for lang
-    # so route_menu skips the language step and goes straight to quality-filtered results.
-    # If only lang is preset, pass ALL for qual so quality step shows for that lang.
-    # If both are preset, pass both and go straight to file list.
     lang_arg = preset_lang if preset_lang else ("MIXED" if preset_qual else "ALL")
     qual_arg = preset_qual if preset_qual else "ALL"
     await route_menu(client, status_msg, session_id, lang_arg, qual_arg, 0)
 
-    # FIX #4: Fire-and-forget instead of blocking handler for 5 minutes
     asyncio.create_task(_auto_delete_search(status_msg, message, manual_query))
 
-
-# ── SEARCH RESULT MENU ────────────────────────────────────────────────────────
 
 async def route_menu(client, message, session_id, lang, qual, page):
     data = await db.get_search(session_id)
@@ -432,8 +400,6 @@ async def route_menu(client, message, session_id, lang, qual, page):
         logger.error(f"UI Route Error: {e}")
 
 
-# ── CALLBACK HANDLERS ─────────────────────────────────────────────────────────
-
 @Client.on_callback_query(filters.regex(r"^lang#"))
 async def handle_language(client: Client, callback: CallbackQuery):
     _, session_id, lang = callback.data.split("#")
@@ -461,7 +427,6 @@ async def handle_ignore(client: Client, callback: CallbackQuery):
 
 
 def _build_caption(config, file_data, delete_minutes, bot_username):
-    """C6: Builds file caption from template or falls back to default."""
     template = config.get("file_caption_template", "")
     if template:
         f_lang, f_qual = extract_attributes(file_data.get("file_name", ""))
@@ -477,7 +442,7 @@ def _build_caption(config, file_data, delete_minutes, bot_username):
                 delete_minutes=delete_minutes
             )
         except (KeyError, ValueError):
-            pass  # Bad template — fall through to default
+            pass  
     return (
         f"🍿 <b>{file_data['file_name']}</b>\n\n"
         f"<blockquote>⏳ Auto-deletes in <b>{delete_minutes} minutes</b>\n"
@@ -496,12 +461,10 @@ async def send_movie_file(client: Client, callback: CallbackQuery):
             "⚠️ This file is no longer available in the database.", show_alert=True
         )
 
-    # Gate 1: join channels — catches users coming from group buttons who bypassed PM search
     if not await is_subscribed_join_only(client, callback):
         await callback.answer("🔐 Please join our channel first!", show_alert=False)
         await send_fsub_message(client, callback.message, pending_file_id=file_obj_id)
         return
-
 
     await callback.answer("📤 Sending file... Please wait!", show_alert=False)
 
@@ -536,11 +499,6 @@ async def send_movie_file(client: Client, callback: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^check_fsub#"))
 async def check_fsub_callback(client: Client, callback: CallbackQuery):
-    """
-    Handles FSub verification. callback_data format: check_fsub#<file_id_or_none>
-    If a file_id is present, the file is sent automatically after successful verification
-    so the user doesn't have to tap the button again.
-    """
     file_part = callback.data.split("#")[1]
     pending_file_id = file_part if file_part != "none" else None
 
@@ -552,11 +510,9 @@ async def check_fsub_callback(client: Client, callback: CallbackQuery):
         )
         return
 
-    # All gates passed — delete the FSub prompt
     await callback.message.delete()
 
     if pending_file_id:
-        # User was trying to get a file — send it now automatically
         file_data = await db.get_file(pending_file_id)
         if not file_data:
             await callback.message.reply_text(
@@ -592,21 +548,8 @@ async def check_fsub_callback(client: Client, callback: CallbackQuery):
             else:
                 await callback.message.reply_text("❌ Could not send file. Please try again.")
     else:
-        # No pending file — just confirm they can now search
         await callback.message.reply_text(
             "✅ **Verification Successful!**\n\n"
             "<blockquote>You're all set! Type any movie or series name to search.</blockquote>",
             parse_mode=ParseMode.HTML
         )
-
-
-# ── ISSUE #15 FIX ─────────────────────────────────────────────────────────────
-# Removed group_filter_handler from this file entirely.
-# group_connect.py already handles all group message logic (chat word filtering,
-# search, not-found, request button). Having it here too caused double MongoDB
-# queries on every single group message. group_connect.py is the single source of truth.
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-# FIX #9: Duplicate reqmovie# handler also removed.
-# Canonical handler with full ticket system lives in request.py.
