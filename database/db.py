@@ -942,6 +942,99 @@ class Database:
 
     # ── PENDING REQUESTS ──────────────────────────────────────────────────────
 
+    # ── REQUEST FSub CHANNELS ─────────────────────────────────────────────────
+    # Separate pool from main FSub. Up to 5 private channels.
+    # One random channel shown per prompt. Timer tracked per user.
+
+    async def add_req_fsub_channel(self, channel_id):
+        if self.config_col is None:
+            return False, "No DB"
+        config = await self.config_col.find_one({"_id": "bot_config"})
+        existing = config.get("req_fsub_channels", []) if config else []
+        if len(existing) >= 5:
+            return False, "Max 5 reached"
+        for e in existing:
+            eid = e.get("id") if isinstance(e, dict) else e
+            if str(eid) == str(channel_id):
+                return False, "Already exists"
+        await self.config_col.update_one(
+            {"_id": "bot_config"},
+            {"$push": {"req_fsub_channels": {"id": channel_id}}},
+            upsert=True
+        )
+        global _config_cache, _config_cache_ts
+        _config_cache = None; _config_cache_ts = 0.0
+        return True, "Added"
+
+    async def remove_req_fsub_channel(self, channel_id):
+        if self.config_col is None:
+            return False
+        await self.config_col.update_one(
+            {"_id": "bot_config"},
+            {"$pull": {"req_fsub_channels": {"id": channel_id}}}
+        )
+        await self.config_col.update_one(
+            {"_id": "bot_config"},
+            {"$pull": {"req_fsub_channels": channel_id}}
+        )
+        global _config_cache, _config_cache_ts
+        _config_cache = None; _config_cache_ts = 0.0
+        return True
+
+    async def update_req_fsub_link(self, channel_id, link):
+        """Store generated invite link for a req_fsub private channel."""
+        if self.config_col is None:
+            return
+        config = await self.config_col.find_one({"_id": "bot_config"})
+        if not config:
+            return
+        channels = config.get("req_fsub_channels", [])
+        updated = []
+        for entry in channels:
+            if isinstance(entry, dict) and str(entry.get("id")) == str(channel_id):
+                entry["link"] = link
+            updated.append(entry)
+        await self.config_col.update_one(
+            {"_id": "bot_config"},
+            {"$set": {"req_fsub_channels": updated}}
+        )
+        global _config_cache, _config_cache_ts
+        _config_cache = None; _config_cache_ts = 0.0
+
+    async def get_req_fsub_interval(self):
+        """Returns configured req_fsub interval in seconds (default 24h)."""
+        config = await self.get_config()
+        hours = int(config.get("req_fsub_interval_hours", 24))
+        return hours * 3600
+
+    async def check_req_fsub_due(self, user_id: int) -> bool:
+        """True if enough time has passed since last req_fsub prompt for this user."""
+        if self.users_col is None:
+            return False
+        try:
+            doc = await self.users_col.find_one({"_id": user_id}, {"req_fsub_last": 1})
+            last = doc.get("req_fsub_last", 0) if doc else 0
+            interval = await self.get_req_fsub_interval()
+            import time as _t
+            return (_t.time() - last) >= interval
+        except Exception:
+            return False
+
+    async def mark_req_fsub_shown(self, user_id: int):
+        """Record that we just showed req_fsub prompt to this user."""
+        if self.users_col is None:
+            return
+        try:
+            import time as _t
+            await self.users_col.update_one(
+                {"_id": user_id},
+                {"$set": {"req_fsub_last": _t.time()}},
+                upsert=True
+            )
+        except Exception:
+            pass
+
+
     async def save_pending_request(self, user_id, movie_name):
         if self.main_db is None:
             return
