@@ -275,6 +275,7 @@ async def forward_indexer(client: Client, message: Message):
 
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton("🚀 Start Super-Index", callback_data=f"bulkindex#{chat_id}#{last_msg_id}")],
+        [InlineKeyboardButton("🔄 Reset & Start Fresh", callback_data=f"resetidx#{chat_id}#{last_msg_id}")],
         [InlineKeyboardButton("❌ Cancel", callback_data="close_data")]
     ])
 
@@ -322,6 +323,27 @@ async def start_bulk_index(client: Client, callback: CallbackQuery):
     # Offload the massive task to the background
     asyncio.create_task(run_indexer(client, status_msg, chat_id, last_msg_id, start_id))
     await callback.answer()
+
+
+@Client.on_callback_query(filters.regex(r"^resetidx#") & filters.user(ADMIN_ID))
+async def reset_and_index(client: Client, callback: CallbackQuery):
+    """Clears saved progress then starts indexing from message 1."""
+    try:
+        _, chat_id_str, last_msg_id_str = callback.data.split("#")
+        chat_id = int(chat_id_str)
+        last_msg_id = int(last_msg_id_str)
+    except (ValueError, IndexError):
+        return await callback.answer("❌ Malformed callback.", show_alert=True)
+
+    await db.clear_index_progress(chat_id)
+    status_msg = await callback.message.edit_text("⏳ **Progress reset. Starting from message 1...**")
+    asyncio.create_task(run_indexer(client, status_msg, chat_id, last_msg_id, 1))
+    asyncio.create_task(send_smart_log(client,
+        f"🔄 **#IndexReset**\n\n📦 Channel: `{chat_id}`\n"
+        f"🎯 Total: `{last_msg_id}`\nStarting fresh from message 1."
+    ))
+    await callback.answer()
+
 
 # --- CONTROL BUTTON CALLBACKS ---
 @Client.on_callback_query(filters.regex(r"^pause_idx#") & filters.user(ADMIN_ID))

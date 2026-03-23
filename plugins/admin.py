@@ -79,6 +79,7 @@ async def get_admin_menu_data():
         [InlineKeyboardButton("📊 Analytics (Stats + Languages + Groups)", callback_data="admin_stats")],
         [InlineKeyboardButton("📚 Manage Database Channels",  callback_data="db_chan_menu")],
         [InlineKeyboardButton("🔐 Manage FSub Channels",      callback_data="fsub_menu")],
+        [InlineKeyboardButton("📢 Req Channel FSub",           callback_data="req_fsub_menu")],
         [InlineKeyboardButton("⚙️ Change Main Group Link",    callback_data="edit_maingroup")],
         [InlineKeyboardButton("⚙️ Change Update Link",        callback_data="edit_update")],
         [InlineKeyboardButton("📡 Set Log Channel ID",        callback_data="edit_logchannel"),
@@ -321,6 +322,66 @@ async def show_fsub_menu(client: Client, callback: CallbackQuery):
 
 # ── DATABASE CHANNELS MANAGER ─────────────────────────────────────────────────
 
+
+@Client.on_callback_query(filters.regex(r"^req_fsub_menu$") & filters.user(ADMIN_ID))
+async def show_req_fsub_menu(client: Client, callback: CallbackQuery):
+    config = await db.get_config()
+    channels = config.get("req_fsub_channels", [])
+    interval = int(config.get("req_fsub_interval_hours", 24))
+    text = (
+        f"📢 **Request Channel FSub**\n\n"
+        f"Users are prompted to join one random channel before file delivery.\n"
+        f"Only once every **{interval}h** per user.\n\n"
+        f"**Channels ({len(channels)}/5):**\n"
+    )
+    for i, entry in enumerate(channels, 1):
+        ch_id = entry.get("id") if isinstance(entry, dict) else entry
+        text += f"`{i}.` `{ch_id}`\n"
+    if not channels:
+        text += "_None configured yet_\n"
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add Channel",   callback_data="req_fsub_add"),
+         InlineKeyboardButton("➖ Remove",         callback_data="req_fsub_remove")],
+        [InlineKeyboardButton("⏱ Set Interval",   callback_data="req_fsub_interval")],
+        [InlineKeyboardButton("🔙 Back",           callback_data="back_to_admin")]
+    ])
+    await callback.message.edit_text(text, reply_markup=markup)
+    await callback.answer()
+
+
+@Client.on_callback_query(filters.regex(r"^req_fsub_add$") & filters.user(ADMIN_ID))
+async def req_fsub_add_prompt(client: Client, callback: CallbackQuery):
+    _set_state(callback.from_user.id, "req_fsub_add")
+    await callback.message.reply_text(
+        "➕ **Send the Channel ID** to add to the Req FSub pool.\n\n"
+        "Must be a private channel where bot is **Admin with Invite permission**.\n"
+        "Example: `-1001234567890`\n\n_Type /cancel to abort._"
+    )
+    await callback.answer()
+
+
+@Client.on_callback_query(filters.regex(r"^req_fsub_remove$") & filters.user(ADMIN_ID))
+async def req_fsub_remove_prompt(client: Client, callback: CallbackQuery):
+    _set_state(callback.from_user.id, "req_fsub_remove")
+    await callback.message.reply_text(
+        "➖ **Send the Channel ID** to remove.\n\n_Type /cancel to abort._"
+    )
+    await callback.answer()
+
+
+@Client.on_callback_query(filters.regex(r"^req_fsub_interval$") & filters.user(ADMIN_ID))
+async def req_fsub_interval_prompt(client: Client, callback: CallbackQuery):
+    config = await db.get_config()
+    current = int(config.get("req_fsub_interval_hours", 24))
+    _set_state(callback.from_user.id, "req_fsub_interval")
+    await callback.message.reply_text(
+        f"⏱ **Send interval in hours** between prompts per user.\n\n"
+        f"Current: `{current}h` — Example: `24` = once per day.\n\n"
+        "_Type /cancel to abort._"
+    )
+    await callback.answer()
+
+
 @Client.on_callback_query(filters.regex(r"^db_chan_menu$") & filters.user(ADMIN_ID))
 async def show_db_chan_menu(client: Client, callback: CallbackQuery):
     config = await db.get_config()
@@ -552,6 +613,48 @@ async def catch_admin_input(client: Client, message: Message):
                 "Example: `123456789`",
                 reply_markup=_BACK_BTN
             )
+
+    elif state == "req_fsub_add":
+        raw = message.text.strip()
+        try:
+            ch_val = int(raw)
+        except ValueError:
+            ch_val = raw
+        ok, msg_r = await db.add_req_fsub_channel(ch_val)
+        if ok:
+            await message.reply_text(
+                f"✅ Channel `{ch_val}` added to Req FSub pool.\n"
+                f"Invite link will be generated on first use.",
+                reply_markup=_BACK_BTN
+            )
+        else:
+            await message.reply_text(f"❌ Failed: {msg_r}", reply_markup=_BACK_BTN)
+
+    elif state == "req_fsub_remove":
+        raw = message.text.strip()
+        try:
+            ch_val = int(raw)
+        except ValueError:
+            ch_val = raw
+        await db.remove_req_fsub_channel(ch_val)
+        await message.reply_text(
+            f"✅ Channel `{ch_val}` removed from Req FSub pool.",
+            reply_markup=_BACK_BTN
+        )
+
+    elif state == "req_fsub_interval":
+        try:
+            hours = int(message.text.strip())
+            if hours < 1:
+                raise ValueError
+            await db.update_config("req_fsub_interval_hours", hours)
+            await message.reply_text(
+                f"✅ Interval set to `{hours}h`.\n"
+                f"Users will see the prompt once every {hours} hour(s).",
+                reply_markup=_BACK_BTN
+            )
+        except ValueError:
+            await message.reply_text("❌ Send a number like `24`.", reply_markup=_BACK_BTN)
 
     _clear_state(admin_id)
     raise StopPropagation

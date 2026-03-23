@@ -21,6 +21,7 @@ except ImportError:
     LinkPreviewOptions = None
     def _no_preview(): return {"disable_web_page_preview": True}
 from database.db import db
+from plugins.req_fsub import check_and_show_req_fsub
 from utils import is_subscribed, is_subscribed_join_only, send_fsub_message
 from tmdb import get_movie_data
 
@@ -533,6 +534,10 @@ async def send_movie_file(client: Client, callback: CallbackQuery):
         await send_fsub_message(client, callback.message, pending_file_id=file_obj_id)
         return
 
+
+    # req_fsub gate — periodic random channel join request prompt
+    if not await check_and_show_req_fsub(client, callback, file_obj_id):
+        return  # prompt shown — file will be sent by rfsub_check_callback
 
     await callback.answer("📤 Sending file... Please wait!", show_alert=False)
 

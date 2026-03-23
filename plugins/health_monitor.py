@@ -1,7 +1,6 @@
 """
 Background tasks started from bot.py:
-  - A10: Health monitor — pings clusters, checks stale indexers, sends alerts
-  - B5: Birthday broadcast — checks daily for users with birthday today
+  - A10: Health monitor — pings clusters every 10 min, alerts on issues
 """
 import asyncio
 import logging
@@ -127,71 +126,3 @@ async def run_health_monitor(client):
         # Heartbeat removed — was noise in log channel
 
 
-async def run_birthday_check(client):
-    """
-    B5: Runs once daily at the configured time (default midnight UTC).
-    Checks for users with birthday today and sends them a greeting.
-    """
-    while True:
-        # Calculate seconds until next midnight UTC
-        now = datetime.datetime.utcnow()
-        next_midnight = (now + datetime.timedelta(days=1)).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-        sleep_seconds = (next_midnight - now).total_seconds()
-        await asyncio.sleep(sleep_seconds)
-
-        # Check configured birthday time — default midnight, configurable
-        try:
-            config = await db.get_config()
-            birthday_hour = int(config.get("birthday_hour", 0))
-            birthday_minute = int(config.get("birthday_minute", 0))
-        except Exception:
-            birthday_hour, birthday_minute = 0, 0
-
-        # Sleep extra if birthday time is not midnight
-        extra = birthday_hour * 3600 + birthday_minute * 60
-        if extra > 0:
-            await asyncio.sleep(extra)
-
-        # Find users with birthday today
-        today = datetime.datetime.utcnow()
-        today_mm_dd = f"{today.month:02d}-{today.day:02d}"
-
-        try:
-            if db.users_col is None:
-                continue
-
-            cursor = db.users_col.find({"birthday": {"$regex": f"-{today_mm_dd}$"}})
-            birthday_users = [doc["_id"] async for doc in cursor]
-
-            if not birthday_users:
-                continue
-
-            logger.info(f"🎂 Birthday check: {len(birthday_users)} user(s) today")
-
-            sent, failed = 0, 0
-            for user_id in birthday_users:
-                try:
-                    await client.send_message(
-                        chat_id=user_id,
-                        text=(
-                            "🎂 **Happy Birthday!**\n\n"
-                            "Wishing you a wonderful day from all of us at MCCxBot! 🎉\n\n"
-                            "Enjoy some movies today 🍿"
-                        )
-                    )
-                    sent += 1
-                    await asyncio.sleep(0.05)  # Respect rate limits
-                except Exception:
-                    failed += 1
-
-            await send_smart_log(
-                client,
-                f"🎂 **#BirthdayBroadcast**\n\n"
-                f"Sent birthday greetings to `{sent}` users.\n"
-                f"Failed: `{failed}`"
-            )
-
-        except Exception as e:
-            logger.error(f"Birthday check error: {e}")

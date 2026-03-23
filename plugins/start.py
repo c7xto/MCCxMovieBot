@@ -1,5 +1,6 @@
 import os
 import re
+import asyncio
 import urllib.parse
 import time
 import random
@@ -32,6 +33,37 @@ def _html(text: str) -> str:
 
 # All config (log channel, media, links) is read from MongoDB inside each
 # handler via db.get_config() — no module-level env reads needed here.
+
+
+
+def _build_start_ui(config, mention, total_files, bot_username, update_link, group_link):
+    """Shared welcome UI builder — used by /start and start_home callback."""
+    default_welcome = (
+        "<b>👋 Hey {mention}!</b>\n\n"
+        "🎬 <b>{total_files:,}</b> files ready to deliver.\n"
+        "Malayalam • Tamil • Telugu • Hindi &amp; more\n\n"
+        "Just type any movie name to search.\n"
+        "<i>Files land in your PM instantly.</i>"
+    )
+    raw = config.get("welcome_text", default_welcome)
+    try:
+        text = raw.format(mention=mention, total_files=total_files)
+    except Exception:
+        text = raw
+    text += f"\n\n👮‍♂️ @{bot_username}"
+
+    buttons = []
+    top_row = []
+    if update_link:
+        top_row.append(InlineKeyboardButton("📢 Updates", url=update_link))
+    if group_link:
+        top_row.append(InlineKeyboardButton("👥 Group", url=group_link))
+    if top_row:
+        buttons.append(top_row)
+    buttons.append([InlineKeyboardButton("➕ Add to Group", url=f"https://t.me/{bot_username}?startgroup=true")])
+    buttons.append([InlineKeyboardButton("ℹ️ Help", callback_data="help_menu")])
+    return text, InlineKeyboardMarkup(buttons)
+
 
 @Client.on_message(filters.command("start") & filters.private)
 async def start_handler(client: Client, message: Message):
@@ -93,10 +125,10 @@ async def start_handler(client: Client, message: Message):
                 chat_id=message.chat.id,
                 file_id=file_data["file_id"],
                 caption=(
-                    f"🍿 <b>{_html(file_data['file_name'])}</b>\n\n"
-                    f"<blockquote>⏳ Auto-deletes in <b>{delete_minutes} minutes</b>\n"
-                    f"⚠️ Forward to your <b>Saved Messages</b> to keep it!</blockquote>\n\n"
-                    f"📢 More movies → @{client.me.username}"
+                    f"🎬 <b>{_html(file_data['file_name'])}</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━\n"
+                    f"⏳ Deletes in <b>{delete_minutes} mins</b>  •  Forward to keep\n"
+                    f"📢 @{client.me.username}"
                 ),
                 parse_mode=ParseMode.HTML
             )
@@ -164,46 +196,10 @@ async def start_handler(client: Client, message: Message):
             await db.save_search(session_id, session_data)
             return await route_menu(client, status_msg, session_id, "ALL", "ALL", 0)
 
-    # Welcome text
-    default_welcome = (
-        "<b>👋 Hey {mention}!</b>\n\n"
-        "<blockquote>"
-        "🎬 Welcome to <b>MCCxBot</b> — Your personal cinema vault!\n"
-        "We have <b>{total_files:,}</b> movies &amp; series ready to deliver instantly."
-        "</blockquote>\n\n"
-        "<b>How to use:</b>\n"
-        "1. Type a movie or series name here\n"
-        "2. Pick your language &amp; quality\n"
-        "3. Get the file instantly in PM\n\n"
-        "<i>💡 Tip: Add me to your group — just type a movie name there!</i>"
+    caption_text, reply_markup = _build_start_ui(
+        config, message.from_user.mention, total_files, client.me.username,
+        UPDATE_CHANNEL_LINK, MAIN_GROUP_LINK
     )
-
-    raw_caption = config.get("welcome_text", default_welcome)
-    
-    try:
-        caption_text = raw_caption.format(mention=message.from_user.mention, total_files=total_files)
-    except Exception:
-        caption_text = raw_caption 
-
-    caption_text += f"\n\n👮‍♂️ <b>Admin:</b> @{client.me.username}"
-
-    # Build sleek, balanced buttons
-    buttons = [
-        [InlineKeyboardButton("➕ Add to Your Group", url=f"https://t.me/{client.me.username}?startgroup=true")]
-    ]
-    
-    top_row = []
-    if UPDATE_CHANNEL_LINK:
-        top_row.append(InlineKeyboardButton("📢 Updates", url=UPDATE_CHANNEL_LINK))
-    if MAIN_GROUP_LINK:
-        top_row.append(InlineKeyboardButton("👥 Group", url=MAIN_GROUP_LINK))
-        
-    if top_row:
-        buttons.append(top_row)
-        
-    buttons.append([InlineKeyboardButton("ℹ️ Help", callback_data="help_menu")])
-
-    reply_markup = InlineKeyboardMarkup(buttons)
 
     try:
         media_lower = START_MEDIA.lower()
@@ -250,41 +246,10 @@ async def start_home_callback(client: Client, callback: CallbackQuery):
     
     total_files = await db.get_total_files()
 
-    default_welcome = (
-        "<b>👋 Hey {mention}!</b>\n\n"
-        "<blockquote>🎬 Welcome to <b>MCCxBot</b> — Your personal cinema vault!</blockquote>\n\n"
-        "<b>How to use:</b>\n"
-        "1. Type a movie or series name here\n"
-        "2. Pick your language &amp; quality\n"
-        "3. Get the file instantly in PM\n\n"
-        "<i>💡 Tip: Add me to your group!</i>"
+    caption_text, reply_markup = _build_start_ui(
+        config, callback.from_user.mention, total_files, client.me.username,
+        UPDATE_CHANNEL_LINK, MAIN_GROUP_LINK
     )
-
-    raw_caption = config.get("welcome_text", default_welcome)
-    try:
-        caption_text = raw_caption.format(mention=callback.from_user.mention, total_files=total_files)
-    except Exception:
-        caption_text = raw_caption
-        
-    caption_text += f"\n\n👮‍♂️ <b>Admin:</b> @{client.me.username}"
-
-    # Build sleek, balanced buttons
-    buttons = [
-        [InlineKeyboardButton("➕ Add to Your Group", url=f"https://t.me/{client.me.username}?startgroup=true")]
-    ]
-    
-    top_row = []
-    if UPDATE_CHANNEL_LINK:
-        top_row.append(InlineKeyboardButton("📢 Updates", url=UPDATE_CHANNEL_LINK))
-    if MAIN_GROUP_LINK:
-        top_row.append(InlineKeyboardButton("👥 Group", url=MAIN_GROUP_LINK))
-        
-    if top_row:
-        buttons.append(top_row)
-        
-    buttons.append([InlineKeyboardButton("ℹ️ Help", callback_data="help_menu")])
-
-    reply_markup = InlineKeyboardMarkup(buttons)
     
     try:
         if getattr(callback.message, "video", None) or getattr(callback.message, "photo", None) or getattr(callback.message, "animation", None):
