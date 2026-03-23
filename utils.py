@@ -35,6 +35,8 @@ async def is_subscribed(client, message_or_callback):
     if not fsub_channels:
         return True
 
+    if not message_or_callback.from_user:
+        return True  # anonymous admin — let through
     user_id = message_or_callback.from_user.id
 
     for entry in fsub_channels:
@@ -112,16 +114,23 @@ async def send_fsub_message(client, message, pending_file_id=None):
 
     file_part = pending_file_id if pending_file_id else "none"
     buttons.append([
-        InlineKeyboardButton("✅ I've Joined — Check Now", callback_data=f"check_fsub#{file_part}")
+        InlineKeyboardButton("✅ Done — Let Me In", callback_data=f"check_fsub#{file_part}")
     ])
     markup = InlineKeyboardMarkup(buttons)
 
-    text = (
-        f"👋 <b>Hello {message.from_user.mention}!</b>\n\n"
-        f"<blockquote>To use this bot, please join our channel(s) below.\n"
-        f"Then tap <b>✅ I've Joined</b> to continue.</blockquote>"
-    )
+    mention = message.from_user.mention if message.from_user else "there"
+    # Get file count for unlock framing
+    try:
+        total_files = await db.get_total_files()
+        files_str = f"{total_files:,}"
+    except Exception:
+        files_str = "millions of"
 
+    text = (
+        f"🔐 <b>One step away!</b>\n\n"
+        f"Join our channel to unlock {files_str} files — free forever.\n\n"
+        f"<blockquote>Tap join, then tap <b>✅ Done — Let Me In</b></blockquote>"
+    )
     await message.reply_text(
         text, reply_markup=markup, quote=True, parse_mode=ParseMode.HTML
     )
