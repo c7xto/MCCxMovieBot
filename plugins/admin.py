@@ -456,4 +456,280 @@ async def catch_admin_input(client: Client, message: Message):
         ok, msg_r = await db.add_req_fsub_channel(ch_val)
         if ok:
             await message.reply_text(
-                f"✅ Channel `{ch_val}` added to R
+                f"✅ Channel `{ch_val}` added to Req FSub pool.", reply_markup=_BACK_BTN
+            )
+        else:
+            await message.reply_text(f"❌ Failed: {msg_r}", reply_markup=_BACK_BTN)
+
+    elif state == "req_fsub_remove":
+        raw = message.text.strip()
+        try:
+            ch_val = int(raw)
+        except ValueError:
+            ch_val = raw
+        await db.remove_req_fsub_channel(ch_val)
+        await message.reply_text(f"✅ Channel `{ch_val}` removed from Req FSub pool.", reply_markup=_BACK_BTN)
+
+    elif state == "req_fsub_interval":
+        try:
+            hours = int(message.text.strip())
+            if hours < 1:
+                raise ValueError
+            await db.update_config("req_fsub_interval_hours", hours)
+            await message.reply_text(
+                f"✅ Interval set to `{hours}h`. Users prompted once every {hours} hour(s).",
+                reply_markup=_BACK_BTN
+            )
+        except ValueError:
+            await message.reply_text("❌ Send a number like `24`.", reply_markup=_BACK_BTN)
+
+    _clear_state(admin_id)
+    raise StopPropagation
+
+
+@Client.on_message(filters.command("cancel") & filters.private & filters.user(ADMIN_ID), group=0)
+async def cancel_cmd(client: Client, message: Message):
+    from plugins.state import clear_state as _cs
+    _cs(message.from_user.id)
+    await message.reply_text("🚫 **Cancelled.**", reply_markup=_BACK_BTN)
+    raise StopPropagation
+
+
+@Client.on_message(filters.command("ban") & filters.private & filters.user(ADMIN_ID))
+async def ban_user_cmd(client: Client, message: Message):
+    if len(message.command) < 2:
+        return await message.reply_text("⚠️ **Usage:** `/ban [user_id]`")
+    try:
+        user_id = int(message.command[1])
+    except ValueError:
+        return await message.reply_text("❌ Invalid user ID.")
+    await db.ban_user(user_id)
+    await message.reply_text(f"✅ **User `{user_id}` banned.**")
+
+
+@Client.on_message(filters.command("unban") & filters.private & filters.user(ADMIN_ID))
+async def unban_user_cmd(client: Client, message: Message):
+    if len(message.command) < 2:
+        return await message.reply_text("⚠️ **Usage:** `/unban [user_id]`")
+    try:
+        user_id = int(message.command[1])
+    except ValueError:
+        return await message.reply_text("❌ Invalid user ID.")
+    await db.unban_user(user_id)
+    await message.reply_text(f"✅ **User `{user_id}` unbanned.**")
+
+
+@Client.on_message(filters.command("reset_index_progress") & filters.private & filters.user(ADMIN_ID))
+async def reset_index_progress_cmd(client: Client, message: Message):
+    args = message.command
+    if len(args) > 1:
+        try:
+            chat_id = int(args[1])
+        except ValueError:
+            return await message.reply_text("Invalid channel ID.", quote=True)
+        await db.clear_index_progress(chat_id)
+        await message.reply_text("Index progress cleared for that channel.", quote=True)
+    else:
+        await db.clear_index_progress(chat_id=None)
+        await message.reply_text("All index progress cleared.", quote=True)
+
+
+@Client.on_message(filters.command("reset_db") & filters.private & filters.user(ADMIN_ID))
+async def reset_db_cmd(client: Client, message: Message):
+    await message.reply_text(
+        "⚠️ **WARNING: NUCLEAR OPTION**\n\n"
+        "This will wipe ALL files, users, and bans.\n\n"
+        "Confirm with: `/confirm_reset`",
+        quote=True
+    )
+
+
+@Client.on_message(filters.command("confirm_reset") & filters.private & filters.user(ADMIN_ID))
+async def confirm_reset_cmd(client: Client, message: Message):
+    status = await message.reply_text("☢️ **Wiping database...**")
+    await db.reset_database()
+    await status.edit_text("✅ **Database wiped.** Clean slate.")
+
+
+@Client.on_message(filters.command("stats") & filters.private & filters.user(ADMIN_ID))
+async def stats_cmd(client: Client, message: Message):
+    msg = await message.reply_text("⏳ Fetching stats...", quote=True)
+    total_users, total_banned, total_files, db_sizes, total_groups = await db.get_bot_stats()
+
+    text = (
+        f"📊 **MCCxBot Stats**\n\n"
+        f"👥 Users: `{total_users:,}`\n"
+        f"🏘 Groups: `{total_groups:,}`\n"
+        f"📁 Files: `{total_files:,}`\n"
+        f"🚫 Banned: `{total_banned}`\n\n"
+        f"💾 **Clusters:**\n"
+    )
+    for db_num, size in db_sizes:
+        fill = int((size / 512) * 10)
+        bar = "█" * fill + "░" * (10 - fill)
+        text += f"├ Cluster {db_num}: [{bar}] `{size:.1f} MB`\n"
+
+    await msg.edit_text(text)
+
+
+@Client.on_message(filters.command("help"))
+async def help_cmd(client: Client, message: Message):
+    help_text = (
+        f"📖 **How to use MCCxBot**\n\n"
+        f"<blockquote>"
+        f"1. Type a movie or series name\n"
+        f"2. Select your language\n"
+        f"3. Pick your quality\n"
+        f"4. Tap the file — sent to your PM instantly"
+        f"</blockquote>\n\n"
+        f"🎬 <b>Examples:</b>\n"
+        f"<code>Leo</code>  •  <code>Aadujeevitham</code>  •  <code>KGF 2</code>\n\n"
+        f"❓ Can't find it? Use the <b>Request</b> button."
+    )
+
+    is_group = message.chat.type.name in ["GROUP", "SUPERGROUP"]
+    markup = None
+    if is_group:
+        markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🤖 Search in PM", url=f"https://t.me/{client.me.username}?start=start")
+        ]])
+
+    help_msg = await message.reply_text(
+        help_text, reply_markup=markup, parse_mode=ParseMode.HTML, quote=True
+    )
+
+    if is_group:
+        async def _del(hm, om):
+            await asyncio.sleep(30)
+            try:
+                await hm.delete()
+                await om.delete()
+            except Exception:
+                pass
+        asyncio.create_task(_del(help_msg, message))
+
+
+@Client.on_callback_query(filters.regex(r"^fsub_refresh_links$") & filters.user(ADMIN_ID))
+async def fsub_refresh_links(client: Client, callback: CallbackQuery):
+    await callback.message.edit_text("♻️ **Refreshing join links...**")
+    await callback.answer()
+
+    config = await db.get_config()
+    channels = config.get("fsub_channels", [])
+    refreshed, skipped = 0, 0
+
+    for entry in channels:
+        ch_id   = entry.get("id") if isinstance(entry, dict) else entry
+        ch_type = entry.get("type", "join") if isinstance(entry, dict) else "join"
+
+        if ch_type != "join" or not ch_id:
+            skipped += 1
+            continue
+
+        ch_str = str(ch_id).strip()
+        if ch_str.startswith("@") or not ch_str.startswith("-100"):
+            skipped += 1
+            continue
+
+        try:
+            new_link = await client.export_chat_invite_link(int(ch_str))
+            await db.update_fsub_channel_link(ch_id, new_link)
+            refreshed += 1
+        except Exception as e:
+            logger.warning(f"Could not refresh link for {ch_id}: {e}")
+            skipped += 1
+
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 Back to FSub Menu", callback_data="fsub_menu")]
+    ])
+    await callback.message.edit_text(
+        f"♻️ **Links Refreshed!**\n\n"
+        f"✅ Refreshed: `{refreshed}`\n"
+        f"⏭ Skipped: `{skipped}`",
+        reply_markup=markup
+    )
+
+
+@Client.on_callback_query(filters.regex(r"^channel_health_check$") & filters.user(ADMIN_ID))
+async def channel_health_check(client: Client, callback: CallbackQuery):
+    from plugins.health_monitor import check_all_channels
+    await callback.message.edit_text("🔍 **Running channel health check...**")
+    await callback.answer()
+
+    config = await db.get_config()
+    results = await check_all_channels(client, config)
+    report_text = "🔍 **Channel Health Report**\n\n" + "\n".join(results)
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_admin")]])
+
+    try:
+        await callback.message.edit_text(report_text, reply_markup=markup)
+    except Exception:
+        await callback.message.edit_text(report_text[:4000] + "\n...", reply_markup=markup)
+
+
+@Client.on_callback_query(filters.regex(r"^admin_toggle_maintenance$") & filters.user(ADMIN_ID))
+async def toggle_maintenance(client: Client, callback: CallbackQuery):
+    config = await db.get_config()
+    new_val = not config.get("maintenance_mode", False)
+    await db.update_config("maintenance_mode", new_val)
+    status = "🔧 **Maintenance ON** — Users see maintenance message." if new_val else "✅ **Maintenance OFF** — Bot is live."
+    await callback.answer("ON" if new_val else "OFF", show_alert=False)
+    await callback.message.reply_text(status, reply_markup=_BACK_BTN)
+
+
+@Client.on_callback_query(filters.regex(r"^admin_export_config$") & filters.user(ADMIN_ID))
+async def export_config(client: Client, callback: CallbackQuery):
+    await callback.answer()
+    config_data = await db.export_config()
+    config_json = json.dumps(config_data, indent=2, default=str)
+    buf = io.BytesIO(config_json.encode())
+    buf.name = "mccxbot_config_backup.json"
+    await callback.message.reply_document(
+        document=buf,
+        caption="📥 **Config Backup** — Use Restore Config to apply."
+    )
+
+
+@Client.on_callback_query(filters.regex(r"^admin_restore_config$") & filters.user(ADMIN_ID))
+async def restore_config_prompt(client: Client, callback: CallbackQuery):
+    _set_state(callback.from_user.id, "restore_config_file")
+    await callback.message.reply_text(
+        "📤 **Restore Config**\n\n"
+        "Send the `.json` backup file as a **document**.\n\n"
+        "⚠️ Protected fields (log channel, admin ID, DB channels) will not be changed.\n\n"
+        "_/cancel to abort._"
+    )
+    await callback.answer()
+
+
+@Client.on_message(filters.private & filters.document & filters.user(ADMIN_ID))
+async def handle_config_restore_file(client: Client, message: Message):
+    state = _get_state(message.from_user.id)
+    if state != "restore_config_file":
+        raise ContinuePropagation
+
+    if not message.document.file_name.endswith(".json"):
+        return await message.reply_text("❌ Please send a `.json` file.", reply_markup=_BACK_BTN)
+
+    _clear_state(message.from_user.id)
+    try:
+        file_bytes = await client.download_media(message.document, in_memory=True)
+        config_data = json.loads(file_bytes.getvalue().decode())
+        success = await db.restore_config(config_data)
+        if success:
+            await message.reply_text(
+                f"✅ **Config Restored!** `{len(config_data)}` settings applied.",
+                reply_markup=_BACK_BTN
+            )
+        else:
+            await message.reply_text(
+                "❌ No valid settings found. File may be empty or invalid.",
+                reply_markup=_BACK_BTN
+            )
+    except Exception as e:
+        await message.reply_text(f"❌ Failed to parse file: `{e}`", reply_markup=_BACK_BTN)
+
+
+@Client.on_callback_query(filters.regex(r"^close_data$") & filters.user(ADMIN_ID))
+async def close_callback(client: Client, callback: CallbackQuery):
+    await callback.message.delete()
