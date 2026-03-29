@@ -554,4 +554,100 @@ async def send_movie_file(client: Client, callback: CallbackQuery):
             await db.delete_file_by_id(file_data["file_id"])
             await callback.message.reply_text(
                 f"❌ **File Unavailable**\n\n"
-                f"{_html(file
+                f"{_html(file_data['file_name'])} has expired.\n"
+                f"Removed from DB. Please search again.",
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            await callback.message.reply_text("❌ Could not send file. Try again.")
+        logger.error(f"send_cached_media failed: {e}")
+
+
+@Client.on_callback_query(filters.regex(r"^check_fsub#"))
+async def check_fsub_callback(client: Client, callback: CallbackQuery):
+    from utils import _parse_entry, _check_one_channel, _get_join_link
+
+    file_part       = callback.data.split("#")[1]
+    pending_file_id = file_part if file_part != "none" else None
+
+    config   = await db.get_config()
+    channels = config.get("fsub_channels", [])
+    user_id  = callback.from_user.id
+
+    remaining = []
+    for i, entry in enumerate(channels, 1):
+        try:
+            cid, stored_link = _parse_entry(entry)
+        except Exception:
+            continue
+        if not cid:
+            continue
+        status = await _check_one_channel(client, cid, user_id)
+        if status in ("joined", "pending", "skip"):
+            continue
+        link = await _get_join_link(client, cid, stored_link)
+        if not link:
+            continue
+        try:
+            chat    = await client.get_chat(cid if isinstance(cid, int) else int(str(cid).strip()))
+            ch_name = (getattr(chat, "title", None) or f"Channel {i}")[:30]
+            is_req  = getattr(chat, "join_by_request", False)
+            lbl     = f"📋 Request to Join {ch_name}" if is_req else f"📢 Join {ch_name}"
+        except Exception:
+            lbl = f"📢 Channel {i}"
+        remaining.append([InlineKeyboardButton(lbl, url=link)])
+
+    if remaining:
+        remaining.append([InlineKeyboardButton(
+            "✅ I've Joined / Requested — Check Now",
+            callback_data=f"check_fsub#{file_part}"
+        )])
+        await callback.answer(
+            f"❌ Still need to join {len(remaining)-1} channel(s).",
+            show_alert=True
+        )
+        try:
+            await callback.message.edit_reply_markup(InlineKeyboardMarkup(remaining))
+        except Exception:
+            pass
+        return
+
+    await callback.answer("✅ Verified! Sending your file...", show_alert=False)
+    chat_id = callback.message.chat.id
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+    if pending_file_id:
+        file_data = await db.get_file(pending_file_id)
+        if not file_data:
+            await client.send_message(chat_id, "✅ Verified! But the file is no longer available.")
+            return
+
+        cfg            = await db.get_config()
+        delete_seconds = int(cfg.get("auto_delete_time", 300))
+        delete_minutes = delete_seconds // 60
+
+        try:
+            sent = await client.send_cached_media(
+                chat_id=chat_id,
+                file_id=file_data["file_id"],
+                caption=_build_caption(cfg, file_data, delete_minutes, client.me.username),
+                parse_mode=ParseMode.HTML
+            )
+            asyncio.create_task(_auto_delete_file(sent, file_data["file_name"], client.me.username, delete_seconds))
+        except Exception as e:
+            err = str(e).lower()
+            if any(k in err for k in ["file_reference", "invalid", "not found", "media"]):
+                await db.delete_file_by_id(file_data["file_id"])
+                await client.send_message(chat_id, "❌ File unavailable. Please search again.")
+            else:
+                await client.send_message(chat_id, "❌ Could not send file. Try again.")
+    else:
+        await client.send_message(
+            chat_id,
+            "✅ **Verification Successful!**\n\n"
+            "<blockquote>You're all set! Type any movie name to search.</blockquote>",
+            parse_mode=ParseMode.HTML
+        )
