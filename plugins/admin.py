@@ -936,6 +936,7 @@ async def help_cmd(client: Client, message: Message):
 # Use this if a join channel's link has expired or been manually revoked.
 # Note: this will revoke the current stored link and create a new one.
 
+
 @Client.on_callback_query(filters.regex(r"^fsub_refresh_links$") & filters.user(ADMIN_ID))
 async def fsub_refresh_links(client: Client, callback: CallbackQuery):
     await callback.message.edit_text("♻️ **Refreshing join channel links...**")
@@ -953,4 +954,150 @@ async def fsub_refresh_links(client: Client, callback: CallbackQuery):
             ch_id = entry
             ch_type = "join"
 
-        if ch
+        if ch_type != "join" or not ch_id:
+            skipped += 1
+            continue
+
+        ch_str = str(ch_id).strip()
+
+        # Public @username channels never need invite links — skip them.
+        # export_chat_invite_link on a public channel stores a private invite
+        # link which can expire, replacing the working @username link.
+        if ch_str.startswith("@") or not ch_str.startswith("-100"):
+            skipped += 1
+            continue
+
+        try:
+            new_link = await client.export_chat_invite_link(int(ch_str))
+            await db.update_fsub_channel_link(ch_id, new_link)
+            refreshed += 1
+        except Exception as e:
+            logger.warning(f"Could not refresh link for {ch_id}: {e}")
+            skipped += 1
+
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 Back to FSub Menu", callback_data="fsub_menu")]
+    ])
+    await callback.message.edit_text(
+        f"♻️ **Links Refreshed!**\n\n"
+        f"✅ Refreshed: `{refreshed}` join channel(s)\n"
+        f"⏭ Skipped: `{skipped}` (request channels or errors)\n\n"
+        f"All old FSub prompt messages are now invalid — users will need "
+        f"a fresh prompt to get working buttons.",
+        reply_markup=markup
+    )
+
+
+# ── CHANNEL HEALTH CHECK ──────────────────────────────────────────────────────
+
+@Client.on_callback_query(filters.regex(r"^channel_health_check$") & filters.user(ADMIN_ID))
+async def channel_health_check(client: Client, callback: CallbackQuery):
+    """Uses shared check_all_channels() from health_monitor — no duplicate logic."""
+    from plugins.health_monitor import check_all_channels
+    await callback.message.edit_text("🔍 **Running channel health check...**")
+    await callback.answer()
+
+    config = await db.get_config()
+    results = await check_all_channels(client, config)
+
+    report_text = "🔍 **Channel Health Report**\n\n" + "\n".join(results)
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_admin")]])
+
+    try:
+        await callback.message.edit_text(report_text, reply_markup=markup)
+    except Exception:
+        await callback.message.edit_text(report_text[:4000] + "\n...", reply_markup=markup)
+
+
+# ── CLOSE PANEL ───────────────────────────────────────────────────────────────
+# FIX #8: Only ONE close_data handler exists now — the duplicate in index.py is removed.
+
+# ── C1: MAINTENANCE MODE TOGGLE ──────────────────────────────────────────────
+
+@Client.on_callback_query(filters.regex(r"^admin_toggle_maintenance$") & filters.user(ADMIN_ID))
+async def toggle_maintenance(client: Client, callback: CallbackQuery):
+    config = await db.get_config()
+    current = config.get("maintenance_mode", False)
+    new_val = not current
+    await db.update_config("maintenance_mode", new_val)
+    status = "🔧 **Maintenance Mode ON**\n\nUsers will see the maintenance message."         if new_val else "✅ **Maintenance Mode OFF**\n\nBot is live again."
+    await callback.answer(f"{'ON' if new_val else 'OFF'}", show_alert=False)
+    await callback.message.reply_text(status, reply_markup=_BACK_BTN)
+
+
+# ── C9: EXPORT CONFIG ─────────────────────────────────────────────────────────
+
+@Client.on_callback_query(filters.regex(r"^admin_export_config$") & filters.user(ADMIN_ID))
+async def export_config(client: Client, callback: CallbackQuery):
+    await callback.answer()
+    config_data = await db.export_config()
+    config_json = json.dumps(config_data, indent=2, default=str)
+    import io
+    buf = io.BytesIO(config_json.encode())
+    buf.name = "mccxbot_config_backup.json"
+    await callback.message.reply_document(
+        document=buf,
+        caption="📥 **MCCxBot Config Backup**\n\nStore this safely. "
+                "Use Restore Config to apply it."
+    )
+
+
+# ── C10: RESTORE CONFIG ───────────────────────────────────────────────────────
+
+@Client.on_callback_query(filters.regex(r"^admin_restore_config$") & filters.user(ADMIN_ID))
+async def restore_config_prompt(client: Client, callback: CallbackQuery):
+    _set_state(callback.from_user.id, "restore_config_file")
+    await callback.message.reply_text(
+        "📤 **Restore Config**\n\n"
+        "Send me the `.json` backup file as a **document attachment**.\n\n"
+        "⚠️ This will overwrite your current settings (except log channel, "
+        "admin ID, and DB channels which are always protected).\n\n"
+        "*Type /cancel to abort.*"
+    )
+    await callback.answer()
+
+
+@Client.on_message(
+    filters.private & filters.document & filters.user(ADMIN_ID)
+)
+async def handle_config_restore_file(client: Client, message: Message):
+    state = _get_state(message.from_user.id)
+    if state != "restore_config_file":
+        # Not a config restore — let the message propagate to other handlers (e.g. forward_indexer)
+        raise ContinuePropagation
+
+    if not message.document.file_name.endswith(".json"):
+        return await message.reply_text(
+            "❌ Please send a `.json` file.",
+            reply_markup=_BACK_BTN
+        )
+
+    _clear_state(message.from_user.id)
+    try:
+        file_bytes = await client.download_media(message.document, in_memory=True)
+        config_data = json.loads(file_bytes.getvalue().decode())
+        success = await db.restore_config(config_data)
+        if success:
+            await message.reply_text(
+                f"✅ **Config Restored!**\n\n"
+                f"Restored `{len(config_data)}` settings from backup.\n"
+                f"Protected fields (log channel, admin ID, DB channels) were not changed.",
+                reply_markup=_BACK_BTN
+            )
+        else:
+            await message.reply_text(
+                "❌ No safe settings found to restore. File may be empty or invalid.",
+                reply_markup=_BACK_BTN
+            )
+    except Exception as e:
+        await message.reply_text(
+            f"❌ Failed to parse backup file: `{e}`",
+            reply_markup=_BACK_BTN
+        )
+
+
+# ── CLOSE PANEL ───────────────────────────────────────────────────────────────
+
+@Client.on_callback_query(filters.regex(r"^close_data$") & filters.user(ADMIN_ID))
+async def close_callback(client: Client, callback: CallbackQuery):
+    await callback.message.delete()
