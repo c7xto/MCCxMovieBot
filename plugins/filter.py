@@ -11,8 +11,7 @@ from pyrogram.errors import MessageNotModified, FloodWait
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
 from pyrogram.types import (
-    Message, InlineKeyboardMarkup, InlineKeyboardButton,
-    CallbackQuery
+    Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 )
 try:
     from pyrogram.types import LinkPreviewOptions
@@ -25,59 +24,39 @@ from plugins.req_fsub import check_and_show_req_fsub
 from utils import is_subscribed, is_subscribed_join_only, send_fsub_message
 from tmdb import get_movie_data
 
-
-def _html(text: str) -> str:
-    """Escapes a string for safe use inside Telegram HTML-mode messages."""
-    return (
-        str(text)
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
-
 load_dotenv()
-
 logger = logging.getLogger(__name__)
 _ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 
-# MISSED_CACHE removed — db.log_missed_search() now handles deduplication
-# with a per-query 1-hour cooldown stored in MongoDB.
-MISSED_CACHE = set()  # kept as empty set — group_connect.py imports it
-
+MISSED_CACHE = set()
 IGNORE_WORDS = {"hi", "hello", "bro", "pls", "plz", "bot", "help", "admin", "sir"}
 
-# FIX #16: USER_SEARCH_COOLDOWN capped to prevent unbounded RAM growth.
 _COOLDOWN_MAX = 10000
 USER_SEARCH_COOLDOWN = {}
 COOLDOWN_TIME = 2
 
-# Replaces deprecated disable_web_page_preview throughout this file
-# _NO_PREVIEW replaced with _no_preview() compat function above
-
-
-async def send_smart_log(client, text):
-    try:
-        config = await db.get_config()
-        log_chat = config.get("log_channel", 0)
-        if log_chat:
-            # FIX deprecated: replaced disable_web_page_preview with link_preview_options
-            await client.send_message(
-                log_chat, text, **_no_preview()
-            )
-    except FloodWait:
-        pass
-    except Exception:
-        pass
-
-
 LANGUAGES = ["Malayalam", "Tamil", "Telugu", "Hindi", "English", "Kannada", "Dual Audio", "Multi Audio"]
-QUALITIES = ["4K", "1080p", "720p", "480p", "HDRip", "WEB-DL", "WEBRip", "BluRay", "PreDVD", "CAM", "HD Rip"]
+QUALITIES  = ["4K", "1080p", "720p", "480p", "HDRip", "WEB-DL", "WEBRip", "BluRay", "PreDVD", "CAM", "HD Rip"]
 
 LANG_EMOJI = {
     "Malayalam": "🌴", "Tamil": "🎭", "Telugu": "⭐",
     "Hindi": "🇮🇳", "English": "🌍", "Kannada": "🏵",
     "Dual Audio": "🎧", "Multi Audio": "🎵", "Other": "🌐"
 }
+
+
+def _html(text: str) -> str:
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+async def send_smart_log(client, text):
+    try:
+        config   = await db.get_config()
+        log_chat = config.get("log_channel", 0)
+        if log_chat:
+            await client.send_message(log_chat, text, **_no_preview())
+    except Exception:
+        pass
 
 
 def clean_query(query):
@@ -87,10 +66,10 @@ def clean_query(query):
         r'\bbro\b', r'\bcan\b', r'\byou\b', r'\bprovide\b', r'\bi\b',
         r'\bneed\b', r'\bwant\b'
     ]
-    query_clean = query.lower()
-    for word in stop_words:
-        query_clean = re.sub(word, '', query_clean, flags=re.IGNORECASE)
-    return re.sub(r'\s+', ' ', query_clean).strip()
+    q = query.lower()
+    for w in stop_words:
+        q = re.sub(w, '', q, flags=re.IGNORECASE)
+    return re.sub(r'\s+', ' ', q).strip()
 
 
 def extract_attributes(filename):
@@ -107,7 +86,6 @@ def extract_attributes(filename):
     return lang, qual
 
 
-# FIX #3 & #4: Background tasks for auto-delete — no longer block the event loop.
 async def _auto_delete_search(status_msg, original_msg, manual_query):
     await asyncio.sleep(300)
     try:
@@ -122,7 +100,6 @@ async def _auto_delete_search(status_msg, original_msg, manual_query):
 
 
 async def _auto_delete_file(sent_msg, file_name, bot_username, delete_seconds=300):
-    """Auto-deletes a sent file after delete_seconds. No warning — clean silent delete."""
     await asyncio.sleep(delete_seconds)
     try:
         await sent_msg.delete()
@@ -130,356 +107,40 @@ async def _auto_delete_file(sent_msg, file_name, bot_username, delete_seconds=30
         pass
 
 
-# ── PRIVATE SEARCH HANDLER ────────────────────────────────────────────────────
+def _fmt_size(file_doc):
+    size_mb = file_doc.get("file_size", 0) / (1024 * 1024)
+    if size_mb >= 1000:
+        return f"{size_mb / 1024:.2f} GB"
+    return f"{size_mb:.0f} MB"
 
-@Client.on_message(
-    filters.text & filters.private &
-    ~filters.command(["start", "help", "about", "admin", "broadcast", "ban", "unban", "purge_cams", "reset_db"])
-)
-async def auto_filter(client: Client, message: Message, manual_query=None):
-    user_id = message.from_user.id
 
-    # FIX #20: Ban enforcement — was completely missing before
-    if await db.is_banned(user_id):
-        return await message.reply_text("🚫 **You are banned from using this bot.**", quote=True)
+def _is_series(filename: str) -> bool:
+    return bool(re.search(r'\b[Ss]\d{1,2}[Ee]\d{1,2}\b|\b[Ss]eason\s*\d+\b|\b[Ee]pisode\s*\d+\b', filename, re.IGNORECASE))
 
-    # C1: Maintenance mode — admin exempt
-    _cm_config = await db.get_config()
-    if _cm_config.get("maintenance_mode") and user_id != _ADMIN_ID:
-        return await message.reply_text(
-            _cm_config.get("maintenance_message", "🔧 Bot is under maintenance. Back soon!"),
-            quote=True
-        )
 
-    # Gate 1: join channels only — user must join public/private channels to search
-    if not await is_subscribed_join_only(client, message):
-        await send_fsub_message(client, message)
-        return
+def _series_sort_key(f):
+    name = f.get("file_name", "")
+    s = re.search(r'[Ss](\d{1,2})', name)
+    e = re.search(r'[Ee](\d{1,2})', name)
+    season  = int(s.group(1)) if s else 0
+    episode = int(e.group(1)) if e else 0
+    return (season, episode)
 
-    # Anti-Spam Rate Limiter
-    current_time = time.time()
-    if user_id in USER_SEARCH_COOLDOWN:
-        time_passed = current_time - USER_SEARCH_COOLDOWN[user_id]
-        if time_passed < COOLDOWN_TIME:
-            warning = await message.reply_text(
-                f"⏳ **Anti-Spam:** Please wait `{int(COOLDOWN_TIME - time_passed) + 1}s` before searching again.",
-                quote=True
-            )
-            await asyncio.sleep(2)
-            try:
-                await warning.delete()
-            except Exception:
-                pass
-            return
 
-    # FIX #16: Cap dict to prevent unbounded RAM growth
-    if len(USER_SEARCH_COOLDOWN) >= _COOLDOWN_MAX:
-        USER_SEARCH_COOLDOWN.clear()
-    USER_SEARCH_COOLDOWN[user_id] = current_time
-
-    start_time = time.time()
-
-    if manual_query:
-        query = manual_query
-    else:
-        original_text = message.text
-        query = clean_query(original_text)
-        clean_content = original_text.lower().strip()
-
-        if len(clean_content) < 3 or clean_content in IGNORE_WORDS:
-            main_group = _cm_config.get("main_group", "")
-            await message.reply_text(
-                f"<b>🙋 ʜᴇʏ {message.from_user.first_name} 😍 ,\n\n"
-                f"𝒀𝒐𝒖 𝒄𝒂𝒏 𝒔𝒆𝒂𝒓𝒄ʜ 𝒇𝒐𝒓 𝒎𝒐𝒗𝒊𝒆𝒔 𝒐𝒏𝒍𝒚 𝒐𝒏 𝒐𝒖𝒓 𝑴𝒐𝒗𝒊𝒆 𝑮𝒓𝒐𝒖𝒑.</b>",
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("📝 ʀᴇǫᴜᴇsᴛ ʜᴇʀᴇ", url=main_group)]]
-                ) if main_group else None,
-                quote=True,
-                parse_mode=ParseMode.HTML
-            )
-            return
-
-    # S4: Extract quality/language preset from raw query
-    raw_query_text = manual_query or (message.text if message.text else "")
-    preset_qual = None
-    preset_lang = None
-    quality_map = {
-        "4k": "4K", "2160p": "4K", "1080p": "1080p", "720p": "720p",
-        "480p": "480p", "360p": "360p", "hdrip": "HDRip", "hd": "HD"
-    }
-    for kw, qual_val in quality_map.items():
-        # Use word-boundary match to prevent "hd" matching inside "hdrip" or "download"
-        if re.search(rf"(?<![a-zA-Z0-9]){re.escape(kw)}(?![a-zA-Z0-9])", raw_query_text.lower()):
-            preset_qual = qual_val
-            query = re.sub(re.escape(kw), "", query, flags=re.IGNORECASE).strip()
-            break
-    for lang in LANGUAGES:
-        if lang.lower() in raw_query_text.lower():
-            preset_lang = lang
-            query = re.sub(re.escape(lang), "", query, flags=re.IGNORECASE).strip()
-            break
-    if not query:
-        return
-
-    results = await db.get_search_results(query)
-
+def _sort_results(results: list) -> list:
     if not results:
-        google_url = f"https://www.google.com/search?q={quote(query)}"
-        safe_query = query[:40]
-
-        # F9: Log to MongoDB — returns True if log channel alert should be sent
-        # (deduplicates alerts with 1-hour cooldown, replaces old MISSED_CACHE RAM set)
-        should_alert = await db.log_missed_search(query)
-        if should_alert:
-            asyncio.create_task(send_smart_log(
-                client,
-                f"❌ **#MissedSearch**\n\n🎬 **Movie:** `{query}`\n"
-                f"👤 **Requested by:** {message.from_user.mention}\n📍 **Where:** Private Chat\n"
-            ))
-
-        # S10: Spell correction — suggest similar titles via prefix match
-        suggestions = await db.get_prefix_suggestions(query, limit=3)
-        suggestion_buttons = []
-        for sug in suggestions:
-            safe_sug = re.sub(r"[^a-zA-Z0-9]", "_", sug)[:40]
-            suggestion_buttons.append([InlineKeyboardButton(
-                f"🔎 {sug[:30]}",
-                url=f"https://t.me/{client.me.username}?start=search_{safe_sug}"
-            )])
-
-        suggestion_buttons += [
-            [InlineKeyboardButton("🔍 Check Spelling on Google", url=google_url)],
-            [InlineKeyboardButton("📝 Request This Movie", callback_data=f"reqmovie#{safe_query}")],
-            [InlineKeyboardButton("🏠 Home", callback_data="start_home")]
-        ]
-
-        spell_hint = "\n💡 <b>Did you mean?</b> Tap a suggestion below." if suggestions else ""
-        text = (
-            f"🔍 <b>No results for</b> <code>{query}</code>\n\n"
-            f"<blockquote>This title isn't in our database yet.\n"
-            f"Check the spelling or tap Request below.{spell_hint}</blockquote>"
-        )
-        return await message.reply_text(
-            text, reply_markup=InlineKeyboardMarkup(suggestion_buttons), **_no_preview(),
-            parse_mode=ParseMode.HTML
-        )
-
-    time_taken = time.time() - start_time
-    await db.clear_old_searches()
-    session_id = ''.join(random.choices(string.ascii_letters + string.digits, k=6))
-
-    _adt_cfg = await db.get_config()
-    session_data = {
-        "results": results,
-        "query": query,
-        "speed": f"{time_taken:.3f}s",
-        "time": time.time(),
-        "preset_lang": preset_lang,
-        "preset_qual": preset_qual,
-        "auto_delete_time": int(_adt_cfg.get("auto_delete_time", 300))
-    }
-    await db.save_search(session_id, session_data)
-
-    status_msg = await message.reply_text("🔍", quote=True)
-    # S4: pass presets. If only quality is preset (no lang), use MIXED for lang
-    # so route_menu skips the language step and goes straight to quality-filtered results.
-    # If only lang is preset, pass ALL for qual so quality step shows for that lang.
-    # If both are preset, pass both and go straight to file list.
-    lang_arg = preset_lang if preset_lang else ("MIXED" if preset_qual else "ALL")
-    qual_arg = preset_qual if preset_qual else "ALL"
-    await route_menu(client, status_msg, session_id, lang_arg, qual_arg, 0)
-
-    # FIX #4: Fire-and-forget instead of blocking handler for 5 minutes
-    asyncio.create_task(_auto_delete_search(status_msg, message, manual_query))
-
-
-# ── SEARCH RESULT MENU ────────────────────────────────────────────────────────
-
-async def route_menu(client, message, session_id, lang, qual, page):
-    data = await db.get_search(session_id)
-    if not data:
-        return await message.edit_text("⚠️ **Search Session Expired.** Please search for the movie again.")
-
-    all_files = data["results"]
-    tmdb = data.get("tmdb")
-
-    filtered_files = []
-    for f in all_files:
-        f_lang, f_qual = extract_attributes(f["file_name"])
-        if lang not in ["ALL", "MIXED"] and f_lang != lang:
-            continue
-        if qual not in ["ALL", "MIXED"] and f_qual != qual:
-            continue
-        filtered_files.append((f, f_lang, f_qual))
-
-    available_langs = set(f[1] for f in filtered_files)
-    available_quals = set(f[2] for f in filtered_files)
-
-    title_display = tmdb['title'] if tmdb else data['query']
-    title_display = (
-        title_display.replace("&", "&amp;")
-                     .replace("<", "&lt;")
-                     .replace(">", "&gt;")
-    )
-
-    _del_secs = int(data.get("auto_delete_time", 300))
-    _del_mins = max(1, _del_secs // 60)
-
-    caption = (
-        f"🎬 <b>{title_display.upper()}</b>\n"
-        f"<blockquote>📦 {len(filtered_files)} files found  •  ⚡ {data['speed']}\n"
-        f"🗑 Auto-deletes in {_del_mins} mins</blockquote>\n\n"
-    )
-
-    buttons = []
-
-    if lang == "ALL" and len(available_langs) > 1:
-        caption += "🌐 <b>Step 1 of 2</b> — Choose your language:"
-        lang_counts = {}
-        for f, f_lang, _ in filtered_files:
-            lang_counts[f_lang] = lang_counts.get(f_lang, 0) + 1
-
-        row = []
-        for l in sorted(available_langs):
-            count = lang_counts.get(l, 0)
-            l_emoji = LANG_EMOJI.get(l, "🔊")
-            row.append(InlineKeyboardButton(
-                f"{l_emoji} {l} ({count})",
-                callback_data=f"lang#{session_id}#{l}"
-            ))
-            if len(row) == 2:
-                buttons.append(row)
-                row = []
-        if row:
-            buttons.append(row)
-        buttons.append([InlineKeyboardButton("🌍 Show All Languages", callback_data=f"lang#{session_id}#MIXED")])
-        buttons.append([InlineKeyboardButton("🏠 Home", callback_data="start_home")])
-
-    elif qual == "ALL" and len(available_quals) > 1:
-        display_lang = lang if lang not in ["ALL", "MIXED"] else "All Languages"
-        caption += f"🎞 <b>Step 2 of 2</b> — Choose quality for {display_lang}:"
-        qual_counts = {}
-        for f, _, f_qual in filtered_files:
-            qual_counts[f_qual] = qual_counts.get(f_qual, 0) + 1
-
-        row = []
-        for q in sorted(available_quals):
-            count = qual_counts.get(q, 0)
-            row.append(InlineKeyboardButton(
-                f"{q} ({count})",
-                callback_data=f"qual#{session_id}#{lang}#{q}"
-            ))
-            if len(row) == 2:
-                buttons.append(row)
-                row = []
-        if row:
-            buttons.append(row)
-        buttons.append([InlineKeyboardButton("🎞 Show All Qualities", callback_data=f"qual#{session_id}#{lang}#MIXED")])
-        buttons.append([
-            InlineKeyboardButton("◀️ Back", callback_data=f"lang#{session_id}#ALL"),
-            InlineKeyboardButton("🏠 Home", callback_data="start_home")
-        ])
-
-    else:
-        lang_tag = f"  {LANG_EMOJI.get(lang, '🔊')} {lang}" if lang not in ["ALL", "MIXED"] else ""
-        qual_tag = f"  {qual}" if qual not in ["ALL", "MIXED"] else ""
-        caption += f"📂 <b>{len(filtered_files)} files</b>{lang_tag}{qual_tag}\n👇 Tap a file to receive it in your PM:"
-
-        per_page = 10
-        total_pages = (len(filtered_files) + per_page - 1) // per_page
-        start_idx = page * per_page
-        end_idx = start_idx + per_page
-        page_files = filtered_files[start_idx:end_idx]
-
-        for f, f_lang, f_qual in page_files:
-            size_mb = f.get('file_size', 0) / (1024 * 1024)
-            size_str = f"{size_mb / 1024:.2f} GB" if size_mb >= 1024 else f"{size_mb:.0f} MB"
-
-            display_name = f['file_name']
-            if lang not in ["ALL", "MIXED"]:
-                display_name = re.sub(rf'\b{re.escape(lang)}\b', '', display_name, flags=re.IGNORECASE)
-            if qual not in ["ALL", "MIXED"]:
-                display_name = re.sub(rf'\b{re.escape(qual)}\b', '', display_name, flags=re.IGNORECASE)
-            display_name = re.sub(r'\s+', ' ', display_name).strip(" -_")
-
-            # Clean label: quality • source • size  (no repeated movie name)
-            qual_label = f_qual if f_qual not in ["Other", ""] else ""
-            lang_label = f_lang if f_lang not in ["Other", ""] and lang in ["ALL", "MIXED"] else ""
-
-            parts = []
-            if qual_label:
-                parts.append(qual_label)
-            if lang_label:
-                parts.append(lang_label)
-            parts.append(size_str)
-
-            btn_text = "🎬 " + "  •  ".join(parts)
-            buttons.append([InlineKeyboardButton(btn_text, callback_data=f"sendfile#{f['_id']}")])
-
-        nav_buttons = []
-        if page > 0:
-            nav_buttons.append(InlineKeyboardButton(
-                "⬅️ Prev", callback_data=f"page#{session_id}#{lang}#{qual}#{page-1}"
-            ))
-        if total_pages > 1:
-            nav_buttons.append(InlineKeyboardButton(
-                f"📄 {page+1}/{total_pages}", callback_data="ignore"
-            ))
-        if page < total_pages - 1:
-            nav_buttons.append(InlineKeyboardButton(
-                "Next ➡️", callback_data=f"page#{session_id}#{lang}#{qual}#{page+1}"
-            ))
-
-        if nav_buttons:
-            buttons.append(nav_buttons)
-        buttons.append([
-            InlineKeyboardButton("◀️ Back", callback_data=f"lang#{session_id}#ALL"),
-            InlineKeyboardButton("🏠 Home", callback_data="start_home")
-        ])
-
-    markup = InlineKeyboardMarkup(buttons)
-    try:
-        await message.edit_text(text=caption, reply_markup=markup, parse_mode=ParseMode.HTML)
-    except MessageNotModified:
-        pass
-    except Exception as e:
-        logger.error(f"UI Route Error: {e}")
-
-
-# ── CALLBACK HANDLERS ─────────────────────────────────────────────────────────
-
-@Client.on_callback_query(filters.regex(r"^lang#"))
-async def handle_language(client: Client, callback: CallbackQuery):
-    _, session_id, lang = callback.data.split("#")
-    await route_menu(client, callback.message, session_id, lang, "ALL", 0)
-    await callback.answer()
-
-
-@Client.on_callback_query(filters.regex(r"^qual#"))
-async def handle_quality(client: Client, callback: CallbackQuery):
-    _, session_id, lang, qual = callback.data.split("#")
-    await route_menu(client, callback.message, session_id, lang, qual, 0)
-    await callback.answer()
-
-
-@Client.on_callback_query(filters.regex(r"^page#"))
-async def handle_pagination(client: Client, callback: CallbackQuery):
-    _, session_id, lang, qual, page = callback.data.split("#")
-    await route_menu(client, callback.message, session_id, lang, qual, int(page))
-    await callback.answer()
-
-
-@Client.on_callback_query(filters.regex(r"^ignore$"))
-async def handle_ignore(client: Client, callback: CallbackQuery):
-    await callback.answer()
+        return results
+    has_series = any(_is_series(f.get("file_name", "")) for f in results)
+    if has_series:
+        return sorted(results, key=_series_sort_key)
+    return sorted(results, key=lambda f: f.get("file_size", 0), reverse=True)
 
 
 def _build_caption(config, file_data, delete_minutes, bot_username):
-    """C6: Builds file caption from template or falls back to default."""
     template = config.get("file_caption_template", "")
     if template:
         f_lang, f_qual = extract_attributes(file_data.get("file_name", ""))
-        size_mb = file_data.get("file_size", 0) / (1024 * 1024)
+        size_mb  = file_data.get("file_size", 0) / (1024 * 1024)
         size_str = f"{size_mb / 1024:.2f}GB" if size_mb > 1024 else f"{size_mb:.0f}MB"
         try:
             return template.format(
@@ -491,10 +152,10 @@ def _build_caption(config, file_data, delete_minutes, bot_username):
                 delete_minutes=delete_minutes
             )
         except (KeyError, ValueError):
-            pass  # Bad template — fall through to default
-    # Build premium caption with metadata
+            pass
+
     f_lang, f_qual = extract_attributes(file_data.get("file_name", ""))
-    size_mb = file_data.get("file_size", 0) / (1024 * 1024)
+    size_mb  = file_data.get("file_size", 0) / (1024 * 1024)
     size_str = f"{size_mb / 1024:.2f} GB" if size_mb >= 1024 else f"{size_mb:.0f} MB"
 
     lang_emojis = {
@@ -503,12 +164,13 @@ def _build_caption(config, file_data, delete_minutes, bot_username):
         "Dual Audio": "🎧", "Multi Audio": "🎵"
     }
     lang_icon = lang_emojis.get(f_lang, "🎬")
-    lang_tag = f"{lang_icon} {f_lang}" if f_lang not in ["Other", ""] else ""
-    qual_tag = f"🎞 {f_qual}" if f_qual not in ["Other", ""] else ""
-    size_tag = f"💿 {size_str}"
-
-    meta_parts = [p for p in [lang_tag, qual_tag, size_tag] if p]
-    meta_line = "  •  ".join(meta_parts)
+    parts     = []
+    if f_lang not in ["Other", ""]:
+        parts.append(f"{lang_icon} {f_lang}")
+    if f_qual not in ["Other", ""]:
+        parts.append(f"🎞 {f_qual}")
+    parts.append(f"💿 {size_str}")
+    meta_line = "  •  ".join(parts)
 
     return (
         f"🍿 <b>{_html(file_data['file_name'])}</b>\n"
@@ -518,127 +180,378 @@ def _build_caption(config, file_data, delete_minutes, bot_username):
     )
 
 
+async def show_results(client, message, session_id, page):
+    data = await db.get_search(session_id)
+    if not data:
+        try:
+            await message.edit_text("⚠️ Session expired. Search again.")
+        except Exception:
+            pass
+        return
+
+    results     = data["results"]
+    query       = data["query"]
+    tmdb        = data.get("tmdb")
+    per_page    = 8
+    total       = len(results)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page        = max(0, min(page, total_pages - 1))
+    start_idx   = page * per_page
+    page_files  = results[start_idx: start_idx + per_page]
+
+    _del_secs = int(data.get("auto_delete_time", 300))
+    _del_mins = max(1, _del_secs // 60)
+
+    title_display = _html(tmdb["title"] if tmdb else query.title())
+
+    caption = (
+        f"🎬 <b>{title_display}</b>\n"
+    )
+
+    if tmdb:
+        if tmdb.get("overview"):
+            caption += f"<blockquote>{_html(tmdb['overview'])}</blockquote>\n"
+        if tmdb.get("rating"):
+            caption += f"⭐ <b>{tmdb['rating']}/10</b>  •  "
+        caption += f"📦 {total} files  •  ⚡ {data.get('speed', '')}\n"
+        caption += f"🗑 Auto-deletes in {_del_mins} mins\n\n"
+    else:
+        caption += (
+            f"<blockquote>📦 {total} files found  •  ⚡ {data.get('speed', '')}\n"
+            f"🗑 Auto-deletes in {_del_mins} mins</blockquote>\n\n"
+        )
+
+    caption += "👇 Tap a file to receive it in your PM:"
+
+    buttons = []
+    for f in page_files:
+        f_lang, f_qual = extract_attributes(f["file_name"])
+        size_str = _fmt_size(f)
+
+        name = re.sub(r'\s+', ' ', f["file_name"]).strip()
+
+        meta_parts = []
+        if f_qual not in ["Other", ""]:
+            meta_parts.append(f_qual)
+        if f_lang not in ["Other", ""]:
+            meta_parts.append(f_lang)
+
+        meta     = " | ".join(meta_parts)
+        size_tag = f"[{size_str}]"
+
+        if meta:
+            available = 48 - len(size_tag) - len(meta) - 4
+            truncated = name[:max(10, available)] + ("…" if len(name) > max(10, available) else "")
+            btn_text  = f"{size_tag} {truncated} | {meta}"
+        else:
+            available = 52 - len(size_tag) - 1
+            truncated = name[:available] + ("…" if len(name) > available else "")
+            btn_text  = f"{size_tag} {truncated}"
+
+        buttons.append([InlineKeyboardButton(btn_text, callback_data=f"sendfile#{f['_id']}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"page#{session_id}#{page-1}"))
+    if total_pages > 1:
+        nav.append(InlineKeyboardButton(f"📄 {page+1}/{total_pages}", callback_data="ignore"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"page#{session_id}#{page+1}"))
+    if nav:
+        buttons.append(nav)
+
+    buttons.append([InlineKeyboardButton("🏠 Home", callback_data="start_home")])
+    markup = InlineKeyboardMarkup(buttons)
+
+    # Page 0 with TMDB poster → send as photo replacing the 🔍 placeholder
+    if page == 0 and tmdb and tmdb.get("poster"):
+        try:
+            chat_id = message.chat.id
+            await message.delete()
+            await client.send_photo(
+                chat_id=chat_id,
+                photo=tmdb["poster"],
+                caption=caption,
+                reply_markup=markup,
+                parse_mode=ParseMode.HTML
+            )
+            return
+        except Exception:
+            pass  # fall through to text if photo fails
+
+    try:
+        await message.edit_text(text=caption, reply_markup=markup, parse_mode=ParseMode.HTML)
+    except MessageNotModified:
+        pass
+    except Exception as e:
+        logger.error(f"show_results error: {e}")
+
+
+route_menu = show_results
+
+
+@Client.on_message(
+    filters.text & filters.private &
+    ~filters.command(["start", "help", "about", "admin", "broadcast", "ban", "unban", "purge_cams", "reset_db", "update"])
+)
+async def auto_filter(client: Client, message: Message, manual_query=None):
+    user_id = message.from_user.id
+
+    if await db.is_banned(user_id):
+        return await message.reply_text("🚫 **You are banned from using this bot.**", quote=True)
+
+    config = await db.get_config()
+    if config.get("maintenance_mode") and user_id != _ADMIN_ID:
+        return await message.reply_text(
+            config.get("maintenance_message", "🔧 Bot is under maintenance. Back soon!"),
+            quote=True
+        )
+
+    if not await is_subscribed_join_only(client, message):
+        await send_fsub_message(client, message)
+        return
+
+    current_time = time.time()
+    if user_id in USER_SEARCH_COOLDOWN:
+        passed = current_time - USER_SEARCH_COOLDOWN[user_id]
+        if passed < COOLDOWN_TIME:
+            warning = await message.reply_text(
+                f"⏳ Wait `{int(COOLDOWN_TIME - passed) + 1}s` before searching again.",
+                quote=True
+            )
+            await asyncio.sleep(2)
+            try:
+                await warning.delete()
+            except Exception:
+                pass
+            return
+
+    if len(USER_SEARCH_COOLDOWN) >= _COOLDOWN_MAX:
+        USER_SEARCH_COOLDOWN.clear()
+    USER_SEARCH_COOLDOWN[user_id] = current_time
+
+    if manual_query:
+        query = manual_query
+    else:
+        raw   = message.text
+        query = clean_query(raw)
+        if len(raw.strip()) < 3 or raw.strip().lower() in IGNORE_WORDS:
+            main_group = config.get("main_group", "")
+            return await message.reply_text(
+                f"<b>Type a movie or series name to search!</b>",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("📝 Request Here", url=main_group)]]
+                ) if main_group else None,
+                quote=True, parse_mode=ParseMode.HTML
+            )
+
+    if not query:
+        return
+
+    start_time = time.time()
+    results    = await db.get_search_results(query)
+
+    if not results:
+        google_url = f"https://www.google.com/search?q={quote(query)}"
+        safe_query = query[:40]
+
+        should_alert = await db.log_missed_search(query)
+        if should_alert:
+            asyncio.create_task(send_smart_log(
+                client,
+                f"❌ **#MissedSearch**\n\n🎬 `{query}`\n"
+                f"👤 {message.from_user.mention}\n📍 Private Chat"
+            ))
+
+        suggestions = await db.get_prefix_suggestions(query, limit=3)
+        sug_buttons = []
+        for sug in suggestions:
+            safe_sug = re.sub(r"[^a-zA-Z0-9]", "_", sug)[:40]
+            sug_buttons.append([InlineKeyboardButton(
+                f"🔎 {sug[:30]}",
+                url=f"https://t.me/{client.me.username}?start=search_{safe_sug}"
+            )])
+
+        sug_buttons += [
+            [InlineKeyboardButton("🔍 Search on Google", url=google_url)],
+            [InlineKeyboardButton("📝 Request This Movie", callback_data=f"reqmovie#{safe_query}")],
+            [InlineKeyboardButton("🏠 Home", callback_data="start_home")]
+        ]
+
+        hint = "\n💡 <b>Did you mean one of these?</b>" if suggestions else ""
+        return await message.reply_text(
+            f"🔍 <b>No results for</b> <code>{query}</code>\n\n"
+            f"<blockquote>Not in our database yet.\n"
+            f"Check spelling or tap Request below.{hint}</blockquote>",
+            reply_markup=InlineKeyboardMarkup(sug_buttons),
+            parse_mode=ParseMode.HTML, **_no_preview()
+        )
+
+    time_taken = time.time() - start_time
+    await db.clear_old_searches()
+    session_id = "".join(random.choices(string.ascii_letters + string.digits, k=6))
+
+    # Fetch TMDB data if API key is set
+    tmdb_data = None
+    try:
+        best_name = results[0]["file_name"]
+        clean_tmdb = re.sub(
+            r"(1080p|720p|480p|4K|HDRip|WEB-DL|WEBRip|BluRay|PreDVD|CAM|"
+            r"HD.Rip|x264|x265|HEVC|Dual.Audio|Multi.Audio|"
+            r"Malayalam|Tamil|Telugu|Hindi|English|Kannada)",
+            "", best_name, flags=re.IGNORECASE
+        )
+        clean_tmdb = re.sub(r"[\(\[].*?[\)\]]", "", clean_tmdb)
+        clean_tmdb = re.sub(r"[^a-zA-Z0-9\s]", " ", clean_tmdb).strip()
+        if len(clean_tmdb) > 2:
+            tmdb_data = await get_movie_data(clean_tmdb)
+        if not tmdb_data:
+            tmdb_data = await get_movie_data(query)
+    except Exception:
+        tmdb_data = None
+
+    session_data = {
+        "results":          _sort_results(results),
+        "query":            query,
+        "tmdb":             tmdb_data,
+        "speed":            f"{time_taken:.3f}s",
+        "time":             time.time(),
+        "auto_delete_time": int(config.get("auto_delete_time", 300))
+    }
+    await db.save_search(session_id, session_data)
+
+    status_msg = await message.reply_text("🔍", quote=True)
+    await show_results(client, status_msg, session_id, 0)
+    asyncio.create_task(_auto_delete_search(status_msg, message, manual_query))
+
+
+@Client.on_callback_query(filters.regex(r"^page#"))
+async def handle_pagination(client: Client, callback: CallbackQuery):
+    parts      = callback.data.split("#")
+    session_id = parts[1]
+    page       = int(parts[2])
+
+    data = await db.get_search(session_id)
+    if not data:
+        await callback.answer("⚠️ Session expired.", show_alert=True)
+        return
+
+    results     = data["results"]
+    tmdb        = data.get("tmdb")
+    per_page    = 8
+    total       = len(results)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page        = max(0, min(page, total_pages - 1))
+    start_idx   = page * per_page
+    page_files  = results[start_idx: start_idx + per_page]
+
+    _del_secs = int(data.get("auto_delete_time", 300))
+    _del_mins = max(1, _del_secs // 60)
+
+    title_display = _html(tmdb["title"] if tmdb else data["query"].title())
+    caption = f"🎬 <b>{title_display}</b>\n"
+
+    if tmdb:
+        if tmdb.get("overview"):
+            caption += f"<blockquote>{_html(tmdb['overview'])}</blockquote>\n"
+        if tmdb.get("rating"):
+            caption += f"⭐ <b>{tmdb['rating']}/10</b>  •  "
+        caption += f"📦 {total} files  •  ⚡ {data.get('speed', '')}\n"
+        caption += f"🗑 Auto-deletes in {_del_mins} mins\n\n"
+    else:
+        caption += (
+            f"<blockquote>📦 {total} files  •  ⚡ {data.get('speed', '')}\n"
+            f"🗑 Auto-deletes in {_del_mins} mins</blockquote>\n\n"
+        )
+    caption += "👇 Tap a file to receive it in your PM:"
+
+    buttons = []
+    for f in page_files:
+        f_lang, f_qual = extract_attributes(f["file_name"])
+        size_str = _fmt_size(f)
+        name     = re.sub(r'\s+', ' ', f["file_name"]).strip()
+        meta_parts = []
+        if f_qual not in ["Other", ""]:
+            meta_parts.append(f_qual)
+        if f_lang not in ["Other", ""]:
+            meta_parts.append(f_lang)
+        meta     = " | ".join(meta_parts)
+        size_tag = f"[{size_str}]"
+        if meta:
+            available = 48 - len(size_tag) - len(meta) - 4
+            truncated = name[:max(10, available)] + ("…" if len(name) > max(10, available) else "")
+            btn_text  = f"{size_tag} {truncated} | {meta}"
+        else:
+            available = 52 - len(size_tag) - 1
+            truncated = name[:available] + ("…" if len(name) > available else "")
+            btn_text  = f"{size_tag} {truncated}"
+        buttons.append([InlineKeyboardButton(btn_text, callback_data=f"sendfile#{f['_id']}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"page#{session_id}#{page-1}"))
+    if total_pages > 1:
+        nav.append(InlineKeyboardButton(f"📄 {page+1}/{total_pages}", callback_data="ignore"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"page#{session_id}#{page+1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton("🏠 Home", callback_data="start_home")])
+    markup = InlineKeyboardMarkup(buttons)
+
+    msg = callback.message
+    try:
+        if getattr(msg, "photo", None) or getattr(msg, "document", None):
+            await msg.edit_caption(caption=caption, reply_markup=markup, parse_mode=ParseMode.HTML)
+        else:
+            await msg.edit_text(text=caption, reply_markup=markup, parse_mode=ParseMode.HTML)
+    except MessageNotModified:
+        pass
+    except Exception as e:
+        logger.error(f"Pagination error: {e}")
+
+    await callback.answer()
+
+
+@Client.on_callback_query(filters.regex(r"^ignore$"))
+async def handle_ignore(client: Client, callback: CallbackQuery):
+    await callback.answer()
+
+
 @Client.on_callback_query(filters.regex(r"^sendfile#"))
 async def send_movie_file(client: Client, callback: CallbackQuery):
     _, file_obj_id = callback.data.split("#")
     file_data = await db.get_file(file_obj_id)
 
     if not file_data:
-        return await callback.answer(
-            "⚠️ This file is no longer available in the database.", show_alert=True
-        )
+        return await callback.answer("⚠️ File no longer available.", show_alert=True)
 
-    # Gate 1: join channels — catches users coming from group buttons who bypassed PM search
     if not await is_subscribed_join_only(client, callback):
-        await callback.answer("🔐 Please join our channel first!", show_alert=False)
-        await send_fsub_message(client, callback.message, pending_file_id=file_obj_id)
+        await callback.answer("🔐 Join our channel first!", show_alert=False)
+        await send_fsub_message(client, callback, pending_file_id=file_obj_id)
         return
 
-
-    # req_fsub gate — periodic random channel join request prompt
     if not await check_and_show_req_fsub(client, callback, file_obj_id):
-        return  # prompt shown — file will be sent by rfsub_check_callback
+        return
 
-    await callback.answer("📤 Sending file... Please wait!", show_alert=False)
+    await callback.answer("📤 Sending file...", show_alert=False)
 
-    config = await db.get_config()
+    config         = await db.get_config()
     delete_seconds = int(config.get("auto_delete_time", 300))
     delete_minutes = delete_seconds // 60
 
     try:
-        sent_message = await client.send_cached_media(
+        sent = await client.send_cached_media(
             chat_id=callback.message.chat.id,
             file_id=file_data["file_id"],
             caption=_build_caption(config, file_data, delete_minutes, client.me.username),
             parse_mode=ParseMode.HTML
         )
-        asyncio.create_task(_auto_delete_file(sent_message, file_data['file_name'], client.me.username, delete_seconds))
+        asyncio.create_task(_auto_delete_file(sent, file_data["file_name"], client.me.username, delete_seconds))
     except Exception as e:
-        err_str = str(e).lower()
-        if any(k in err_str for k in ["file_reference", "invalid", "not found", "media"]):
+        err = str(e).lower()
+        if any(k in err for k in ["file_reference", "invalid", "not found", "media"]):
             await db.delete_file_by_id(file_data["file_id"])
             await callback.message.reply_text(
                 f"❌ **File Unavailable**\n\n"
-                f"{_html(file_data['file_name'])} has expired or been deleted from Telegram's servers.\n"
-                f"It has been removed from our database. Please search again for an updated copy.",
-                parse_mode=ParseMode.HTML
-            )
-        else:
-            await callback.message.reply_text(
-                "❌ **Could not send file.** Please try again in a moment."
-            )
-        logger.error(f"send_cached_media failed for {file_data['file_id']}: {e}")
-
-
-@Client.on_callback_query(filters.regex(r"^check_fsub#"))
-async def check_fsub_callback(client: Client, callback: CallbackQuery):
-    """
-    Handles FSub verification. callback_data format: check_fsub#<file_id_or_none>
-    If a file_id is present, the file is sent automatically after successful verification
-    so the user doesn't have to tap the button again.
-    """
-    file_part = callback.data.split("#")[1]
-    pending_file_id = file_part if file_part != "none" else None
-
-    join_ok = await is_subscribed_join_only(client, callback)
-    if not join_ok:
-        await callback.answer(
-            "❌ You haven't joined all channels yet! Please join and try again.",
-            show_alert=True
-        )
-        return
-
-    # All gates passed — save chat_id before deleting (can't access after delete)
-    chat_id = callback.message.chat.id
-    await callback.message.delete()
-
-    if pending_file_id:
-        # User was trying to get a file — send it now automatically
-        file_data = await db.get_file(pending_file_id)
-        if not file_data:
-            await client.send_message(chat_id,
-                "✅ **Verified!** But the file is no longer available. Please search again."
-            )
-            return
-
-        config = await db.get_config()
-        delete_seconds = int(config.get("auto_delete_time", 300))
-        delete_minutes = delete_seconds // 60
-
-        try:
-            sent_msg = await client.send_cached_media(
-                chat_id=chat_id,
-                file_id=file_data["file_id"],
-                caption=_build_caption(config, file_data, delete_minutes, client.me.username),
-                parse_mode=ParseMode.HTML
-            )
-            asyncio.create_task(_auto_delete_file(sent_msg, file_data['file_name'], client.me.username, delete_seconds))
-        except Exception as e:
-            err_str = str(e).lower()
-            if any(k in err_str for k in ["file_reference", "invalid", "not found", "media"]):
-                await db.delete_file_by_id(file_data["file_id"])
-                await client.send_message(chat_id,
-                    "❌ **File Unavailable** — it has expired. Please search again.",
-                    parse_mode=ParseMode.HTML
-                )
-            else:
-                await client.send_message(chat_id, "❌ Could not send file. Please try again.")
-    else:
-        # No pending file — just confirm they can now search
-        await client.send_message(chat_id,
-            "✅ **Verification Successful!**\n\n"
-            "<blockquote>You're all set! Type any movie or series name to search.</blockquote>",
-            parse_mode=ParseMode.HTML
-        )
-
-
-# ── ISSUE #15 FIX ─────────────────────────────────────────────────────────────
-# Removed group_filter_handler from this file entirely.
-# group_connect.py already handles all group message logic (chat word filtering,
-# search, not-found, request button). Having it here too caused double MongoDB
-# queries on every single group message. group_connect.py is the single source of truth.
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-# FIX #9: Duplicate reqmovie# handler also removed.
-# Canonical handler with full ticket system lives in request.py.
+                f"{_html(file
