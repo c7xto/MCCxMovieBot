@@ -4,6 +4,7 @@ import time
 import json
 import asyncio
 import logging
+from functools import lru_cache
 from bson.objectid import ObjectId
 from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
@@ -15,6 +16,11 @@ logger = logging.getLogger(__name__)
 _config_cache = None
 _config_cache_ts = 0.0
 _CONFIG_TTL = 60
+
+
+@lru_cache(maxsize=4096)
+def compile_regex(pattern):
+    return re.compile(pattern, re.IGNORECASE)
 
 
 class Database:
@@ -473,40 +479,92 @@ class Database:
                 skipped += len(batch)
         return migrated, skipped
 
-    async def get_search_results(self, query):
-        results = []
-        clean = re.sub(r"[^a-zA-Z0-9]", " ", query.strip())
-        words = [w for w in clean.split() if w]
-        if not words:
-            return []
-        conditions  = [{"file_name": {"$regex": f"(?:^|[\\W_]){re.escape(w)}(?:[\\W_]|$)", "$options": "i"}} for w in words]
-        mongo_query = {"$and": conditions}
+    async def get_search_results(self, query, max_results=40, offset=0):
+        """DreamXBotz-style search: single ordered regex (words must appear in
+        order, separated by [\\s.+-_]), $natural sort, fanned across all clusters."""
+        if isinstance(query, list):
+            raw_pattern = "|".join(re.escape(q.strip()) for q in query if q and q.strip())
+            if not raw_pattern:
+                return []
+            regex = compile_regex(raw_pattern)
+        else:
+            query = query.strip()
+            if not query:
+                return []
+            if " " in query:
+                words = [re.escape(w) for w in query.split() if w]
+                raw_pattern = (r".*[\s\.\+\-_]".join(words) if words else r".")
+            else:
+                raw_pattern = r"(\b|[\.\+\-_])" + re.escape(query) + r"(\b|[\.\+\-_])"
+            try:
+                regex = compile_regex(raw_pattern)
+            except re.error:
+                return []
+
+        filter_mongo = {"file_name": regex}
+
+        limit = max_results + 1
+        seen_ids = set()
+        files = []
         for col in self.file_cols:
-            cursor = col.find(mongo_query).limit(40)
+            cursor = col.find(filter_mongo).sort("$natural", -1).skip(offset).limit(limit)
             async for doc in cursor:
-                if not any(r["file_id"] == doc["file_id"] for r in results):
-                    results.append(doc)
-                if len(results) >= 40:
-                    break
-            if len(results) >= 40:
+                fid = doc.get("file_id")
+                if fid in seen_ids:
+                    continue
+                seen_ids.add(fid)
+                files.append(doc)
+            if len(files) >= limit:
                 break
 
-        def _natural(d):
-            return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", d["file_name"])]
+        return files[:max_results]
 
-        results.sort(key=_natural)
-        return results[:40]
+    async def get_bad_files(self, query, max_results=300):
+        """DreamXBotz-style broad scan used for admin/duplicate tooling — same
+        ordered-regex pattern as get_search_results but no offset, higher cap."""
+        query = query.strip()
+        if not query:
+            return []
+        if " " not in query:
+            raw_pattern = r"(\b|[\.\+\-_])" + re.escape(query) + r"(\b|[\.\+\-_])"
+        else:
+            raw_pattern = r".*[\s\.\+\-_]".join(re.escape(w) for w in query.split())
+        try:
+            regex = compile_regex(raw_pattern)
+        except re.error:
+            return []
+        filter_mongo = {"file_name": regex}
+
+        seen_ids = set()
+        files = []
+        for col in self.file_cols:
+            cursor = col.find(filter_mongo).sort("$natural", -1).limit(max_results)
+            async for doc in cursor:
+                fid = doc.get("file_id")
+                if fid in seen_ids:
+                    continue
+                seen_ids.add(fid)
+                files.append(doc)
+            if len(files) >= max_results:
+                break
+        return files[:max_results]
 
     async def get_prefix_suggestions(self, query, limit=3):
         clean = re.sub(r"[^a-zA-Z0-9]", " ", query.strip())
-        words = [w for w in clean.split() if len(w) >= 5]
+        words = [w for w in clean.split() if len(w) >= 4]
         if not words:
             return []
-        prefix      = words[0][:5]
+        # Use the longest significant word, not just the first one — the first word
+        # in a query is often noise the stop-word stripper didn't catch.
+        anchor      = max(words, key=len)
+        prefix      = anchor[:5]
         suggestions = []
         seen        = set()
         for col in self.file_cols:
-            cursor = col.find({"file_name": {"$regex": f"^{re.escape(prefix)}", "$options": "i"}}, {"file_name": 1}).limit(10)
+            cursor = col.find(
+                {"file_name": {"$regex": f"(?:^|[\\W_]){re.escape(prefix)}", "$options": "i"}},
+                {"file_name": 1}
+            ).limit(15)
             async for doc in cursor:
                 title = " ".join(doc.get("file_name", "").split()[:4])
                 if title.lower() not in seen:
