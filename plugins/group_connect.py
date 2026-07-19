@@ -23,6 +23,7 @@ from plugins.filter import (
     send_smart_log, extract_attributes, _html, _fmt_size,
     _sort_results, clean_query, LANG_EMOJI
 )
+from plugins.health_monitor import _log_task_crash
 from tmdb import get_movie_data
 
 logger = logging.getLogger(__name__)
@@ -192,7 +193,12 @@ async def group_search(client: Client, message: Message):
 
     start_time = time.time()
     results    = await db.get_search_results(query)
-    asyncio.create_task(db.increment_group_search(message.chat.id))
+    # increment_group_search has no internal try/except, unlike the other
+    # fire-and-forget calls in this file — a transient Mongo error here would
+    # otherwise vanish into asyncio's default "Task exception was never
+    # retrieved" log instead of reaching the admin log channel.
+    count_task = asyncio.create_task(db.increment_group_search(message.chat.id))
+    count_task.add_done_callback(lambda t: _log_task_crash(t, client, "increment_group_search"))
 
     # ── No results ────────────────────────────────────────────────────────────
     if not results:

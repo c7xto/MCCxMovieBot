@@ -17,10 +17,11 @@ from dotenv import load_dotenv
 from pyrogram import Client, filters
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.enums import ParseMode
+from utils import ADMIN_ID
+from plugins.health_monitor import _log_task_crash
 
 load_dotenv()
 logger = logging.getLogger(__name__)
-ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 
 GITHUB_REPO   = "c7xto/mccxmoviebot"
 GITHUB_BRANCH = "main"
@@ -63,6 +64,16 @@ async def _download(session: aiohttp.ClientSession, path: str) -> bytes:
         return await r.read()
 
 
+def _write_file(path: str, content: bytes):
+    """Synchronous disk I/O — always call via asyncio.to_thread so it
+    doesn't block the event loop for every user while an update runs."""
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(content)
+
+
 async def _do_update(client: Client, status: Message):
     # Step 1 — fetch file list
     try:
@@ -101,11 +112,7 @@ async def _do_update(client: Client, status: Message):
         for path in to_update:
             try:
                 content = await _download(s, path)
-                parent  = os.path.dirname(path)
-                if parent:
-                    os.makedirs(parent, exist_ok=True)
-                with open(path, "wb") as f:
-                    f.write(content)
+                await asyncio.to_thread(_write_file, path, content)
                 updated.append(path)
             except Exception as e:
                 failed.append(f"{path} ({e})")
@@ -187,7 +194,12 @@ async def cb_upd_confirm(client: Client, callback: CallbackQuery):
     status = await callback.message.edit_text(
         "🔄 **Updater** — initialising…", parse_mode=ParseMode.MARKDOWN
     )
-    asyncio.create_task(_do_update(client, status))
+    # _do_update ends with os.execv() — if that call itself fails (rare, but
+    # possible depending on host), the failure would otherwise be completely
+    # invisible: the bot appears to hang mid-"update" with no restart and no
+    # log line anywhere.
+    update_task = asyncio.create_task(_do_update(client, status))
+    update_task.add_done_callback(lambda t: _log_task_crash(t, client, "self_update"))
 
 
 # ── Cancel ────────────────────────────────────────────────────────────────────

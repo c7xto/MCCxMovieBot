@@ -5,9 +5,10 @@ import random
 import string
 import asyncio
 import logging
+from collections import OrderedDict
 from urllib.parse import quote
 from dotenv import load_dotenv
-from pyrogram.errors import MessageNotModified, FloodWait
+from pyrogram.errors import MessageNotModified, FloodWait, UserNotParticipant
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
 from pyrogram.types import (
@@ -21,18 +22,16 @@ except ImportError:
     def _no_preview(): return {"disable_web_page_preview": True}
 from database.db import db
 from plugins.req_fsub import check_and_show_req_fsub
-from utils import is_subscribed, is_subscribed_join_only, send_fsub_message
+from utils import is_subscribed, is_subscribed_join_only, send_fsub_message, _parse_fsub_entry, ADMIN_ID
 from tmdb import get_movie_data
 
 load_dotenv()
 logger = logging.getLogger(__name__)
-_ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 
-MISSED_CACHE = set()
 IGNORE_WORDS = {"hi", "hello", "bro", "pls", "plz", "bot", "help", "admin", "sir"}
 
 _COOLDOWN_MAX = 10000
-USER_SEARCH_COOLDOWN = {}
+USER_SEARCH_COOLDOWN = OrderedDict()  # LRU: oldest entry is first
 COOLDOWN_TIME = 2
 
 LANGUAGES = ["Malayalam", "Tamil", "Telugu", "Hindi", "English", "Kannada", "Dual Audio", "Multi Audio"]
@@ -59,28 +58,34 @@ async def send_smart_log(client, text):
         pass
 
 
-def clean_query(query):
-    stop_words = [
+# Precompiled once at import time rather than rebuilt from pattern strings on
+# every incoming search/result-render — clean_query() runs on every message
+# and extract_attributes() runs once per file on every page render.
+_STOP_WORD_RES = [
+    re.compile(p, re.IGNORECASE) for p in (
         r'\bplease\b', r'\bsend\b', r'\bme\b', r'\bthe\b', r'\bmovie\b',
         r'\bseries\b', r'\bhd\b', r'\bprint\b', r'\bdownload\b', r'\blink\b',
         r'\bbro\b', r'\bcan\b', r'\byou\b', r'\bprovide\b', r'\bi\b',
         r'\bneed\b', r'\bwant\b'
-    ]
+    )
+]
+_WS_RE = re.compile(r'\s+')
+
+
+def clean_query(query):
     q = query.lower()
-    for w in stop_words:
-        q = re.sub(w, '', q, flags=re.IGNORECASE)
-    return re.sub(r'\s+', ' ', q).strip()
+    for pattern in _STOP_WORD_RES:
+        q = pattern.sub('', q)
+    return _WS_RE.sub(' ', q).strip()
+
+
+_LANG_RES = [(l, re.compile(r'\b' + l + r'\b', re.IGNORECASE)) for l in LANGUAGES]
+_QUAL_RES = [(q, re.compile(r'\b' + q.replace(' ', r'\s*') + r'\b', re.IGNORECASE)) for q in QUALITIES]
 
 
 def extract_attributes(filename):
-    lang = next(
-        (l for l in LANGUAGES if re.search(r'\b' + l + r'\b', filename, re.IGNORECASE)),
-        "Other"
-    )
-    qual = next(
-        (q for q in QUALITIES if re.search(r'\b' + q.replace(' ', r'\s*') + r'\b', filename, re.IGNORECASE)),
-        "Other"
-    )
+    lang = next((l for l, pat in _LANG_RES if pat.search(filename)), "Other")
+    qual = next((q for q, pat in _QUAL_RES if pat.search(filename)), "Other")
     if qual.lower() == "hdrip":
         qual = "HD Rip"
     return lang, qual
@@ -114,14 +119,19 @@ def _fmt_size(file_doc):
     return f"{size_mb:.0f} MB"
 
 
+_SERIES_RE = re.compile(r'\b[Ss]\d{1,2}[Ee]\d{1,2}\b|\b[Ss]eason\s*\d+\b|\b[Ee]pisode\s*\d+\b', re.IGNORECASE)
+_SEASON_NUM_RE = re.compile(r'[Ss](\d{1,2})')
+_EPISODE_NUM_RE = re.compile(r'[Ee](\d{1,2})')
+
+
 def _is_series(filename: str) -> bool:
-    return bool(re.search(r'\b[Ss]\d{1,2}[Ee]\d{1,2}\b|\b[Ss]eason\s*\d+\b|\b[Ee]pisode\s*\d+\b', filename, re.IGNORECASE))
+    return bool(_SERIES_RE.search(filename))
 
 
 def _series_sort_key(f):
     name = f.get("file_name", "")
-    s = re.search(r'[Ss](\d{1,2})', name)
-    e = re.search(r'[Ee](\d{1,2})', name)
+    s = _SEASON_NUM_RE.search(name)
+    e = _EPISODE_NUM_RE.search(name)
     season  = int(s.group(1)) if s else 0
     episode = int(e.group(1)) if e else 0
     return (season, episode)
@@ -292,7 +302,10 @@ route_menu = show_results
 
 @Client.on_message(
     filters.text & filters.private &
-    ~filters.command(["start", "help", "about", "admin", "broadcast", "ban", "unban", "purge_cams", "reset_db", "update"])
+    ~filters.command([
+        "start", "help", "about", "admin", "broadcast", "ban", "unban", "purge_cams", "reset_db", "update",
+        "request", "filesearch", "stats", "cancel", "reset_index_progress", "confirm_reset"
+    ])
 )
 async def auto_filter(client: Client, message: Message, manual_query=None):
     user_id = message.from_user.id
@@ -301,7 +314,7 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
         return await message.reply_text("🚫 **You are banned from using this bot.**", quote=True)
 
     config = await db.get_config()
-    if config.get("maintenance_mode") and user_id != _ADMIN_ID:
+    if config.get("maintenance_mode") and user_id not in ADMIN_ID:
         return await message.reply_text(
             config.get("maintenance_message", "🔧 Bot is under maintenance. Back soon!"),
             quote=True
@@ -314,6 +327,7 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
     current_time = time.time()
     if user_id in USER_SEARCH_COOLDOWN:
         passed = current_time - USER_SEARCH_COOLDOWN[user_id]
+        USER_SEARCH_COOLDOWN.move_to_end(user_id)
         if passed < COOLDOWN_TIME:
             warning = await message.reply_text(
                 f"⏳ Wait `{int(COOLDOWN_TIME - passed) + 1}s` before searching again.",
@@ -327,8 +341,9 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
             return
 
     if len(USER_SEARCH_COOLDOWN) >= _COOLDOWN_MAX:
-        USER_SEARCH_COOLDOWN.clear()
+        USER_SEARCH_COOLDOWN.popitem(last=False)  # evict least-recently-used
     USER_SEARCH_COOLDOWN[user_id] = current_time
+    USER_SEARCH_COOLDOWN.move_to_end(user_id)
 
     if manual_query:
         query = manual_query
@@ -565,8 +580,6 @@ async def send_movie_file(client: Client, callback: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^check_fsub#"))
 async def check_fsub_callback(client: Client, callback: CallbackQuery):
-    from utils import _parse_entry, _check_one_channel, _get_join_link
-
     file_part       = callback.data.split("#")[1]
     pending_file_id = file_part if file_part != "none" else None
 
@@ -576,30 +589,52 @@ async def check_fsub_callback(client: Client, callback: CallbackQuery):
 
     remaining = []
     for i, entry in enumerate(channels, 1):
+        channel_id, _ = _parse_fsub_entry(entry)
+        if not channel_id:
+            continue
+
+        # Same membership check as utils.is_subscribed, per-channel so we can
+        # report exactly which channels are still outstanding.
         try:
-            cid, stored_link = _parse_entry(entry)
-        except Exception:
-            continue
-        if not cid:
-            continue
-        status = await _check_one_channel(client, cid, user_id)
-        if status in ("joined", "pending", "skip"):
-            continue
-        link = await _get_join_link(client, cid, stored_link)
-        if not link:
-            continue
+            ch = int(channel_id) if str(channel_id).lstrip('-').isdigit() else str(channel_id)
+            member = await client.get_chat_member(ch, user_id)
+            if member.status.name not in ["KICKED", "BANNED", "LEFT"]:
+                continue  # already joined
+        except UserNotParticipant:
+            pass
+        except Exception as e:
+            logger.warning(f"FSub check error on channel {channel_id}: {e}")
+            continue  # treat as joined on error, consistent with is_subscribed
+
+        # Same join-link resolution as utils.send_fsub_message.
         try:
-            chat    = await client.get_chat(cid if isinstance(cid, int) else int(str(cid).strip()))
+            ch_str      = str(channel_id).strip()
+            stored_link = entry.get("link") if isinstance(entry, dict) else None
+            if ch_str.startswith("@"):
+                link = f"https://t.me/{ch_str[1:]}"
+            elif stored_link and not stored_link.startswith("tg://"):
+                link = stored_link
+            elif ch_str.startswith("-100"):
+                link = await client.export_chat_invite_link(int(ch_str))
+                await db.update_fsub_channel_link(channel_id, link)
+            elif ch_str.startswith("http"):
+                link = ch_str
+            else:
+                link = f"https://t.me/{ch_str}"
+        except Exception as e:
+            logger.warning(f"Could not build FSub join link for {channel_id}: {e}")
+            continue
+
+        try:
+            chat    = await client.get_chat(int(ch_str) if ch_str.lstrip('-').isdigit() else ch_str)
             ch_name = (getattr(chat, "title", None) or f"Channel {i}")[:30]
-            is_req  = getattr(chat, "join_by_request", False)
-            lbl     = f"📋 Request to Join {ch_name}" if is_req else f"📢 Join {ch_name}"
         except Exception:
-            lbl = f"📢 Channel {i}"
-        remaining.append([InlineKeyboardButton(lbl, url=link)])
+            ch_name = f"Channel {i}"
+        remaining.append([InlineKeyboardButton(f"📢 Join {ch_name}", url=link)])
 
     if remaining:
         remaining.append([InlineKeyboardButton(
-            "✅ I've Joined / Requested — Check Now",
+            "✅ I've Joined — Check Now",
             callback_data=f"check_fsub#{file_part}"
         )])
         await callback.answer(

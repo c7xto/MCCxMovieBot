@@ -194,7 +194,7 @@ async def start_handler(client: Client, message: Message):
                 "auto_delete_time": int(config.get("auto_delete_time", 300))
             }
             await db.save_search(session_id, session_data)
-            return await route_menu(client, status_msg, session_id, "ALL", "ALL", 0)
+            return await route_menu(client, status_msg, session_id, 0)
 
     caption_text, reply_markup = _build_start_ui(
         config, message.from_user.mention, total_files, client.me.username,

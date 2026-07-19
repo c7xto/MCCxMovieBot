@@ -7,11 +7,11 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, 
 from pyrogram.enums import ParseMode
 from database.db import db
 from plugins.state import get_state, set_state, clear_state
+from utils import ADMIN_ID
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
-ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 
 _BACK_BTN = InlineKeyboardMarkup([
     [InlineKeyboardButton("🔙 Back to Group Manager", callback_data="group_manager_menu")]

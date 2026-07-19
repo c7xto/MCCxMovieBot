@@ -7,11 +7,12 @@ from pyrogram import Client, filters
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait, InputUserDeactivated, UserIsBlocked
 from database.db import db
+from utils import ADMIN_ID
+from plugins.health_monitor import _log_task_crash
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
-ADMIN_ID = [int(x.strip()) for x in os.getenv("ADMIN_ID", "0").split(",") if x.strip()]
 
 # B2: Stores pending broadcast params while admin reviews the preview
 _pending_broadcasts = {}
@@ -122,7 +123,11 @@ async def bc_confirm(client: Client, callback: CallbackQuery):
             await asyncio.sleep(delay_seconds)
             await status_msg.edit_text("⏳ **Scheduled broadcast starting now...**")
             await _run_broadcast(client, message, pending["do_pin"], pending["do_del"], status_msg, target=target)
-        asyncio.create_task(_scheduled())
+        # Unlike the per-recipient sends inside _run_broadcast, nothing here
+        # is wrapped — a scheduled broadcast can fire hours later with no one
+        # watching, so a crash needs to reach the log channel, not vanish.
+        scheduled_task = asyncio.create_task(_scheduled())
+        scheduled_task.add_done_callback(lambda t: _log_task_crash(t, client, "scheduled_broadcast"))
     else:
         await _run_broadcast(client, message, pending["do_pin"], pending["do_del"], status_msg, target=target)
 

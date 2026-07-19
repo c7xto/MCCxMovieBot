@@ -6,6 +6,7 @@ import asyncio
 import logging
 import time
 import datetime
+from pyrogram.errors import FloodWait
 from database.db import db
 from plugins.filter import send_smart_log
 
@@ -30,6 +31,23 @@ async def _clear_alert(key: str):
     _last_alert.pop(key, None)
 
 
+def _log_task_crash(task: asyncio.Task, client, label: str):
+    """Attach via task.add_done_callback(...) on any fire-and-forget
+    asyncio.create_task(...) so an unhandled exception is surfaced to the
+    log channel instead of dying silently — by default it's only visible
+    via asyncio's own "Task exception was never retrieved" stderr log,
+    which nobody is watching."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc:
+        logger.error(f"{label} crashed: {exc}")
+        asyncio.create_task(send_smart_log(
+            client,
+            f"💥 **#BackgroundTaskCrashed**\n\n🏷 **Task:** `{label}`\n🛑 **Error:** `{exc}`"
+        ))
+
+
 async def check_all_channels(client, config):
     """
     Shared channel health check — called by both the automatic monitor
@@ -52,6 +70,9 @@ async def check_all_channels(client, config):
                 return f"{label}: ⚠️ Member only — `{ch_id}`"
             else:
                 return f"{label}: ❓ Status `{status}` — `{ch_id}`"
+        except FloodWait as e:
+            await asyncio.sleep(e.value)
+            return f"{label}: ⏳ Rate-limited, retry health check — `{ch_id}`"
         except Exception as e:
             return f"{label}: ❌ No access — `{ch_id}`\n  _({str(e)[:60]})_"
 
@@ -124,5 +145,21 @@ async def run_health_monitor(client):
             pass
 
         # Heartbeat removed — was noise in log channel
+
+
+async def run_cache_reaper():
+    """
+    Sweeps the in-process search-session cache every 5 minutes. _SearchCache
+    normally evicts lazily (on read) or via the LRU cap, so a burst of unique
+    searches followed by a long quiet period would otherwise leave stale
+    sessions resident in memory until something else happens to touch the
+    cache. This is the timer-driven backstop for that gap.
+    """
+    while True:
+        await asyncio.sleep(300)
+        try:
+            db._search_cache.purge(db._search_cache.default_ttl)
+        except Exception as e:
+            logger.warning(f"Cache reaper error: {e}")
 
 

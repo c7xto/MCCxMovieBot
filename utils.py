@@ -16,6 +16,11 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+# Single shared source of truth for admin IDs — parsed as a comma-separated
+# list so multi-admin setups (ADMIN_ID=123,456) work everywhere, not just
+# in broadcast.py. Import this everywhere instead of re-parsing os.getenv.
+ADMIN_ID = [int(x.strip()) for x in os.getenv("ADMIN_ID", "0").split(",") if x.strip()]
+
 
 def _parse_fsub_entry(entry):
     """Normalises a stored FSub entry to (channel_id). All channels are join type."""

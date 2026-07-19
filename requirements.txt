@@ -3,5 +3,6 @@ TgCrypto
 motor
 pymongo
 dnspython
+certifi
 python-dotenv
 aiohttp

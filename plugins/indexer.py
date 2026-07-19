@@ -4,13 +4,15 @@ import time
 import random
 import asyncio
 import logging
+from collections import OrderedDict
 from dotenv import load_dotenv
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.enums import ParseMode
 from database.db import db
 from tmdb import get_movie_data
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, InputUserDeactivated, UserIsBlocked
+from plugins.health_monitor import _log_task_crash
 
 # load_dotenv() needed so DATABASE_CHANNEL_ID env fallback works correctly
 load_dotenv()
@@ -21,8 +23,8 @@ logger = logging.getLogger(__name__)
 def _html(text: str) -> str:
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-# Cap to prevent unbounded RAM growth
-RECENT_POSTS = {}
+# Cap to prevent unbounded RAM growth — LRU: oldest entry is first
+RECENT_POSTS = OrderedDict()
 _RECENT_POSTS_MAX = 1000
 POST_COOLDOWN = 300
 
@@ -51,7 +53,8 @@ async def _ensure_queue_worker(client: Client):
     global _queue_worker_started
     if not _queue_worker_started:
         _queue_worker_started = True
-        asyncio.create_task(_post_queue_worker(client))
+        worker_task = asyncio.create_task(_post_queue_worker(client))
+        worker_task.add_done_callback(lambda t: _log_task_crash(t, client, "post_queue_worker"))
 
 
 # ── FILE INFO PARSER ──────────────────────────────────────────────────────────
@@ -128,13 +131,16 @@ async def _do_post(client: Client, filename: str):
         return
 
     current_time = time.time()
-    last_posted = RECENT_POSTS.get(clean_title.lower(), 0)
+    title_key = clean_title.lower()
+    last_posted = RECENT_POSTS.get(title_key, 0)
     if current_time - last_posted < POST_COOLDOWN:
         return
 
-    if len(RECENT_POSTS) >= _RECENT_POSTS_MAX:
-        RECENT_POSTS.clear()
-    RECENT_POSTS[clean_title.lower()] = current_time
+    if title_key in RECENT_POSTS:
+        RECENT_POSTS.move_to_end(title_key)
+    elif len(RECENT_POSTS) >= _RECENT_POSTS_MAX:
+        RECENT_POSTS.popitem(last=False)  # evict least-recently-used
+    RECENT_POSTS[title_key] = current_time
 
     tmdb_data = await get_movie_data(clean_title)
     display_title = tmdb_data["title"] if tmdb_data else clean_title.title()
@@ -271,6 +277,10 @@ async def _fulfill_matching_requests(client, file_name: str):
                 )
                 await db.delete_pending_request(user_id, movie_name)
                 logger.info(f"Auto-fulfilled request for user {user_id}: {movie_name}")
+            except (InputUserDeactivated, UserIsBlocked):
+                await db.delete_user(user_id)
+                await db.delete_pending_request(user_id, movie_name)
+                logger.info(f"User {user_id} blocked/deactivated — cleaned up")
             except Exception as e:
                 logger.warning(f"Could not notify user {user_id} for request '{movie_name}': {e}")
     except Exception as e:

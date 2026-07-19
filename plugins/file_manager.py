@@ -7,18 +7,20 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, 
 from pyrogram.enums import ParseMode
 from database.db import db
 from plugins.state import get_state, set_state, clear_state
+from plugins.health_monitor import _log_task_crash
+from utils import ADMIN_ID
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
-ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 
 _BACK_BTN = InlineKeyboardMarkup([
     [InlineKeyboardButton("🔙 Back to File Manager", callback_data="file_manager_menu")]
 ])
 
-# In-memory cache for duplicate scan results (TTL not needed — re-scan resets it)
-_cached_dupes = []
+# In-memory cache for duplicate scan results, keyed by admin user_id so
+# concurrent admin sessions don't overwrite each other's scan results.
+_cached_dupes = {}
 
 
 # ── FILE MANAGER MENU ─────────────────────────────────────────────────────────
@@ -144,7 +146,8 @@ async def fm_duplicates(client: Client, callback: CallbackQuery):
     await callback.answer()
 
     # Run in background so it doesn't timeout
-    asyncio.create_task(_run_duplicate_scan(client, callback.message))
+    scan_task = asyncio.create_task(_run_duplicate_scan(client, callback.message, callback.from_user.id))
+    scan_task.add_done_callback(lambda t: _log_task_crash(t, client, "duplicate_scan"))
 
 
 @Client.on_callback_query(filters.regex(r"^fm_dupes_page#") & filters.user(ADMIN_ID))
@@ -155,13 +158,14 @@ async def fm_dupes_page(client: Client, callback: CallbackQuery):
     except (ValueError, IndexError):
         return await callback.answer("❌ Malformed callback.", show_alert=True)
     await callback.answer()
-    if not _cached_dupes:
+    dupes = _cached_dupes.get(callback.from_user.id)
+    if not dupes:
         await callback.message.edit_text(
             "⚠️ Scan results expired. Please re-run duplicate scan.",
             reply_markup=_BACK_BTN
         )
         return
-    await _show_dupes_page(callback, _cached_dupes, page=page)
+    await _show_dupes_page(callback, dupes, page=page)
 
 
 @Client.on_callback_query(filters.regex(r"^fm_del_dupes#") & filters.user(ADMIN_ID))
@@ -188,15 +192,18 @@ async def fm_del_dupes(client: Client, callback: CallbackQuery):
 
     await callback.answer(f"✅ Deleted {deleted} duplicate(s). Oldest copy kept.", show_alert=True)
 
-    # Remove from cached list
+    # Remove from this admin's cached list
+    admin_id = callback.from_user.id
+    dupes = _cached_dupes.get(admin_id, [])
     ids_set = set(ids)
-    for i, d in enumerate(_cached_dupes):
+    for i, d in enumerate(dupes):
         if ids_set.intersection(set(d.get("ids", []))):
-            _cached_dupes.pop(i)
+            dupes.pop(i)
             break
+    _cached_dupes[admin_id] = dupes
 
-    if _cached_dupes:
-        await _show_dupes_page(callback, _cached_dupes, page=0)
+    if dupes:
+        await _show_dupes_page(callback, dupes, page=0)
     else:
         await callback.message.edit_text(
             "✅ **All duplicates resolved!** Database is clean.",
@@ -204,7 +211,7 @@ async def fm_del_dupes(client: Client, callback: CallbackQuery):
         )
 
 
-async def _run_duplicate_scan(client, status_msg):
+async def _run_duplicate_scan(client, status_msg, admin_id):
     try:
         dupes = await db.find_duplicate_files()
 
@@ -215,8 +222,7 @@ async def _run_duplicate_scan(client, status_msg):
             )
             return
 
-        global _cached_dupes
-        _cached_dupes = dupes
+        _cached_dupes[admin_id] = dupes
         await _show_dupes_page(status_msg, dupes, page=0)
 
     except Exception as e:
@@ -309,8 +315,7 @@ async def fm_delete_all_dupes(client: Client, callback: CallbackQuery):
             f"✔️ Oldest copy of each file preserved.",
             reply_markup=_BACK_BTN
         )
-        global _cached_dupes
-        _cached_dupes = []
+        _cached_dupes.pop(callback.from_user.id, None)
     except Exception as e:
         await callback.message.edit_text(
             f"❌ Purge failed: `{e}`",
@@ -399,7 +404,8 @@ async def fm_migrate_confirm(client: Client, callback: CallbackQuery):
         f"_(This runs in background — you'll be notified when done)_"
     )
     await callback.answer()
-    asyncio.create_task(_run_migration(client, status, from_idx, to_idx))
+    migrate_task = asyncio.create_task(_run_migration(client, status, from_idx, to_idx))
+    migrate_task.add_done_callback(lambda t: _log_task_crash(t, client, f"cluster_migration({from_idx}->{to_idx})"))
 
 
 async def _run_migration(client, status_msg, from_idx, to_idx):

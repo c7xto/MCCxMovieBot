@@ -5,6 +5,7 @@ import logging
 from dotenv import load_dotenv
 from pyrogram import ContinuePropagation, StopPropagation
 from pyrogram import Client, filters
+from pyrogram.errors import FloodWait
 from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton,
     CallbackQuery
@@ -17,13 +18,12 @@ except ImportError:
     def _no_preview(): return {"disable_web_page_preview": True}
 from database.db import db
 from plugins.state import get_state as _get_state_fn, set_state as _set_state_fn, clear_state as _clear_state_fn
+from utils import ADMIN_ID
 
 # load_dotenv() here so ADMIN_ID is populated before module-level filter decorators run
 load_dotenv()
 
 logger = logging.getLogger(__name__)
-
-ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 
 # Reusable "Back to Panel" button — avoids repeating it everywhere
 _BACK_BTN = InlineKeyboardMarkup([
@@ -971,6 +971,15 @@ async def fsub_refresh_links(client: Client, callback: CallbackQuery):
             new_link = await client.export_chat_invite_link(int(ch_str))
             await db.update_fsub_channel_link(ch_id, new_link)
             refreshed += 1
+        except FloodWait as e:
+            await asyncio.sleep(e.value)
+            try:
+                new_link = await client.export_chat_invite_link(int(ch_str))
+                await db.update_fsub_channel_link(ch_id, new_link)
+                refreshed += 1
+            except Exception as e2:
+                logger.warning(f"Could not refresh link for {ch_id} after FloodWait: {e2}")
+                skipped += 1
         except Exception as e:
             logger.warning(f"Could not refresh link for {ch_id}: {e}")
             skipped += 1

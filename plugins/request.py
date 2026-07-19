@@ -2,6 +2,7 @@ import os
 import re
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from pyrogram.errors import InputUserDeactivated, UserIsBlocked
 from database.db import db
 
 # --- 1. THE COMMAND HANDLER (/request) ---
@@ -88,9 +89,15 @@ async def mark_request_done(client: Client, callback: CallbackQuery):
         ])
         
         await client.send_message(chat_id=int(user_id), text=notify_text, reply_markup=markup)
+    except (InputUserDeactivated, UserIsBlocked):
+        await db.delete_user(int(user_id))
+        await db.delete_pending_request(int(user_id), movie_name)
+        resolved_text = callback.message.text + f"\n\n⚠️ **User blocked bot — removed from database by:** {callback.from_user.mention}"
+        await callback.message.edit_text(resolved_text)
+        return await callback.answer("⚠️ User has blocked the bot — removed from database.", show_alert=True)
     except Exception as e:
         return await callback.answer(f"❌ Could not PM user (they might have blocked the bot). Error: {e}", show_alert=True)
-        
+
     # Update the Admin Ticket so you know it's done
     resolved_text = callback.message.text + f"\n\n✅ **Completed by:** {callback.from_user.mention}"
     await callback.message.edit_text(resolved_text)

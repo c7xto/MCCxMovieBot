@@ -9,14 +9,15 @@ from pyrogram import ContinuePropagation, StopPropagation
 from pyrogram.errors import FloodWait, MessageNotModified
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from database.db import db
+from utils import ADMIN_ID
 
 load_dotenv()
 
 # Import our unified smart logger!
 from plugins.filter import send_smart_log
+from plugins.health_monitor import _log_task_crash
 
 logger = logging.getLogger(__name__)
-ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 
 # --- GLOBAL STATE DICTIONARY ---
 
@@ -119,10 +120,10 @@ async def run_indexer(client: Client, status_message: Message, chat_id: int, las
             asyncio.create_task(send_smart_log(client, error_log))
             
             # We still send a direct PM to the Admin just in case they miss the log!
-            if ADMIN_ID:
+            for admin_id in ADMIN_ID:
                 try:
                     await client.send_message(
-                        ADMIN_ID, 
+                        admin_id,
                         f"❌ **Indexer Crashed!**\n\nI cannot read the Database Channel (`{chat_id}`). Please make sure I am an **Administrator** with permission to read message history!\n\n**Error Details:** `{e}`"
                     )
                 except Exception:
@@ -321,7 +322,8 @@ async def start_bulk_index(client: Client, callback: CallbackQuery):
     # ----------------------------------------
     
     # Offload the massive task to the background
-    asyncio.create_task(run_indexer(client, status_msg, chat_id, last_msg_id, start_id))
+    task = asyncio.create_task(run_indexer(client, status_msg, chat_id, last_msg_id, start_id))
+    task.add_done_callback(lambda t: _log_task_crash(t, client, f"run_indexer(chat={chat_id})"))
     await callback.answer()
 
 
@@ -337,7 +339,8 @@ async def reset_and_index(client: Client, callback: CallbackQuery):
 
     await db.clear_index_progress(chat_id)
     status_msg = await callback.message.edit_text("⏳ **Progress reset. Starting from message 1...**")
-    asyncio.create_task(run_indexer(client, status_msg, chat_id, last_msg_id, 1))
+    task = asyncio.create_task(run_indexer(client, status_msg, chat_id, last_msg_id, 1))
+    task.add_done_callback(lambda t: _log_task_crash(t, client, f"run_indexer(chat={chat_id})"))
     asyncio.create_task(send_smart_log(client,
         f"🔄 **#IndexReset**\n\n📦 Channel: `{chat_id}`\n"
         f"🎯 Total: `{last_msg_id}`\nStarting fresh from message 1."
