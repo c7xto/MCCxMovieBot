@@ -37,6 +37,8 @@
 - **Caption Template** — custom file captions with `{filename}`, `{quality}`, `{lang}`, `{size}`, `{username}`, `{delete_minutes}` variables
 - **Config Backup/Restore** — export settings as JSON, restore with protected fields
 - **Channel Health Check** — verifies bot admin status in all configured channels
+- **Request Channel FSub** — separate, rotating "join to unlock" prompt (independent of the main FSub gate) shown before file delivery, on a configurable per-user interval
+- **Self-Update** — `/update` or the panel's **Update Bot** button pulls the latest code straight from GitHub and restarts, without touching `.env`
 
 ### 📢 Broadcast
 - **Preview before send** — shows recipient count, time estimate, message preview
@@ -52,9 +54,10 @@
 - **Smart log notifications** — completion and stop summaries to log channel
 
 ### 🔔 Background Tasks
-- **Health monitor** — pings all clusters every 10 minutes, alerts on failure, green heartbeat every 6 hours
-- **Birthday broadcast** — optional daily birthday greetings to users
+- **Health monitor** — pings all clusters every 10 minutes, alerts the log channel on failure and again on recovery, checks for indexer tasks stuck for 2+ hours
+- **Cache reaper** — sweeps expired search-pagination sessions from the in-process cache every 5 minutes
 - **Auto request fulfillment** — notifies users when a requested movie is indexed
+- **Crash visibility** — every background task is wrapped so an unhandled exception is reported to the log channel instead of failing silently
 
 ### 🎬 Movie Requests
 - **Ticket system** — users request movies, tickets sent to admin log channel
@@ -67,15 +70,19 @@
 ```
 MCCxBot/
 │
-├── bot.py                    # Entry point
-├── utils.py                  # FSub helpers
+├── bot.py                    # Entry point — startup environment check, then Client boot
+├── utils.py                  # Shared ADMIN_ID parsing + FSub helpers
 ├── tmdb.py                   # TMDB API integration
 ├── requirements.txt
 ├── .env                      # ← Never commit this
 │
 ├── database/
 │   ├── __init__.py
-│   └── db.py                 # Multi-cluster MongoDB layer with config cache
+│   └── db.py                 # Multi-cluster MongoDB layer, file_registry, config cache
+│
+├── tools/
+│   ├── migrate_registry.py       # One-time backfill for the file_registry collection
+│   └── verify_db_performance.py  # Offline DB layer test suite (Pyrogram-isolated)
 │
 └── plugins/
     ├── admin.py              # Admin panel, commands
@@ -83,13 +90,15 @@ MCCxBot/
     ├── start.py              # /start handler, deep links
     ├── welcome.py            # Group welcome messages
     ├── group_connect.py      # Group search handler
+    ├── req_fsub.py           # Request Channel FSub (rotating join prompt)
     ├── index.py              # Super-Indexer (bulk)
     ├── indexer.py            # Real-time indexer + post queue
     ├── request.py            # Movie request system
     ├── broadcast.py          # Broadcast command
     ├── file_manager.py       # File Manager panel
     ├── group_manager.py      # Group Manager panel
-    ├── health_monitor.py     # Background health + birthday tasks
+    ├── health_monitor.py     # Background health monitor + cache reaper
+    ├── updater.py            # GitHub self-update
     └── state.py              # Shared admin input state
 ```
 
@@ -169,14 +178,17 @@ docker run --env-file .env mccxbot
 ## 📋 Requirements
 
 ```
-pyrogram>=2.0.0
+pyrogram>=2.0.106
 TgCrypto
 motor
 pymongo
+dnspython
+certifi
 python-dotenv
-requests
 aiohttp
 ```
+
+`dnspython` resolves the SRV/TXT records `mongodb+srv://` URIs depend on; `certifi` supplies the CA bundle used for the TLS handshake to MongoDB Atlas. Both are required, not optional — the bot fails fast at startup if either is missing.
 
 ---
 
@@ -191,6 +203,19 @@ After deploying, do these steps once:
 - [ ] Run `/admin` → **Manage FSub** → add your channels
 - [ ] Set your welcome text and media via `/admin`
 - [ ] Forward a message from your DB channel to the bot → tap **Start Indexing** to index existing files
+
+---
+
+## 🛠 Maintenance Scripts (`tools/`)
+
+- **`tools/migrate_registry.py`** — one-time backfill for the centralized `file_registry` collection (the single source of truth for cross-cluster `file_id` uniqueness). Builds and verifies the unique index before touching any documents, then streams and dedupes every existing file across all configured clusters concurrently. Idempotent and safe to run against a live bot — run it once after upgrading to a version with `file_registry`:
+  ```bash
+  python tools/migrate_registry.py
+  ```
+- **`tools/verify_db_performance.py`** — standalone test suite for the database layer (search-cache TTL/LRU behavior, the `$facet` language-aggregation pipeline, and indexed search traversal) that runs without needing a live Pyrogram/Telegram session:
+  ```bash
+  python tools/verify_db_performance.py
+  ```
 
 ---
 
