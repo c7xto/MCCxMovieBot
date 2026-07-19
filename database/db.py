@@ -94,6 +94,53 @@ class _SearchCache:
             del self._data[k]
 
 
+class _TrendingCache:
+    """In-process, memory-bounded rolling counter backing the home-panel
+    'Trending Searches' widget. Deliberately NOT a new Mongo collection —
+    trending is a short-window, best-effort popularity signal, not durable
+    data, so this mirrors _SearchCache's in-process design instead of
+    adding schema. Also deliberately NOT sourced from missed_searches:
+    those are queries that returned zero results, and surfacing one as a
+    "trending" suggestion would make tapping it a guaranteed dead end —
+    only queries that actually returned results should ever be recorded."""
+
+    def __init__(self, maxsize=500, window_seconds=86400):
+        self.maxsize = maxsize
+        self.window_seconds = window_seconds
+        self._data = OrderedDict()  # normalized_query -> [count, last_seen_ts, display_text]
+
+    def record(self, query: str):
+        norm = self._normalize(query)
+        if not norm:
+            return
+        self._prune()
+        if norm in self._data:
+            entry = self._data[norm]
+            entry[0] += 1
+            entry[1] = time.time()
+            self._data.move_to_end(norm)
+        else:
+            if len(self._data) >= self.maxsize:
+                self._data.popitem(last=False)  # evict least-recently-inserted
+            self._data[norm] = [1, time.time(), query.strip()]
+
+    def top(self, limit=6) -> list:
+        self._prune()
+        ranked = sorted(self._data.values(), key=lambda entry: entry[0], reverse=True)
+        return [entry[2] for entry in ranked[:limit]]
+
+    def _prune(self):
+        cutoff = time.time() - self.window_seconds
+        expired = [k for k, entry in self._data.items() if entry[1] < cutoff]
+        for k in expired:
+            del self._data[k]
+
+    @staticmethod
+    def _normalize(query: str) -> str:
+        q = re.sub(r"[^a-zA-Z0-9 ]", "", query.lower()).strip()
+        return re.sub(r"\s+", " ", q)
+
+
 class Database:
     def __init__(self):
         self.uris = [
@@ -143,6 +190,7 @@ class Database:
         self.registry_col = None
         self.main_db = None
         self._search_cache = _SearchCache(maxsize=2000, default_ttl=600)
+        self._trending_cache = _TrendingCache(maxsize=500, window_seconds=86400)
 
         if self.dbs:
             self.main_db = self.dbs[0]
@@ -1085,6 +1133,15 @@ class Database:
 
     async def clear_old_searches(self, expiry_seconds=600):
         self._search_cache.purge(expiry_seconds)
+
+    async def log_trending_search(self, query: str):
+        """Records a query that actually returned results, for the home-
+        panel Trending Searches widget. Call only on the success path —
+        see _TrendingCache's docstring for why misses are excluded."""
+        self._trending_cache.record(query)
+
+    async def get_trending_searches(self, limit: int = 6) -> list:
+        return self._trending_cache.top(limit)
 
 
 db = Database()
