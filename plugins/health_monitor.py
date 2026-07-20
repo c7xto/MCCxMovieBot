@@ -50,41 +50,54 @@ def _log_task_crash(task: asyncio.Task, client, label: str):
 
 async def check_all_channels(client, config):
     """
-    Shared channel health check — called by both the automatic monitor
-    and the admin panel's manual Channel Health Check button.
-    Returns a list of status strings.
+    Shared channel health check — called by the admin panel's manual
+    Channel Health Check button (the automatic 10-min run_health_monitor()
+    below checks cluster/indexer health instead, not channels).
+
+    Returns a list of {"label", "ok", "fix", "text"} dicts rather than
+    plain strings, so the caller can build a "🔧 Fix" button straight to
+    the right admin.py edit flow for anything that isn't OK, instead of
+    just reporting the failure and making the admin go find the fix
+    themselves. "ok" is True/False/None (None = not configured at all,
+    treated the same as a failure for "should this get a fix button").
     """
     results = []
 
-    async def _check(label, ch_id):
+    async def _check(label, ch_id, fix=None):
         if not ch_id or ch_id in [0, "", None]:
-            return f"{label}: ⚪ Not configured"
+            return {"label": label, "ok": None, "fix": fix,
+                    "text": f"{label}: ⚪ Not configured"}
         try:
             ch = int(ch_id) if str(ch_id).lstrip('-').isdigit() else str(ch_id)
             await client.get_chat(ch)
             member = await client.get_chat_member(ch, client.me.id)
             status = member.status.name
             if status == "ADMINISTRATOR":
-                return f"{label}: ✅ Admin — `{ch_id}`"
+                return {"label": label, "ok": True, "fix": fix,
+                        "text": f"{label}: ✅ Admin — `{ch_id}`"}
             elif status == "MEMBER":
-                return f"{label}: ⚠️ Member only — `{ch_id}`"
+                return {"label": label, "ok": False, "fix": fix,
+                        "text": f"{label}: ⚠️ Member only — `{ch_id}`"}
             else:
-                return f"{label}: ❓ Status `{status}` — `{ch_id}`"
+                return {"label": label, "ok": False, "fix": fix,
+                        "text": f"{label}: ❓ Status `{status}` — `{ch_id}`"}
         except FloodWait as e:
             await asyncio.sleep(e.value)
-            return f"{label}: ⏳ Rate-limited, retry health check — `{ch_id}`"
+            return {"label": label, "ok": False, "fix": fix,
+                    "text": f"{label}: ⏳ Rate-limited, retry health check — `{ch_id}`"}
         except Exception as e:
-            return f"{label}: ❌ No access — `{ch_id}`\n  _({str(e)[:60]})_"
+            return {"label": label, "ok": False, "fix": fix,
+                    "text": f"{label}: ❌ No access — `{ch_id}`\n  _({str(e)[:60]})_"}
 
-    results.append(await _check("📡 Log Channel",    config.get("log_channel")))
-    results.append(await _check("📢 Update Channel", config.get("update_channel_id")))
+    results.append(await _check("📡 Log Channel",    config.get("log_channel"), fix="edit_logchannel"))
+    results.append(await _check("📢 Update Channel", config.get("update_channel_id"), fix="edit_updatechid"))
 
     for i, ch in enumerate(config.get("db_channels", []), 1):
-        results.append(await _check(f"📚 DB Channel {i}", ch))
+        results.append(await _check(f"📚 DB Channel {i}", ch, fix="db_chan_menu"))
 
     for i, entry in enumerate(config.get("fsub_channels", []), 1):
         ch_id = entry.get("id") if isinstance(entry, dict) else entry
-        results.append(await _check(f"🔐 FSub {i}", ch_id))
+        results.append(await _check(f"🔐 FSub {i}", ch_id, fix="fsub_menu"))
 
     return results
 

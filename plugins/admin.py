@@ -72,32 +72,78 @@ async def get_admin_menu_data():
         f"🛠 **MCCxBot Admin**\n\n"
         f"👤 `{total_users}` users  •  📁 `{total_files:,}` files  •  🏘 `{total_groups}` groups\n"
         f"🔐 FSub: {fsub_status}  •  📡 Log: {log_status}\n\n"
-        f"_Tap a module below_"
+        f"_Tap a category below_"
     )
 
+    # Two-tier dashboard: the root panel only shows the 4 category tiles
+    # (plus Close) — each opens a submenu built from _CATEGORY_MENUS below.
+    # Same underlying callbacks as before, just better information
+    # architecture instead of one flat 19-button wall.
     markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Analytics (Stats + Languages + Groups)", callback_data="admin_stats")],
-        [InlineKeyboardButton("📚 Manage Database Channels",  callback_data="db_chan_menu")],
-        [InlineKeyboardButton("🔐 Manage FSub Channels",      callback_data="fsub_menu")],
-        [InlineKeyboardButton("📢 Req Channel FSub",           callback_data="req_fsub_menu")],
-        [InlineKeyboardButton("⚙️ Change Main Group Link",    callback_data="edit_maingroup")],
-        [InlineKeyboardButton("⚙️ Change Update Link",        callback_data="edit_update")],
-        [InlineKeyboardButton("📡 Set Log Channel ID",        callback_data="edit_logchannel"),
-         InlineKeyboardButton("👤 Set Admin ID",              callback_data="edit_adminid")],
-        [InlineKeyboardButton("⏱ Set Auto-Delete Time",      callback_data="edit_autodeletetime")],
-        [InlineKeyboardButton("🖼 Change Welcome Media",      callback_data="edit_media")],
-        [InlineKeyboardButton("📝 Edit Welcome Text",         callback_data="edit_welcometext")],
-        [InlineKeyboardButton("🔍 Channel Health Check",      callback_data="channel_health_check")],
-        [InlineKeyboardButton("📁 File Manager",              callback_data="file_manager_menu"),
-         InlineKeyboardButton("🏘 Group Manager",             callback_data="group_manager_menu")],
-        [InlineKeyboardButton("🔧 Maintenance Mode",          callback_data="admin_toggle_maintenance")],
-        [InlineKeyboardButton("✏️ Caption Template",          callback_data="edit_captiontemplate")],
-        [InlineKeyboardButton("📥 Export Config",             callback_data="admin_export_config"),
-         InlineKeyboardButton("📤 Restore Config",            callback_data="admin_restore_config")],
-        [InlineKeyboardButton("🔄 Update Bot",                callback_data="upd_start")],
-        [InlineKeyboardButton("❌ Close Panel",               callback_data="close_data")]
+        [InlineKeyboardButton("📁 Content", callback_data="admin_cat_content"),
+         InlineKeyboardButton("👥 Users & Groups", callback_data="admin_cat_users")],
+        [InlineKeyboardButton("⚙️ Settings", callback_data="admin_cat_settings"),
+         InlineKeyboardButton("🩺 Health & System", callback_data="admin_cat_health")],
+        [InlineKeyboardButton("❌ Close Panel", callback_data="close_data")]
     ])
     return text, markup
+
+
+# ── TWO-TIER DASHBOARD: CATEGORY SUBMENUS ─────────────────────────────────────
+# Every entry here is one of the exact same callback_data strings the old
+# flat menu used — this only changes how they're grouped and navigated to,
+# not what they do or how they're handled.
+
+_CATEGORY_MENUS = {
+    "content": ("📁 Content", [
+        ("📚 Manage Database Channels", "db_chan_menu"),
+        ("📁 File Manager",             "file_manager_menu"),
+        ("✏️ Caption Template",         "edit_captiontemplate"),
+        ("🖼 Change Welcome Media",     "edit_media"),
+        ("📝 Edit Welcome Text",        "edit_welcometext"),
+    ]),
+    "users": ("👥 Users & Groups", [
+        ("🔐 Manage FSub Channels", "fsub_menu"),
+        ("📢 Req Channel FSub",     "req_fsub_menu"),
+        ("🏘 Group Manager",        "group_manager_menu"),
+        ("🔧 Maintenance Mode",     "admin_toggle_maintenance"),
+    ]),
+    "settings": ("⚙️ Settings", [
+        ("⚙️ Change Main Group Link",  "edit_maingroup"),
+        ("⚙️ Change Update Link",      "edit_update"),
+        ("📡 Set Log Channel ID",      "edit_logchannel"),
+        ("📢 Set Update Channel ID",   "edit_updatechid"),
+        ("👤 Set Admin ID",            "edit_adminid"),
+        ("⏱ Set Auto-Delete Time",    "edit_autodeletetime"),
+        ("📥 Export Config",           "admin_export_config"),
+        ("📤 Restore Config",          "admin_restore_config"),
+        ("🔄 Update Bot",              "upd_start"),
+    ]),
+    "health": ("🩺 Health & System", [
+        ("📊 Analytics (Stats + Languages + Groups)", "admin_stats"),
+        ("🔍 Channel Health Check",                   "channel_health_check"),
+    ]),
+}
+
+_CATEGORY_BACK_BTN = InlineKeyboardMarkup([
+    [InlineKeyboardButton("🔙 Back to Dashboard", callback_data="back_to_admin")]
+])
+
+
+@Client.on_callback_query(filters.regex(r"^admin_cat_(content|users|settings|health)$") & filters.user(ADMIN_ID))
+async def show_category_menu(client: Client, callback: CallbackQuery):
+    key = callback.data.split("_", 2)[2]
+    title, items = _CATEGORY_MENUS[key]
+
+    text = f"{title}\n\n_Tap an item below_"
+    buttons = [[InlineKeyboardButton(label, callback_data=cb)] for label, cb in items]
+    buttons.append([InlineKeyboardButton("🔙 Back to Dashboard", callback_data="back_to_admin")])
+
+    try:
+        await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    except Exception:
+        await callback.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    await callback.answer()
 
 
 # ── DASHBOARD ────────────────────────────────────────────────────────────────
@@ -244,6 +290,13 @@ async def handle_edit_buttons(client: Client, callback: CallbackQuery):
         "logchannel": (
             "📡 **Send me the new Log Channel ID.**\n\n"
             "This is a numeric ID like `-100123456789`.\n"
+            "Make sure the bot is an **Admin** in that channel first!\n\n"
+            "*Type /cancel to abort.*"
+        ),
+        "updatechid": (
+            "📢 **Send me the new Update Channel ID.**\n\n"
+            "This is a numeric ID like `-100123456789` — the channel new-upload "
+            "announcements are posted to.\n"
             "Make sure the bot is an **Admin** in that channel first!\n\n"
             "*Type /cancel to abort.*"
         ),
@@ -671,6 +724,30 @@ async def catch_admin_input(client: Client, message: Message):
                 reply_markup=_BACK_BTN
             )
 
+    elif state == "updatechid":
+        raw = message.text.strip()
+        try:
+            ch_val = int(raw)
+            await client.get_chat(ch_val)
+            await db.update_config("update_channel_id", ch_val)
+            await message.reply_text(
+                f"✅ **Update Channel Updated!**\n\n"
+                f"New Update Channel ID: `{ch_val}`\n"
+                f"New upload announcements will now post there.",
+                reply_markup=_BACK_BTN
+            )
+        except ValueError:
+            await message.reply_text(
+                "❌ **Invalid format!** Update Channel ID must be a number like `-100123456789`.",
+                reply_markup=_BACK_BTN
+            )
+        except Exception as e:
+            await message.reply_text(
+                f"❌ **Cannot access that channel!**\n"
+                f"Make sure the bot is an **Admin** in `{raw}` first.\nError: `{e}`",
+                reply_markup=_BACK_BTN
+            )
+
     elif state == "adminid":
         raw = message.text.strip()
         try:
@@ -1007,10 +1084,24 @@ async def channel_health_check(client: Client, callback: CallbackQuery):
     await callback.answer()
 
     config = await db.get_config()
-    results = await check_all_channels(client, config)
+    checks = await check_all_channels(client, config)
 
-    report_text = "🔍 **Channel Health Report**\n\n" + "\n".join(results)
-    markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_admin")]])
+    report_text = "🔍 **Channel Health Report**\n\n" + "\n".join(c["text"] for c in checks)
+
+    # One "Fix" button per failing/unconfigured channel — jumps straight into
+    # the relevant edit flow instead of making the admin navigate back
+    # through the menu to find it. Multiple DB/FSub channel failures all
+    # point at the same manager screen, so that button is only offered once.
+    buttons = []
+    seen_fix_targets = set()
+    for c in checks:
+        fix = c.get("fix")
+        if c["ok"] is not True and fix and fix not in seen_fix_targets:
+            seen_fix_targets.add(fix)
+            buttons.append([InlineKeyboardButton(f"🔧 Fix: {c['label']}", callback_data=fix)])
+
+    buttons.append([InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_admin")])
+    markup = InlineKeyboardMarkup(buttons)
 
     try:
         await callback.message.edit_text(report_text, reply_markup=markup)
@@ -1038,7 +1129,7 @@ async def toggle_maintenance(client: Client, callback: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^admin_export_config$") & filters.user(ADMIN_ID))
 async def export_config(client: Client, callback: CallbackQuery):
-    await callback.answer()
+    await callback.answer("📥 Preparing export...", show_alert=False)
     config_data = await db.export_config()
     config_json = json.dumps(config_data, indent=2, default=str)
     import io
@@ -1110,3 +1201,4 @@ async def handle_config_restore_file(client: Client, message: Message):
 @Client.on_callback_query(filters.regex(r"^close_data$") & filters.user(ADMIN_ID))
 async def close_callback(client: Client, callback: CallbackQuery):
     await callback.message.delete()
+    await callback.answer()
