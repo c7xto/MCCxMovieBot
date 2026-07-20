@@ -172,6 +172,10 @@ async def _handle_file_link(client, message, file_obj_id: str):
         await send_fsub_message(client, message, pending_file_id=file_obj_id)
         return
 
+    from plugins.req_fsub import check_and_show_two_stage
+    if not await check_and_show_two_stage(client, message, file_obj_id):
+        return
+
     config = await db.get_config()
     delete_seconds = int(config.get("auto_delete_time", 300))
     delete_minutes = delete_seconds // 60

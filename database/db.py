@@ -34,6 +34,13 @@ _config_cache = None
 _config_cache_ts = 0.0
 _CONFIG_TTL = 60
 
+# Fixed per-user re-verification window for the Two-Stage Verification gate
+# (database.get_two_stage_due / mark_two_stage_verified below). Deliberately
+# a hardcoded constant rather than an admin-configurable field like
+# req_fsub_interval_hours — the product requirement is specifically a fixed
+# 30-minute window, not a tunable one.
+TWO_STAGE_VERIFY_INTERVAL = 1800
+
 
 @lru_cache(maxsize=4096)
 def compile_regex(pattern):
@@ -1010,6 +1017,73 @@ class Database:
         await self.config_col.update_one({"_id": "bot_config"}, {"$set": {"req_fsub_channels": updated}})
         global _config_cache, _config_cache_ts
         _config_cache = None; _config_cache_ts = 0.0
+
+    async def set_two_stage_channel(self, slot: int, channel_id) -> bool:
+        """slot is 1 or 2 — a fixed 2-slot list (unlike fsub_channels/
+        req_fsub_channels, which are appendable pools), since the Two-Stage
+        Verification gate is specifically a sequential Channel-1-then-
+        Channel-2 flow, not "join any N of these"."""
+        if self.config_col is None:
+            return False
+        config   = await self.config_col.find_one({"_id": "bot_config"})
+        channels = list(config.get("two_stage_channels", [])) if config else []
+        while len(channels) < 2:
+            channels.append(None)
+        channels[slot - 1] = {"id": channel_id}
+        await self.config_col.update_one({"_id": "bot_config"}, {"$set": {"two_stage_channels": channels}}, upsert=True)
+        global _config_cache, _config_cache_ts
+        _config_cache = None; _config_cache_ts = 0.0
+        return True
+
+    async def remove_two_stage_channel(self, slot: int) -> bool:
+        if self.config_col is None:
+            return False
+        config   = await self.config_col.find_one({"_id": "bot_config"})
+        channels = list(config.get("two_stage_channels", [])) if config else []
+        while len(channels) < 2:
+            channels.append(None)
+        channels[slot - 1] = None
+        await self.config_col.update_one({"_id": "bot_config"}, {"$set": {"two_stage_channels": channels}}, upsert=True)
+        global _config_cache, _config_cache_ts
+        _config_cache = None; _config_cache_ts = 0.0
+        return True
+
+    async def update_two_stage_channel_link(self, channel_id, link):
+        if self.config_col is None:
+            return
+        config = await self.config_col.find_one({"_id": "bot_config"})
+        if not config:
+            return
+        channels = config.get("two_stage_channels", [])
+        updated  = []
+        for entry in channels:
+            if isinstance(entry, dict) and str(entry.get("id")) == str(channel_id):
+                entry["link"] = link
+            updated.append(entry)
+        await self.config_col.update_one({"_id": "bot_config"}, {"$set": {"two_stage_channels": updated}})
+        global _config_cache, _config_cache_ts
+        _config_cache = None; _config_cache_ts = 0.0
+
+    async def check_two_stage_due(self, user_id: int) -> bool:
+        """True if this user needs to go through Two-Stage Verification
+        again — i.e. hasn't completed it within the last
+        TWO_STAGE_VERIFY_INTERVAL (30 min)."""
+        if self.users_col is None:
+            return False
+        try:
+            doc  = await self.users_col.find_one({"_id": user_id}, {"two_stage_verified_at": 1})
+            last = doc.get("two_stage_verified_at", 0) if doc else 0
+            return (time.time() - last) >= TWO_STAGE_VERIFY_INTERVAL
+        except Exception:
+            return False
+
+    async def mark_two_stage_verified(self, user_id: int):
+        if self.users_col is None:
+            return
+        try:
+            await self.users_col.update_one({"_id": user_id}, {"$set": {"two_stage_verified_at": time.time()}}, upsert=True)
+        except Exception:
+            pass
 
     async def get_req_fsub_interval(self):
         config = await self.get_config()

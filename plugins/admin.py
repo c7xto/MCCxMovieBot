@@ -103,10 +103,11 @@ _CATEGORY_MENUS = {
         ("📝 Edit Welcome Text",        "edit_welcometext"),
     ]),
     "users": ("👥 Users & Groups", [
-        ("🔐 Manage FSub Channels", "fsub_menu"),
-        ("📢 Req Channel FSub",     "req_fsub_menu"),
-        ("🏘 Group Manager",        "group_manager_menu"),
-        ("🔧 Maintenance Mode",     "admin_toggle_maintenance"),
+        ("🔐 Manage FSub Channels",     "fsub_menu"),
+        ("📢 Req Channel FSub",         "req_fsub_menu"),
+        ("🔐🔐 Two-Stage Verification", "two_stage_menu"),
+        ("🏘 Group Manager",            "group_manager_menu"),
+        ("🔧 Maintenance Mode",         "admin_toggle_maintenance"),
     ]),
     "settings": ("⚙️ Settings", [
         ("⚙️ Change Main Group Link",  "edit_maingroup"),
@@ -281,6 +282,26 @@ async def handle_edit_buttons(client: Client, callback: CallbackQuery):
             "➖ **Send me the Channel ID or Username** to remove from FSub.\n"
             "*Type /cancel to abort.*"
         ),
+        "twostage1": (
+            "➕ **Set Two-Stage Channel 1**\n\n"
+            "Send the channel in any format:\n"
+            "`https://t.me/+xxxxxxx` — private invite link ✅\n"
+            "`https://t.me/username` — public channel link\n"
+            "`@username` — public username\n"
+            "`-1001234567890` — numeric channel ID\n\n"
+            "Bot must be **Admin** in that channel.\n\n"
+            "*Type /cancel to abort.*"
+        ),
+        "twostage2": (
+            "➕ **Set Two-Stage Channel 2**\n\n"
+            "Send the channel in any format:\n"
+            "`https://t.me/+xxxxxxx` — private invite link ✅\n"
+            "`https://t.me/username` — public channel link\n"
+            "`@username` — public username\n"
+            "`-1001234567890` — numeric channel ID\n\n"
+            "Bot must be **Admin** in that channel.\n\n"
+            "*Type /cancel to abort.*"
+        ),
         "welcometext": (
             "📝 **Send me the new Welcome Message.**\n\n"
             "**Tip:** You can use standard Telegram HTML tags (`<b>`, `<i>`, `<blockquote>`).\n"
@@ -443,6 +464,56 @@ async def req_fsub_interval_prompt(client: Client, callback: CallbackQuery):
         "_Type /cancel to abort._"
     )
     await callback.answer()
+
+
+# ── TWO-STAGE VERIFICATION MANAGER ────────────────────────────────────────────
+# Real, sequential 2-channel gate — see plugins/req_fsub.py's module
+# docstring for the full design. Both slots must be set for the gate to be
+# active; leaving either one unset makes it a no-op (fails open), matching
+# how every other optional channel-gate in this bot behaves.
+
+def _fmt_two_stage_slot(entry):
+    if not entry:
+        return "_Not set_"
+    cid = entry.get("id") if isinstance(entry, dict) else entry
+    return f"`{cid}`"
+
+
+@Client.on_callback_query(filters.regex(r"^two_stage_menu$") & filters.user(ADMIN_ID))
+async def show_two_stage_menu(client: Client, callback: CallbackQuery):
+    config   = await db.get_config()
+    channels = config.get("two_stage_channels", [])
+    ch1 = channels[0] if len(channels) > 0 else None
+    ch2 = channels[1] if len(channels) > 1 else None
+    active = bool(ch1 and ch2)
+
+    text = (
+        f"🔐🔐 **Two-Stage Verification**\n\n"
+        f"Requires joining 2 channels in sequence — each step is a real "
+        f"membership check via Telegram, not just a tap — before a file is "
+        f"delivered. Verified users are cached for **30 minutes** so they "
+        f"aren't re-prompted on every file in that window.\n\n"
+        f"🔸 **Status:** {'✅ Active' if active else '⚫ Incomplete — both channels needed'}\n\n"
+        f"**Channel 1:** {_fmt_two_stage_slot(ch1)}\n"
+        f"**Channel 2:** {_fmt_two_stage_slot(ch2)}"
+    )
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Set Channel 1", callback_data="edit_twostage1"),
+         InlineKeyboardButton("✏️ Set Channel 2", callback_data="edit_twostage2")],
+        [InlineKeyboardButton("🗑 Remove Channel 1", callback_data="twostage_remove1"),
+         InlineKeyboardButton("🗑 Remove Channel 2", callback_data="twostage_remove2")],
+        [InlineKeyboardButton("🔙 Back", callback_data="back_to_admin")]
+    ])
+    await callback.message.edit_text(text, reply_markup=markup)
+    await callback.answer()
+
+
+@Client.on_callback_query(filters.regex(r"^twostage_remove(1|2)$") & filters.user(ADMIN_ID))
+async def two_stage_remove(client: Client, callback: CallbackQuery):
+    slot = int(callback.data[-1])
+    await db.remove_two_stage_channel(slot)
+    await callback.answer(f"✅ Channel {slot} removed.", show_alert=False)
+    await show_two_stage_menu(client, callback)
 
 
 @Client.on_callback_query(filters.regex(r"^db_chan_menu$") & filters.user(ADMIN_ID))
@@ -655,6 +726,93 @@ async def catch_admin_input(client: Client, message: Message):
             f"✅ **Channel `{ch_val}` Successfully Removed from FSub!**",
             reply_markup=_BACK_BTN
         )
+
+    elif state in ("twostage1", "twostage2"):
+        import re as _re
+        raw  = message.text.strip()
+        slot = 1 if state == "twostage1" else 2
+
+        # Same input-resolution logic as addfsub — accepts a t.me link,
+        # @username, or a bare numeric ID.
+        link_to_store = None
+        ch_input = raw
+
+        tme_match = _re.match(r'https?://t\.me/([a-zA-Z0-9_]+)', raw)
+        if tme_match:
+            username = tme_match.group(1)
+            ch_input = f"@{username}"
+            link_to_store = raw
+        elif raw.startswith("@"):
+            ch_input = raw
+            link_to_store = f"https://t.me/{raw.lstrip('@')}"
+        elif raw.lstrip("-").isdigit():
+            ch_input = int(raw)
+        else:
+            await message.reply_text(
+                "❌ **Invalid format.**\n\n"
+                "Send one of:\n"
+                "• `https://t.me/yourchannel`\n"
+                "• `@yourchannel`\n"
+                "• `-100123456789`",
+                reply_markup=_BACK_BTN
+            )
+            _clear_state(admin_id)
+            raise StopPropagation
+
+        try:
+            chat = await client.get_chat(ch_input)
+            ch_id    = chat.id
+            ch_title = getattr(chat, "title", str(ch_id))
+
+            if not link_to_store:
+                uname = getattr(chat, "username", None)
+                if uname:
+                    link_to_store = f"https://t.me/{uname}"
+                else:
+                    # Private channel — a "request to join" link, matching
+                    # the "Request to Join" wording this gate uses, not a
+                    # direct-join link like the main FSub's addfsub flow.
+                    try:
+                        invite = await client.create_chat_invite_link(ch_id, creates_join_request=True)
+                        link_to_store = invite.invite_link
+                    except Exception:
+                        link_to_store = None
+
+            try:
+                member = await client.get_chat_member(ch_id, client.me.id)
+                is_admin = member.status.name in ["ADMINISTRATOR", "CREATOR"]
+            except Exception:
+                is_admin = False
+
+            if not is_admin:
+                await message.reply_text(
+                    f"❌ **Bot is not Admin in** `{ch_title}`.\n\n"
+                    f"Make the bot an Admin first, then add it again.",
+                    reply_markup=_BACK_BTN
+                )
+                _clear_state(admin_id)
+                raise StopPropagation
+
+            await db.set_two_stage_channel(slot, ch_id)
+            if link_to_store:
+                await db.update_two_stage_channel_link(ch_id, link_to_store)
+
+            await message.reply_text(
+                f"✅ **Two-Stage Channel {slot} Set!**\n\n"
+                f"📢 **{ch_title}**\n"
+                f"🆔 `{ch_id}`\n"
+                f"🔗 `{link_to_store or 'No link (set manually)'}`",
+                reply_markup=_BACK_BTN
+            )
+
+        except StopPropagation:
+            raise
+        except Exception as e:
+            await message.reply_text(
+                f"❌ **Could not resolve channel.**\n\n`{e}`\n\n"
+                f"Make sure the bot is a member/admin in that channel.",
+                reply_markup=_BACK_BTN
+            )
 
     elif state == "autodeletetime":
         raw = message.text.strip()
