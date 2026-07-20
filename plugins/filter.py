@@ -10,20 +10,16 @@ from urllib.parse import quote
 from dotenv import load_dotenv
 from pyrogram.errors import MessageNotModified, FloodWait, UserNotParticipant
 from pyrogram import Client, filters
-from pyrogram.enums import ParseMode
+from pyrogram.enums import ParseMode, ChatAction
 from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 )
-try:
-    from pyrogram.types import LinkPreviewOptions
-    def _no_preview(): return {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
-except ImportError:
-    LinkPreviewOptions = None
-    def _no_preview(): return {"disable_web_page_preview": True}
 from database.db import db
-from plugins.req_fsub import check_and_show_req_fsub, check_and_show_two_stage
-from utils import is_subscribed, is_subscribed_join_only, send_fsub_message, _parse_fsub_entry, ADMIN_ID
-from tmdb import get_movie_data
+from plugins.req_fsub import check_verification_gates
+from utils import (
+    is_subscribed, is_subscribed_join_only, send_fsub_message, _parse_fsub_entry,
+    ADMIN_ID, _no_preview, _html,
+)
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -42,19 +38,6 @@ LANG_EMOJI = {
     "Hindi": "🇮🇳", "English": "🌍", "Kannada": "🏵",
     "Dual Audio": "🎧", "Multi Audio": "🎵", "Other": "🌐"
 }
-
-# ── Sort modes for the results-view "sort toggle" row. "smart" is the
-# existing series-aware/size-desc default (_sort_results, unchanged).
-_SORT_LABELS = {
-    "smart": "✨ Smart",
-    "size":  "📦 Size",
-    "new":   "🆕 Newest",
-}
-
-
-def _html(text: str) -> str:
-    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
 
 async def send_smart_log(client, text):
     try:
@@ -160,27 +143,6 @@ def _sort_results(results: list) -> list:
     return sorted(results, key=lambda f: f.get("file_size", 0), reverse=True)
 
 
-def _apply_sort(results: list, mode: str) -> list:
-    """Applies one of the "sort toggle" modes to a full results list.
-    "new" sorts by the raw ObjectId (monotonically time-ordered, same trick
-    already used elsewhere in this codebase — e.g. db.py's duplicate
-    cleanup uses ObjectId.generation_time) rather than needing a separate
-    upload-timestamp field."""
-    if mode == "size":
-        return sorted(results, key=lambda f: f.get("file_size", 0), reverse=True)
-    if mode == "new":
-        return sorted(results, key=lambda f: f.get("_id"), reverse=True)
-    return _sort_results(results)
-
-
-def _sort_row(session_id: str, current_mode: str) -> list:
-    row = []
-    for mode, label in _SORT_LABELS.items():
-        text = f"✅ {label}" if mode == current_mode else label
-        row.append(InlineKeyboardButton(text, callback_data=f"sort#{session_id}#{mode}"))
-    return row
-
-
 def _build_caption(config, file_data, delete_minutes, bot_username):
     template = config.get("file_caption_template", "")
     if template:
@@ -208,22 +170,18 @@ def _build_caption(config, file_data, delete_minutes, bot_username):
         "Hindi": "🇮🇳", "English": "🌍", "Kannada": "🏵",
         "Dual Audio": "🎧", "Multi Audio": "🎵"
     }
-    lang_icon = lang_emojis.get(f_lang, "🎬")
-    tag_parts = []
+    meta_parts = [f"📦 {size_str}"]
     if f_lang not in ["Other", ""]:
-        tag_parts.append(f"{lang_icon} {f_lang}")
+        meta_parts.append(f"{lang_emojis.get(f_lang, '🎬')} {f_lang}")
     if f_qual not in ["Other", ""]:
-        tag_parts.append(f"🎞 {f_qual}")
-    tags_line = f"{'  •  '.join(tag_parts)}\n" if tag_parts else ""
+        meta_parts.append(f"🎞 {f_qual}")
+    meta_line = "   ".join(meta_parts)
 
     return (
-        f"📥 <b>{_html(file_data['file_name'])}</b>\n"
-        f"📦 Size: {size_str}\n"
-        f"{tags_line}\n"
-        f"👇 Use the links below to join or download...\n\n"
-        f"<blockquote>⚠️ <b>Files will be deleted in {delete_minutes} minutes. If you want to keep "
-        f"this file, kindly forward it to any chat (Saved Messages) and start the download...</b></blockquote>\n"
-        f"📢 @{bot_username}"
+        f"🎬 <b>{_html(file_data['file_name'])}</b>\n\n"
+        f"{meta_line}\n\n"
+        f"⚠️ Deletes in {delete_minutes} min — forward to Saved Messages to keep it\n\n"
+        f"@{bot_username}"
     )
 
 
@@ -278,25 +236,18 @@ def _build_result_buttons(results: list, session_id: str, page: int, per_page: i
 
 async def _render_results_view(client, message, session_id: str, page: int, data: dict, user_id=None):
     """Single shared renderer for every results screen — the initial
-    search render, Prev/Next pagination, sort-mode switches, the series
-    expand toggle, and the Data Saver toggle all funnel through this one
-    function so they can never drift out of sync with each other (the old
-    code duplicated this whole block between show_results and
-    handle_pagination).
+    search render, Prev/Next pagination, and the series expand toggle all
+    funnel through this one function so they can never drift out of sync
+    with each other (the old code duplicated this whole block between
+    show_results and handle_pagination).
     """
-    results   = data["results"]
-    query     = data["query"]
-    tmdb      = data.get("tmdb")
-    sort_mode = data.get("sort_mode", "smart")
+    results = data["results"]
+    query   = data["query"]
     series_expanded = data.get("series_expanded", False)
 
     total     = len(results)
     _del_secs = int(data.get("auto_delete_time", 300))
     _del_mins = max(1, _del_secs // 60)
-
-    uid = user_id if user_id is not None else data.get("user_id")
-    data_saver = await db.get_data_saver(uid) if uid is not None else False
-    first_name = data.get("first_name", "")
 
     has_series = _has_series_content(results)
     buttons = []
@@ -307,46 +258,24 @@ async def _render_results_view(client, message, session_id: str, page: int, data
         file_buttons, page, total_pages = _build_result_buttons(results, session_id, page)
         buttons.extend(file_buttons)
 
-    caption = (
-        f"🔍 <b>Results Found For {_html(query)}</b>\n"
-        f"🗣️ : {_html(first_name)}\n\n"
-        f"📁 <b>Files: {total} - 📚 Page: {page+1}/{total_pages}</b>\n\n"
-    )
-
-    if tmdb:
-        title_display = _html(tmdb["title"])
-        caption += f"🎬 <b>{title_display}</b>\n"
-        if tmdb.get("overview"):
-            # tap-to-reveal — keeps plot details out of the way until the
-            # user actually wants them (also a mild spoiler guard).
-            caption += f"<blockquote><tg-spoiler>{_html(tmdb['overview'])}</tg-spoiler></blockquote>\n"
-        if tmdb.get("rating"):
-            caption += f"⭐ <b>{tmdb['rating']}/10</b>\n"
-        caption += "\n"
-
-    caption += f"🗑 Auto-deletes in {_del_mins} mins\n\n"
+    caption  = f"🔍 <code>{_html(query)}</code>\n\n"
+    caption += f"{total} files · Page {page+1}/{total_pages} · Auto-deletes in {_del_mins} min\n\n"
 
     if has_series and not series_expanded:
-        caption += "👇 Grouped as a series — tap to see every episode:"
+        caption += "Grouped as a series — tap to see every episode:"
         buttons.append([InlineKeyboardButton(
             f"📺 View All Episodes ({total} found)",
             callback_data=f"expandseries#{session_id}"
         )])
     else:
-        caption += "👇 Tap a file to receive it in your PM:"
-
-    buttons.append(_sort_row(session_id, sort_mode))
-
-    utility_row = [InlineKeyboardButton("🔍 New Search", callback_data="new_search_hint")]
-    if uid is not None:
-        saver_label = "📶 Data Saver: ON" if data_saver else "📶 Data Saver: OFF"
-        utility_row.append(InlineKeyboardButton(saver_label, callback_data=f"datasaver#{session_id}"))
-    buttons.append(utility_row)
+        caption += "Tap a file below to receive it in your PM"
 
     buttons.append([InlineKeyboardButton("🏠 Home", callback_data="start_home")])
     markup = InlineKeyboardMarkup(buttons)
 
-    has_poster = bool(tmdb and tmdb.get("poster"))
+    # Results render as plain text only now — there's no TMDB poster to
+    # upgrade a status message into a photo with. The media-message branch
+    # is just a safe fallback for a session started just before this deploy.
     is_media_msg = bool(
         getattr(message, "photo", None) or getattr(message, "video", None) or
         getattr(message, "animation", None) or getattr(message, "document", None)
@@ -354,26 +283,11 @@ async def _render_results_view(client, message, session_id: str, page: int, data
 
     try:
         if is_media_msg:
-            if data_saver:
-                # Downgrade: the session was already showing the poster and
-                # the user just enabled Data Saver — Telegram can't turn a
-                # photo message into a text message in place, so replace it.
-                chat_id = message.chat.id
-                await message.delete()
-                await client.send_message(
-                    chat_id, caption, reply_markup=markup,
-                    parse_mode=ParseMode.HTML, **_no_preview()
-                )
-            else:
-                await message.edit_caption(caption=caption, reply_markup=markup, parse_mode=ParseMode.HTML)
-        elif page == 0 and has_poster and not data_saver:
-            # First render of this session with a poster available and Data
-            # Saver off — upgrade the plain status message into a photo.
             chat_id = message.chat.id
             await message.delete()
-            await client.send_photo(
-                chat_id=chat_id, photo=tmdb["poster"], caption=caption,
-                reply_markup=markup, parse_mode=ParseMode.HTML
+            await client.send_message(
+                chat_id, caption, reply_markup=markup,
+                parse_mode=ParseMode.HTML, **_no_preview()
             )
         else:
             await message.edit_text(text=caption, reply_markup=markup, parse_mode=ParseMode.HTML)
@@ -400,7 +314,7 @@ route_menu = show_results
 @Client.on_message(
     filters.text & filters.private &
     ~filters.command([
-        "start", "help", "about", "admin", "broadcast", "ban", "unban", "purge_cams", "reset_db", "update",
+        "start", "help", "admin", "broadcast", "ban", "unban", "reset_db", "update",
         "request", "filesearch", "stats", "cancel", "reset_index_progress", "confirm_reset"
     ])
 )
@@ -460,6 +374,11 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
     if not query:
         return
 
+    try:
+        await client.send_chat_action(message.chat.id, ChatAction.TYPING)
+    except Exception:
+        pass
+
     start_time = time.time()
     results    = await db.get_search_results(query)
 
@@ -491,12 +410,10 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
             [InlineKeyboardButton("🏠 Home", callback_data="start_home")]
         ]
 
-        first_name = _html(message.from_user.first_name or "")
         return await message.reply_text(
-            f"<b>Hey {first_name} something Is Wrong ❌</b>\n\n"
-            f"🔹 Check IMDb and check the OTT release or Join the Channel below\n"
-            f"🔹 Click spelling button below to correct the spelling of the movie And More Information 📥\n\n"
-            f"📢 Join Our Community",
+            f"🔍 No matches for <code>{_html(query)}</code>\n\n"
+            f"It may not be uploaded yet, or there's a typo — try a spelling "
+            f"suggestion below, or request it directly.",
             reply_markup=InlineKeyboardMarkup(sug_buttons),
             parse_mode=ParseMode.HTML, **_no_preview()
         )
@@ -504,42 +421,16 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
     time_taken = time.time() - start_time
     await db.clear_old_searches()
 
-    # Only searches that actually returned something are worth surfacing as
-    # a "trending" suggestion on the home panel — see _TrendingCache's
-    # docstring in db.py.
-    await db.log_trending_search(query)
-
     session_id = "".join(random.choices(string.ascii_letters + string.digits, k=6))
-
-    # Fetch TMDB data if API key is set
-    tmdb_data = None
-    try:
-        best_name = results[0]["file_name"]
-        clean_tmdb = re.sub(
-            r"(1080p|720p|480p|4K|HDRip|WEB-DL|WEBRip|BluRay|PreDVD|CAM|"
-            r"HD.Rip|x264|x265|HEVC|Dual.Audio|Multi.Audio|"
-            r"Malayalam|Tamil|Telugu|Hindi|English|Kannada)",
-            "", best_name, flags=re.IGNORECASE
-        )
-        clean_tmdb = re.sub(r"[\(\[].*?[\)\]]", "", clean_tmdb)
-        clean_tmdb = re.sub(r"[^a-zA-Z0-9\s]", " ", clean_tmdb).strip()
-        if len(clean_tmdb) > 2:
-            tmdb_data = await get_movie_data(clean_tmdb)
-        if not tmdb_data:
-            tmdb_data = await get_movie_data(query)
-    except Exception:
-        tmdb_data = None
 
     session_data = {
         "results":          _sort_results(results),
         "query":            query,
-        "tmdb":             tmdb_data,
         "speed":            f"{time_taken:.3f}s",
         "time":             time.time(),
         "auto_delete_time": int(config.get("auto_delete_time", 300)),
         "user_id":          user_id,
         "first_name":       message.from_user.first_name or "",
-        "sort_mode":        "smart",
     }
     await db.save_search(session_id, session_data)
 
@@ -563,27 +454,6 @@ async def handle_pagination(client: Client, callback: CallbackQuery):
     await callback.answer()
 
 
-@Client.on_callback_query(filters.regex(r"^sort#"))
-async def handle_sort(client: Client, callback: CallbackQuery):
-    parts = callback.data.split("#")
-    if len(parts) < 3:
-        return await callback.answer()
-    session_id, mode = parts[1], parts[2]
-    if mode not in _SORT_LABELS:
-        return await callback.answer()
-
-    data = await db.get_search(session_id)
-    if not data:
-        return await callback.answer("⚠️ Session expired.", show_alert=True)
-
-    data["results"]   = _apply_sort(data["results"], mode)
-    data["sort_mode"] = mode
-    await db.save_search(session_id, data)
-
-    await callback.answer(f"Sorted: {_SORT_LABELS[mode]}")
-    await _render_results_view(client, callback.message, session_id, 0, data, user_id=callback.from_user.id)
-
-
 @Client.on_callback_query(filters.regex(r"^expandseries#"))
 async def handle_expand_series(client: Client, callback: CallbackQuery):
     session_id = callback.data.split("#", 1)[1]
@@ -599,40 +469,6 @@ async def handle_expand_series(client: Client, callback: CallbackQuery):
     await _render_results_view(client, callback.message, session_id, 0, data, user_id=callback.from_user.id)
 
 
-@Client.on_callback_query(filters.regex(r"^datasaver#"))
-async def handle_data_saver_toggle(client: Client, callback: CallbackQuery):
-    session_id = callback.data.split("#", 1)[1]
-
-    data = await db.get_search(session_id)
-    if not data:
-        return await callback.answer("⚠️ Session expired.", show_alert=True)
-
-    user_id   = callback.from_user.id
-    new_value = not await db.get_data_saver(user_id)
-    await db.set_data_saver(user_id, new_value)
-
-    await callback.answer(f"📶 Data Saver {'ON' if new_value else 'OFF'}", show_alert=False)
-    # No page number travels in this callback's data — reset to page 0,
-    # same as the sort and expand-series toggles.
-    await _render_results_view(client, callback.message, session_id, 0, data, user_id=user_id)
-
-
-@Client.on_callback_query(filters.regex(r"^new_search_hint$"))
-async def new_search_hint_callback(client: Client, callback: CallbackQuery):
-    await callback.answer()
-    prompt_text = "🔍 <b>Type any movie or series name to search!</b>"
-    markup = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="start_home")]])
-    msg = callback.message
-    try:
-        if getattr(msg, "photo", None) or getattr(msg, "video", None) or \
-           getattr(msg, "animation", None) or getattr(msg, "document", None):
-            await msg.edit_caption(caption=prompt_text, reply_markup=markup, parse_mode=ParseMode.HTML)
-        else:
-            await msg.edit_text(text=prompt_text, reply_markup=markup, parse_mode=ParseMode.HTML)
-    except Exception:
-        pass
-
-
 @Client.on_callback_query(filters.regex(r"^ignore$"))
 async def handle_ignore(client: Client, callback: CallbackQuery):
     await callback.answer()
@@ -646,15 +482,7 @@ async def send_movie_file(client: Client, callback: CallbackQuery):
     if not file_data:
         return await callback.answer("⚠️ File no longer available.", show_alert=True)
 
-    if not await is_subscribed_join_only(client, callback):
-        await callback.answer("🔐 Join our channel first!", show_alert=False)
-        await send_fsub_message(client, callback, pending_file_id=file_obj_id)
-        return
-
-    if not await check_and_show_req_fsub(client, callback, file_obj_id):
-        return
-
-    if not await check_and_show_two_stage(client, callback, file_obj_id):
+    if not await check_verification_gates(client, callback, file_obj_id):
         return
 
     await callback.answer("📤 Sending file...", show_alert=False)

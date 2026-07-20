@@ -16,6 +16,13 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+
+def _html(text) -> str:
+    """Escapes a string for safe use inside Telegram HTML-mode messages.
+    Single shared definition — every plugin that builds HTML captions
+    imports this instead of redefining it locally."""
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
 # Single shared source of truth for admin IDs — parsed as a comma-separated
 # list so multi-admin setups (ADMIN_ID=123,456) work everywhere, not just
 # in broadcast.py. Import this everywhere instead of re-parsing os.getenv.
@@ -32,17 +39,17 @@ def _parse_fsub_entry(entry):
         return str(entry), "join"
 
 
-async def is_subscribed(client, message_or_callback):
-    """Checks if the user has joined all FSub channels."""
+async def is_subscribed_by_id(client, user_id: int) -> bool:
+    """Core Main-FSub membership check against every configured channel,
+    by user_id directly — the reusable half of is_subscribed() below, and
+    also used by req_fsub.py's unified verification-gates checker so both
+    entry points share one exact set of pass/fail semantics. Deny only on
+    KICKED/BANNED/LEFT/UserNotParticipant; fail-open on any other error
+    (documented tradeoff — see BOT_BLUEPRINT.md's fail-open FSub note)."""
     config = await db.get_config()
     fsub_channels = config.get("fsub_channels", [])
-
     if not fsub_channels:
         return True
-
-    if not message_or_callback.from_user:
-        return True  # anonymous admin — let through
-    user_id = message_or_callback.from_user.id
 
     for entry in fsub_channels:
         channel_id, _ = _parse_fsub_entry(entry)
@@ -60,6 +67,13 @@ async def is_subscribed(client, message_or_callback):
             continue
 
     return True
+
+
+async def is_subscribed(client, message_or_callback):
+    """Checks if the user has joined all FSub channels."""
+    if not message_or_callback.from_user:
+        return True  # anonymous admin — let through
+    return await is_subscribed_by_id(client, message_or_callback.from_user.id)
 
 
 # Keep is_subscribed_join_only as alias for backward compat with filter.py and start.py

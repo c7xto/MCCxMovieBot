@@ -8,7 +8,7 @@ from pyrogram import Client, filters
 from pyrogram import ContinuePropagation, StopPropagation
 from pyrogram.errors import FloodWait, MessageNotModified
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from database.db import db
+from database.db import db, AllClustersFullError
 from utils import ADMIN_ID
 
 load_dotenv()
@@ -37,10 +37,19 @@ async def run_indexer(client: Client, status_message: Message, chat_id: int, las
     await db.set_index_task(chat_id, "running")
     current_id = start_id
     batch_size = 50 # Safe size to prevent API limits
-    
+
     saved_files, duplicates, deleted_empty = 0, 0, 0
     start_time = time.time()
     loops = 0
+
+    # Adaptive backoff between batches — start fast, only slow down after an
+    # actual FloodWait (rather than a fixed 3s pause regardless of how close
+    # to a flood limit we actually are), then ease back toward the minimum
+    # once a stretch of batches has gone through clean.
+    MIN_BATCH_SLEEP = 0.5
+    MAX_BATCH_SLEEP = 10.0
+    batch_sleep = MIN_BATCH_SLEEP
+    clean_streak = 0
 
     while current_id <= last_msg_id:
         # 1. Check the Control State
@@ -94,9 +103,15 @@ async def run_indexer(client: Client, status_message: Message, chat_id: int, las
                     })
 
         except FloodWait as e:
+            # Telegram itself just told us to slow down — obey the mandatory
+            # wait, then raise our steady-state pace too so we don't march
+            # straight back into the next one.
+            batch_sleep = min(MAX_BATCH_SLEEP, batch_sleep * 2)
+            clean_streak = 0
             await asyncio.sleep(e.value)
             continue
-            
+
+
         except Exception as e:
             # --- 1. UPDATE THE USER IN THE CHAT ---
             try:
@@ -140,27 +155,31 @@ async def run_indexer(client: Client, status_message: Message, chat_id: int, las
                 new_saves, dups = await db.save_files_bulk(batch_files)
                 saved_files += new_saves
                 duplicates += dups
+            except AllClustersFullError as e:
+                # Every configured cluster is at its 450MB safety margin —
+                # halt instead of silently reporting a false "complete".
+                duplicates += e.duplicates
+                await db.clear_index_task(chat_id)
+                next_slot = len(db.file_cols) + 1
+                try:
+                    await status_message.edit_text(
+                        f"🛑 **Indexing Stopped — Database Full!**\n\n"
+                        f"All `{len(db.file_cols)}` configured cluster(s) have hit their 450MB safety margin — "
+                        f"`{e.unsaved_count}` file(s) in this batch could not be stored anywhere.\n"
+                        f"**Fix:** Add a new cluster as `DATABASE_URI_{next_slot}` in your environment variables "
+                        f"and restart the bot. Then resume indexing.\n\n"
+                        f"✅ Saved so far: `{saved_files}` files"
+                    )
+                except Exception:
+                    pass
+                asyncio.create_task(send_smart_log(client,
+                    f"🛑 **#DatabaseFull**\n\nBulk indexer stopped — every cluster is at capacity.\n"
+                    f"Add `DATABASE_URI_{next_slot}` to env vars and restart.\n"
+                    f"Files saved before stopping: `{saved_files}`\n"
+                    f"Files lost this batch: `{e.unsaved_count}`"
+                ))
+                return
             except Exception as e:
-                err_str = str(e).lower()
-                if "space quota" in err_str or "over your space" in err_str:
-                    # Cluster is full — stop indexing gracefully with a clear message
-                    await db.clear_index_task(chat_id)
-                    try:
-                        await status_message.edit_text(
-                            f"🛑 **Indexing Stopped — Database Full!**\n\n"
-                            f"Your MongoDB cluster has hit the 512MB free tier limit.\n"
-                            f"**Fix:** Add a new cluster as `DATABASE_URI_2` in your environment variables "
-                            f"and restart the bot. Then index again.\n\n"
-                            f"✅ Saved so far: `{saved_files}` files"
-                        )
-                        asyncio.create_task(send_smart_log(client,
-                            f"🛑 **#DatabaseFull**\n\nIndexer stopped — Cluster is at capacity.\n"
-                            f"Add DATABASE_URI_2 to env vars and restart.\n"
-                            f"Files saved before stopping: `{saved_files}`"
-                        ))
-                    except Exception:
-                        pass
-                    return
                 logger.warning(f"Batch save error (non-fatal): {e}")
 
         await db.set_index_progress(chat_id, end_id)
@@ -181,7 +200,7 @@ async def run_indexer(client: Client, status_message: Message, chat_id: int, las
             ])
 
             text = (
-                f"⚡ **MCCxBot Super-Indexer [RUNNING]**\n"
+                f"⚡ **Super-Indexer — Running**\n"
                 f"{get_progress_bar(percentage)} `{percentage:.1f}%`\n\n"
                 f"📈 **Progress:** `{current_id} / {last_msg_id}`\n"
                 f"⏱ **Elapsed:** `{get_readable_time(elapsed_time)}` | ⏳ **ETA:** `{get_readable_time(eta_seconds)}`\n"
@@ -195,8 +214,15 @@ async def run_indexer(client: Client, status_message: Message, chat_id: int, las
             except FloodWait as e:
                 await asyncio.sleep(e.value)
 
-        # 🛡️ THE STEALTH BRAKE: 3-second mandatory pause between API calls
-        await asyncio.sleep(3)
+        # Ease back toward the minimum pace after a clean run of batches —
+        # gradual, not instant, so we don't immediately re-trigger the
+        # FloodWait that just pushed batch_sleep up.
+        clean_streak += 1
+        if clean_streak >= 10 and batch_sleep > MIN_BATCH_SLEEP:
+            batch_sleep = max(MIN_BATCH_SLEEP, batch_sleep * 0.75)
+            clean_streak = 0
+
+        await asyncio.sleep(batch_sleep)
 
     # 4. Finish Execution
     if await db.get_index_task(chat_id) == "running":
@@ -388,6 +414,6 @@ async def stop_index(client: Client, callback: CallbackQuery):
     await db.set_index_task(chat_id, "stopped")
     await callback.answer("Stopping Indexer... ⏹", show_alert=True)
 
-# FIX #8: close_data handler removed from this file.
-# The canonical handler lives in admin.py — having it here too caused
-# Pyrogram to register it twice, leading to unpredictable double-fire behavior.
+# No close_data handler in this file — the canonical one lives in admin.py.
+# Having it here too caused Pyrogram to register it twice, leading to
+# unpredictable double-fire behavior.

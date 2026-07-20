@@ -1,23 +1,34 @@
 """
-updater.py — GitHub auto-updater
-Pulls latest code from GitHub and restarts the bot.
-Only .env is never touched. Everything else gets updated.
+updater.py — GitHub self-updater, pinned to an admin-approved commit SHA.
+Pulls a single specific commit (never "whatever is on main right now") and
+restarts the bot. Only .env is never touched. Everything else gets updated.
+
+Why pinned: blindly pulling the head of a public branch on every /update tap
+means a compromised GitHub account, a bad merge, or a malicious PR becomes
+full remote code execution on the bot host the instant an admin taps
+"Update Bot" — with the Telegram bot token and every MongoDB credential on
+the line. Requiring the admin to name a commit, see its message/author/diff
+link, and explicitly confirm turns that into a deliberate, reviewable
+action instead of an unpinned trust-the-branch button.
 
 Triggered by:
-  • /update  command (admin only)
+  • /update [sha]  command (admin only)
   • 🔄 Update Bot  button in /admin panel  (callback: upd_start)
 """
 
 import os
+import re
 import sys
 import asyncio
 import logging
 import aiohttp
 from dotenv import load_dotenv
-from pyrogram import Client, filters
+from pyrogram import Client, filters, ContinuePropagation, StopPropagation
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.enums import ParseMode
-from utils import ADMIN_ID
+from database.db import db
+from utils import ADMIN_ID, _html
+from plugins.state import get_state, set_state, clear_state
 from plugins.health_monitor import _log_task_crash
 
 load_dotenv()
@@ -26,29 +37,46 @@ logger = logging.getLogger(__name__)
 GITHUB_REPO   = "c7xto/mccxmoviebot"
 GITHUB_BRANCH = "main"
 
+_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+
 
 def _skip(path: str) -> bool:
     """Only .env is protected — everything else gets updated."""
     return path.replace("\\", "/").split("/")[-1] == ".env"
 
 
-async def _get_tree(session: aiohttp.ClientSession) -> list:
-    url = (
-        f"https://api.github.com/repos/{GITHUB_REPO}/git/trees/{GITHUB_BRANCH}"
-        "?recursive=1"
-    )
+async def _get_commit(session: aiohttp.ClientSession, sha: str) -> dict:
+    """Resolves a (possibly short) SHA to full commit metadata — message,
+    author, date, and the html_url an admin can open to review the actual
+    diff before approving it."""
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/commits/{sha}"
     headers = {
         "Accept":     "application/vnd.github+json",
-        "User-Agent": "MCCxMovieBot-Updater/1.0",
+        "User-Agent": "MCCxMovieBot-Updater/2.0",
+    }
+    async with session.get(url, headers=headers,
+                           timeout=aiohttp.ClientTimeout(total=30)) as r:
+        if r.status == 404 or r.status == 422:
+            raise RuntimeError(f"No commit matching `{sha}` found in {GITHUB_REPO}.")
+        if r.status == 403:
+            raise RuntimeError("GitHub API rate-limited (403). Wait a minute and retry.")
+        if r.status != 200:
+            raise RuntimeError(f"GitHub API {r.status}: {(await r.text())[:150]}")
+        return await r.json(content_type=None)
+
+
+async def _get_tree(session: aiohttp.ClientSession, sha: str) -> list:
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/git/trees/{sha}?recursive=1"
+    headers = {
+        "Accept":     "application/vnd.github+json",
+        "User-Agent": "MCCxMovieBot-Updater/2.0",
     }
     async with session.get(url, headers=headers,
                            timeout=aiohttp.ClientTimeout(total=30)) as r:
         if r.status == 403:
             raise RuntimeError("GitHub API rate-limited (403). Wait a minute and retry.")
         if r.status == 404:
-            raise RuntimeError(
-                f"Repo '{GITHUB_REPO}' / branch '{GITHUB_BRANCH}' not found."
-            )
+            raise RuntimeError(f"Commit `{sha}` not found in {GITHUB_REPO}.")
         if r.status != 200:
             raise RuntimeError(f"GitHub API {r.status}: {(await r.text())[:150]}")
         data = await r.json(content_type=None)
@@ -56,8 +84,8 @@ async def _get_tree(session: aiohttp.ClientSession) -> list:
     return [item["path"] for item in data.get("tree", []) if item["type"] == "blob"]
 
 
-async def _download(session: aiohttp.ClientSession, path: str) -> bytes:
-    url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_BRANCH}/{path}"
+async def _download(session: aiohttp.ClientSession, sha: str, path: str) -> bytes:
+    url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{sha}/{path}"
     async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as r:
         if r.status != 200:
             raise RuntimeError(f"HTTP {r.status}")
@@ -74,11 +102,11 @@ def _write_file(path: str, content: bytes):
         f.write(content)
 
 
-async def _do_update(client: Client, status: Message):
-    # Step 1 — fetch file list
+async def _do_update(client: Client, status: Message, sha: str):
+    # Step 1 — fetch file list for this exact commit
     try:
         await status.edit_text(
-            "🔄 **Step 1/3** — Fetching file list from GitHub...",
+            f"🔄 **Step 1/3** — Fetching file list for `{sha[:12]}`...",
             parse_mode=ParseMode.MARKDOWN,
         )
     except Exception:
@@ -86,7 +114,7 @@ async def _do_update(client: Client, status: Message):
 
     try:
         async with aiohttp.ClientSession() as s:
-            all_files = await _get_tree(s)
+            all_files = await _get_tree(s, sha)
     except Exception as e:
         await status.edit_text(
             f"❌ **Failed — could not reach GitHub**\n\n`{e}`",
@@ -111,16 +139,29 @@ async def _do_update(client: Client, status: Message):
     async with aiohttp.ClientSession() as s:
         for path in to_update:
             try:
-                content = await _download(s, path)
+                content = await _download(s, sha, path)
                 await asyncio.to_thread(_write_file, path, content)
                 updated.append(path)
             except Exception as e:
                 failed.append(f"{path} ({e})")
                 logger.warning(f"Updater: failed {path}: {e}")
 
+    # Persist which commit is now deployed — both locally (survives even if
+    # Mongo is unreachable) and in bot_config (so the admin panel can show
+    # it without SSHing in).
+    try:
+        await asyncio.to_thread(_write_file, ".deployed_sha", sha.encode())
+    except Exception as e:
+        logger.warning(f"Could not record deployed SHA locally: {e}")
+    try:
+        await db.update_config("last_update_sha", sha)
+    except Exception as e:
+        logger.warning(f"Could not record deployed SHA in bot_config: {e}")
+
     # Step 3 — report and restart
     lines = [
         "✅ **Update complete!**\n",
+        f"📌 Commit  : `{sha[:12]}`",
         f"📦 Updated : `{len(updated)}` files",
         f"🔒 Skipped : `.env` _(protected)_",
     ]
@@ -136,70 +177,154 @@ async def _do_update(client: Client, status: Message):
         pass
 
     await asyncio.sleep(3)
-    logger.info("Restarting bot after update (os.execv).")
+    logger.info(f"Restarting bot after update to {sha} (os.execv).")
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
-# ── /update command ───────────────────────────────────────────────────────────
+async def _show_commit_review(client: Client, target, sha: str, *, is_callback: bool):
+    """Fetches commit metadata for `sha` and shows a review/confirm screen.
+    `target` is a Message (reply) or CallbackQuery (edit) depending on
+    `is_callback`."""
+    try:
+        async with aiohttp.ClientSession() as s:
+            commit = await _get_commit(s, sha)
+    except Exception as e:
+        text = f"❌ **Couldn't look up that commit.**\n\n`{e}`\n\nSend a different SHA, or /cancel."
+        if is_callback:
+            await target.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        else:
+            await target.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    full_sha    = commit.get("sha", sha)
+    html_url    = commit.get("html_url", f"https://github.com/{GITHUB_REPO}/commit/{full_sha}")
+    commit_info = commit.get("commit", {})
+    message_1st = (commit_info.get("message") or "").split("\n", 1)[0][:200]
+    author      = (commit_info.get("author") or {}).get("name", "unknown")
+    date        = (commit_info.get("author") or {}).get("date", "unknown")
+
+    set_state(target.from_user.id, f"upd_wait_confirm#{full_sha}")
+
+    # Commit message/author come from GitHub, not our own admin — avoid
+    # Markdown parsing on that part so stray `*`/`_`/backticks can't break
+    # message formatting.
+    text = (
+        "🔄 **Bot Updater — Review Commit**\n\n"
+        f"Repo: {GITHUB_REPO}\n"
+        f"SHA: {full_sha}\n"
+        f"Author: {_html(author)}\n"
+        f"Date: {date}\n"
+        f"Message: {_html(message_1st)}\n\n"
+        "All files will be replaced with this commit's contents. `.env` will "
+        "never be touched.\n\n"
+        "Review the diff on GitHub before confirming."
+    )
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔗 View diff on GitHub", url=html_url)],
+        [InlineKeyboardButton("✅ Confirm update", callback_data=f"upd_confirm#{full_sha}"),
+         InlineKeyboardButton("❌ Cancel",          callback_data="upd_cancel")],
+    ])
+
+    if is_callback:
+        await target.message.edit_text(text, reply_markup=markup)
+    else:
+        await target.reply_text(text, reply_markup=markup)
+
+
+_PROMPT_TEXT = (
+    "🔄 **Bot Updater**\n\n"
+    "For safety, updates are pinned to a specific commit — the bot will "
+    "never blindly pull whatever is currently on `main`.\n\n"
+    "Send the **commit SHA** you want to update to (copy it from the commits "
+    "page below), or /cancel."
+)
+_BROWSE_MARKUP = InlineKeyboardMarkup([[
+    InlineKeyboardButton("🔗 Browse commits on GitHub",
+                          url=f"https://github.com/{GITHUB_REPO}/commits/{GITHUB_BRANCH}")
+]])
+
+
+# ── /update [sha] command ──────────────────────────────────────────────────────
 
 @Client.on_message(
     filters.command("update") & filters.private & filters.user(ADMIN_ID)
 )
 async def cmd_update(client: Client, message: Message):
-    markup = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Yes, update now", callback_data="upd_confirm"),
-        InlineKeyboardButton("❌ Cancel",          callback_data="upd_cancel"),
-    ]])
-    await message.reply_text(
-        f"🔄 **Bot Updater**\n\n"
-        f"Repo: `github.com/{GITHUB_REPO}` (`{GITHUB_BRANCH}`)\n\n"
-        f"• All files will be replaced with latest from GitHub.\n"
-        f"• `.env` will **never** be touched.\n\n"
-        f"⚠️ Bot will auto-restart after update.\n\nProceed?",
-        reply_markup=markup,
-        parse_mode=ParseMode.MARKDOWN,
-        quote=True,
-    )
+    parts = message.text.split(maxsplit=1)
+    if len(parts) == 2 and _SHA_RE.match(parts[1].strip()):
+        await _show_commit_review(client, message, parts[1].strip().lower(), is_callback=False)
+        return
+    set_state(message.from_user.id, "upd_wait_sha")
+    await message.reply_text(_PROMPT_TEXT, reply_markup=_BROWSE_MARKUP, parse_mode=ParseMode.MARKDOWN, quote=True)
 
 
-# ── Admin panel button → show confirm prompt ──────────────────────────────────
+# ── Admin panel button → prompt for a SHA ──────────────────────────────────────
 
 @Client.on_callback_query(
     filters.regex(r"^upd_start$") & filters.user(ADMIN_ID)
 )
 async def cb_upd_start(client: Client, callback: CallbackQuery):
-    markup = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Yes, update now", callback_data="upd_confirm"),
-        InlineKeyboardButton("❌ Cancel",          callback_data="upd_cancel"),
-    ]])
-    await callback.message.edit_text(
-        f"🔄 **Bot Updater**\n\n"
-        f"Repo: `github.com/{GITHUB_REPO}` (`{GITHUB_BRANCH}`)\n\n"
-        f"• All files will be replaced with latest from GitHub.\n"
-        f"• `.env` will **never** be touched.\n\n"
-        f"⚠️ Bot will auto-restart after update.\n\nProceed?",
-        reply_markup=markup,
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    set_state(callback.from_user.id, "upd_wait_sha")
+    await callback.message.edit_text(_PROMPT_TEXT, reply_markup=_BROWSE_MARKUP, parse_mode=ParseMode.MARKDOWN)
     await callback.answer()
+
+
+# ── Text input handler for upd_wait_sha ─────────────────────────────────────────
+
+@Client.on_message(
+    filters.private & filters.text & filters.user(ADMIN_ID) &
+    ~filters.command(["start", "admin", "ban", "unban", "reset_db", "broadcast", "filesearch", "cancel"]),
+    group=-1,  # must win the race against filter.py's auto_filter — see admin.py's
+               # matching catch_admin_input handler for the full explanation.
+)
+async def upd_input_handler(client: Client, message: Message):
+    admin_id = message.from_user.id
+    state = get_state(admin_id)
+
+    if not state or not state.startswith("upd_"):
+        raise ContinuePropagation
+
+    if message.text.strip().lower() in ("/cancel", "cancel"):
+        clear_state(admin_id)
+        await message.reply_text("🚫 **Update cancelled.**", parse_mode=ParseMode.MARKDOWN)
+        raise StopPropagation
+
+    if state != "upd_wait_sha":
+        # upd_wait_confirm#<sha> — admin should be tapping a button, not typing.
+        raise ContinuePropagation
+
+    sha_input = message.text.strip()
+    if not _SHA_RE.match(sha_input):
+        await message.reply_text(
+            "❌ That doesn't look like a commit SHA (7-40 hex characters). "
+            "Try again, or /cancel.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        raise StopPropagation
+
+    clear_state(admin_id)
+    await _show_commit_review(client, message, sha_input.lower(), is_callback=False)
+    raise StopPropagation
 
 
 # ── Confirm ───────────────────────────────────────────────────────────────────
 
 @Client.on_callback_query(
-    filters.regex(r"^upd_confirm$") & filters.user(ADMIN_ID)
+    filters.regex(r"^upd_confirm#") & filters.user(ADMIN_ID)
 )
 async def cb_upd_confirm(client: Client, callback: CallbackQuery):
+    sha = callback.data.split("#", 1)[1]
+    clear_state(callback.from_user.id)
     await callback.answer("Starting update…")
     status = await callback.message.edit_text(
-        "🔄 **Updater** — initialising…", parse_mode=ParseMode.MARKDOWN
+        f"🔄 **Updater** — initialising for `{sha[:12]}`…", parse_mode=ParseMode.MARKDOWN
     )
     # _do_update ends with os.execv() — if that call itself fails (rare, but
     # possible depending on host), the failure would otherwise be completely
     # invisible: the bot appears to hang mid-"update" with no restart and no
     # log line anywhere.
-    update_task = asyncio.create_task(_do_update(client, status))
-    update_task.add_done_callback(lambda t: _log_task_crash(t, client, "self_update"))
+    update_task = asyncio.create_task(_do_update(client, status, sha))
+    update_task.add_done_callback(lambda t: _log_task_crash(t, client, f"self_update({sha[:12]})"))
 
 
 # ── Cancel ────────────────────────────────────────────────────────────────────
@@ -208,6 +333,7 @@ async def cb_upd_confirm(client: Client, callback: CallbackQuery):
     filters.regex(r"^upd_cancel$") & filters.user(ADMIN_ID)
 )
 async def cb_upd_cancel(client: Client, callback: CallbackQuery):
+    clear_state(callback.from_user.id)
     await callback.message.edit_text(
         "❌ **Update cancelled.**", parse_mode=ParseMode.MARKDOWN
     )

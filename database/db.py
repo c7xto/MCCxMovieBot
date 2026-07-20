@@ -30,6 +30,19 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+
+class AllClustersFullError(Exception):
+    """Raised by save_files_bulk() when every cluster is at/above its 450MB
+    safety margin and none of the batch's files could be stored anywhere.
+    Distinguishes "no cluster had room" from a normal (0 saved, N
+    duplicates) result — without this, callers can't tell a full database
+    apart from a batch that was simply all duplicates."""
+    def __init__(self, unsaved_count: int, duplicates: int):
+        self.unsaved_count = unsaved_count
+        self.duplicates = duplicates
+        super().__init__(f"All clusters full — {unsaved_count} file(s) could not be stored")
+
+
 _config_cache = None
 _config_cache_ts = 0.0
 _CONFIG_TTL = 60
@@ -101,53 +114,6 @@ class _SearchCache:
             del self._data[k]
 
 
-class _TrendingCache:
-    """In-process, memory-bounded rolling counter backing the home-panel
-    'Trending Searches' widget. Deliberately NOT a new Mongo collection —
-    trending is a short-window, best-effort popularity signal, not durable
-    data, so this mirrors _SearchCache's in-process design instead of
-    adding schema. Also deliberately NOT sourced from missed_searches:
-    those are queries that returned zero results, and surfacing one as a
-    "trending" suggestion would make tapping it a guaranteed dead end —
-    only queries that actually returned results should ever be recorded."""
-
-    def __init__(self, maxsize=500, window_seconds=86400):
-        self.maxsize = maxsize
-        self.window_seconds = window_seconds
-        self._data = OrderedDict()  # normalized_query -> [count, last_seen_ts, display_text]
-
-    def record(self, query: str):
-        norm = self._normalize(query)
-        if not norm:
-            return
-        self._prune()
-        if norm in self._data:
-            entry = self._data[norm]
-            entry[0] += 1
-            entry[1] = time.time()
-            self._data.move_to_end(norm)
-        else:
-            if len(self._data) >= self.maxsize:
-                self._data.popitem(last=False)  # evict least-recently-inserted
-            self._data[norm] = [1, time.time(), query.strip()]
-
-    def top(self, limit=6) -> list:
-        self._prune()
-        ranked = sorted(self._data.values(), key=lambda entry: entry[0], reverse=True)
-        return [entry[2] for entry in ranked[:limit]]
-
-    def _prune(self):
-        cutoff = time.time() - self.window_seconds
-        expired = [k for k, entry in self._data.items() if entry[1] < cutoff]
-        for k in expired:
-            del self._data[k]
-
-    @staticmethod
-    def _normalize(query: str) -> str:
-        q = re.sub(r"[^a-zA-Z0-9 ]", "", query.lower()).strip()
-        return re.sub(r"\s+", " ", q)
-
-
 class Database:
     def __init__(self):
         self.uris = [
@@ -197,7 +163,7 @@ class Database:
         self.registry_col = None
         self.main_db = None
         self._search_cache = _SearchCache(maxsize=2000, default_ttl=600)
-        self._trending_cache = _TrendingCache(maxsize=500, window_seconds=86400)
+        self._db_size_cache = {}  # id(db_instance) -> (fetched_at, size_mb)
 
         if self.dbs:
             self.main_db = self.dbs[0]
@@ -380,12 +346,28 @@ class Database:
         cursor = self.main_db["connected_groups"].find({}).sort("search_count", -1).limit(limit)
         return [doc async for doc in cursor]
 
+    _DB_SIZE_TTL = 30  # seconds
+
     async def get_db_size(self, db_instance):
+        """Cached wrapper around the `dbstats` command. save_file() and
+        save_files_bulk() call this once per candidate cluster on every
+        single write — once earlier clusters fill up, that becomes a
+        sequential dbstats round-trip on each of them before ever reaching
+        one with room. A short TTL keeps the "is this cluster full" check
+        fresh enough (worst case a few seconds stale right at the 450MB
+        boundary) while collapsing bursts of saves into one real query."""
+        now  = time.time()
+        key  = id(db_instance)
+        hit  = self._db_size_cache.get(key)
+        if hit and (now - hit[0]) < self._DB_SIZE_TTL:
+            return hit[1]
         try:
             stats = await db_instance.command("dbstats")
-            return max(stats.get("storageSize", 0), stats.get("dataSize", 0)) / (1024 * 1024)
+            size  = max(stats.get("storageSize", 0), stats.get("dataSize", 0)) / (1024 * 1024)
         except Exception:
-            return 0
+            size = 0
+        self._db_size_cache[key] = (now, size)
+        return size
 
     async def get_total_files(self):
         async def _count(col):
@@ -497,6 +479,13 @@ class Database:
                 )
             except Exception as e:
                 logger.warning(f"Registry rollback failed for {len(remaining)} unsaved files: {e}")
+
+        if remaining:
+            # Every cluster was either at its safety margin or rejected the
+            # insert — this batch is genuinely unstorable right now. Raise
+            # instead of returning (0, duplicates) so callers can't mistake
+            # "database full" for "everything was a duplicate".
+            raise AllClustersFullError(len(remaining), duplicates)
 
         return saved_total, duplicates
 
@@ -640,15 +629,6 @@ class Database:
         results.sort(key=lambda x: (x["type"] == "fuzzy", -x["count"]))
         results = results[:100]
 
-        try:
-            if self.main_db is not None:
-                dupes_col = self.main_db["duplicate_scan_results"]
-                await dupes_col.drop()
-                if results:
-                    await dupes_col.insert_many(results)
-        except Exception:
-            pass
-
         return results
 
     async def delete_duplicates_all(self):
@@ -688,30 +668,59 @@ class Database:
         return total
 
     async def migrate_cluster(self, from_idx: int, to_idx: int, batch_size=100):
+        """Moves every document from cluster from_idx to cluster to_idx.
+        Each batch is only deleted from the source *after* it's confirmed
+        copied to the destination — otherwise a file's file_id (already
+        claimed in file_registry from when it was first saved) would end up
+        physically duplicated across two clusters instead of moved, with no
+        way to tell which copy is the "real" one."""
         if from_idx >= len(self.file_cols) or to_idx >= len(self.file_cols):
             return 0, 0
         to_size = await self.get_db_size(self.dbs[to_idx])
         if to_size >= 450:
             return 0, -1
+
         migrated, skipped = 0, 0
+
+        async def _flush(batch):
+            nonlocal migrated, skipped
+            if not batch:
+                return
+            docs = [entry["doc"] for entry in batch]
+            try:
+                await self.file_cols[to_idx].insert_many(docs, ordered=False)
+                copied_src_ids = [entry["_id"] for entry in batch]
+            except BulkWriteError as bwe:
+                write_errors  = bwe.details.get("writeErrors", [])
+                failed_idx    = {e["index"] for e in write_errors}
+                copied_src_ids = [entry["_id"] for idx, entry in enumerate(batch) if idx not in failed_idx]
+                skipped       += len(failed_idx)
+                if len(failed_idx) < len(write_errors):
+                    logger.warning(f"Migration batch: {len(write_errors)} write errors, {len(failed_idx)} unique docs failed")
+            except Exception as e:
+                logger.warning(f"Migration batch error: {e}")
+                skipped += len(batch)
+                return
+
+            if copied_src_ids:
+                try:
+                    result = await self.file_cols[from_idx].delete_many({"_id": {"$in": copied_src_ids}})
+                    migrated += result.deleted_count
+                except Exception as e:
+                    # Docs are now confirmed present in the destination but
+                    # couldn't be removed from the source — they exist in
+                    # both clusters until a retry cleans up the source.
+                    logger.error(f"Migration source-cleanup failed for {len(copied_src_ids)} doc(s) — now duplicated across clusters {from_idx+1}/{to_idx+1}: {e}")
+
         batch = []
         async for doc in self.file_cols[from_idx].find({}):
-            doc.pop("_id", None)
-            batch.append(doc)
+            src_id = doc.pop("_id")
+            batch.append({"_id": src_id, "doc": doc})
             if len(batch) >= batch_size:
-                try:
-                    await self.file_cols[to_idx].insert_many(batch, ordered=False)
-                    migrated += len(batch)
-                except Exception as e:
-                    logger.warning(f"Migration batch error: {e}")
-                    skipped += len(batch)
+                await _flush(batch)
                 batch = []
-        if batch:
-            try:
-                await self.file_cols[to_idx].insert_many(batch, ordered=False)
-                migrated += len(batch)
-            except Exception:
-                skipped += len(batch)
+        await _flush(batch)
+
         return migrated, skipped
 
     async def get_search_results(self, query, max_results=40, offset=0):
@@ -806,9 +815,6 @@ class Database:
                 return True
         return False
 
-    async def purge_cams(self):
-        return await self.purge_by_pattern(r"cam|predvd|hdcam|tsrip|1xbet")
-
     async def log_missed_search(self, query: str):
         if self.main_db is None:
             return False
@@ -886,7 +892,6 @@ class Database:
                 "auto_delete_time": 300,
                 "maintenance_mode": False,
                 "maintenance_message": "🔧 Bot is under maintenance. Back soon!",
-                "group_whitelist_enabled": False,
                 "file_caption_template": "",
             }
             await self.config_col.insert_one(config)
@@ -1108,24 +1113,23 @@ class Database:
         except Exception:
             pass
 
-    async def get_data_saver(self, user_id: int) -> bool:
-        """Mobile Data Saver preference — an additive field on the existing
-        users doc, not a new collection. A single find_one on an indexed
-        _id is cheap enough to call on every result-view render, unlike the
-        multi-cluster gather() fan-outs elsewhere in this class."""
+    async def get_user_language(self, user_id: int) -> str:
+        """Persisted UI language preference — additive field on the existing
+        users doc, same pattern as the old data_saver flag. Defaults to
+        "en"; plugins/start.py's LANG_STRINGS defines what's translated."""
         if self.users_col is None:
-            return False
+            return "en"
         try:
-            doc = await self.users_col.find_one({"_id": user_id}, {"data_saver": 1})
-            return bool(doc.get("data_saver", False)) if doc else False
+            doc = await self.users_col.find_one({"_id": user_id}, {"language": 1})
+            return doc.get("language", "en") if doc else "en"
         except Exception:
-            return False
+            return "en"
 
-    async def set_data_saver(self, user_id: int, enabled: bool):
+    async def set_user_language(self, user_id: int, lang: str):
         if self.users_col is None:
             return
         try:
-            await self.users_col.update_one({"_id": user_id}, {"$set": {"data_saver": enabled}}, upsert=True)
+            await self.users_col.update_one({"_id": user_id}, {"$set": {"language": lang}}, upsert=True)
         except Exception:
             pass
 
@@ -1158,6 +1162,18 @@ class Database:
         if self.main_db is None:
             return
         await self.main_db["pending_requests"].delete_one({"user_id": user_id, "movie_name": movie_name.lower().strip()})
+
+    async def pending_request_exists(self, user_id, movie_name) -> bool:
+        """Used by the manual "Mark Uploaded" admin ticket flow to check
+        whether _fulfill_matching_requests() already auto-fulfilled (and
+        deleted) this same request before the admin got to it — avoids a
+        duplicate "your movie is ready" ping to the user."""
+        if self.main_db is None:
+            return False
+        doc = await self.main_db["pending_requests"].find_one(
+            {"user_id": user_id, "movie_name": movie_name.lower().strip()}
+        )
+        return doc is not None
 
     async def set_index_progress(self, chat_id, msg_id):
         if self.main_db is None:
@@ -1228,15 +1244,6 @@ class Database:
 
     async def clear_old_searches(self, expiry_seconds=600):
         self._search_cache.purge(expiry_seconds)
-
-    async def log_trending_search(self, query: str):
-        """Records a query that actually returned results, for the home-
-        panel Trending Searches widget. Call only on the success path —
-        see _TrendingCache's docstring for why misses are excluded."""
-        self._trending_cache.record(query)
-
-    async def get_trending_searches(self, limit: int = 6) -> list:
-        return self._trending_cache.top(limit)
 
 
 db = Database()

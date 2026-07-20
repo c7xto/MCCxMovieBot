@@ -1,7 +1,8 @@
 """
 Background tasks started from bot.py:
-  - A10: Health monitor — pings clusters every 10 min, alerts on issues
+  - Health monitor — pings clusters every 10 min, alerts on issues
 """
+import os
 import asyncio
 import logging
 import time
@@ -102,9 +103,92 @@ async def check_all_channels(client, config):
     return results
 
 
+async def check_known_issues(client, config):
+    """
+    Live operational checks for the admin panel's "⚠️ Known Issues" tile —
+    unlike run_health_monitor() (which only alerts the log channel when
+    something breaks), this is pull-based: an admin can check current
+    status any time instead of waiting to be alerted or discovering a
+    problem by accident. Returns a list of {"label", "ok", "text"} dicts,
+    "ok" is True/False/None (None = informational, not a problem).
+    """
+    findings = []
+
+    # ── Cluster capacity ──────────────────────────────────────────────────────
+    for i, db_instance in enumerate(db.dbs):
+        try:
+            size_mb = await db.get_db_size(db_instance)
+        except Exception:
+            continue
+        if size_mb >= 450:
+            findings.append({
+                "label": f"Cluster {i+1}", "ok": False,
+                "text": f"🛑 Cluster {i+1} is at its 450MB safety margin (`{size_mb:.0f} MB`) "
+                        f"— new saves will skip it. Add `DATABASE_URI_{i+2}`."
+            })
+        elif size_mb >= 400:
+            findings.append({
+                "label": f"Cluster {i+1}", "ok": False,
+                "text": f"⚠️ Cluster {i+1} is approaching its safety margin (`{size_mb:.0f} MB` / 450 MB)."
+            })
+
+    # ── Whitelist mode with nothing whitelisted ───────────────────────────────
+    if config.get("group_whitelist_mode", "blacklist") == "whitelist":
+        try:
+            groups = await db.get_all_groups()
+            if not any(g.get("whitelisted") for g in groups):
+                findings.append({
+                    "label": "Group Whitelist", "ok": False,
+                    "text": "⚠️ Whitelist mode is ON but no group is whitelisted — the bot "
+                            "will leave every group it's added to. Approve groups in Group Manager."
+                })
+        except Exception:
+            pass
+
+    # ── Verification gate stacking ────────────────────────────────────────────
+    gates_active = []
+    if config.get("fsub_channels"):
+        gates_active.append("Main FSub")
+    if config.get("req_fsub_channels"):
+        gates_active.append("Request-FSub")
+    if len([c for c in config.get("two_stage_channels", []) if c]) >= 2:
+        gates_active.append("Two-Stage Verification")
+    if len(gates_active) >= 2:
+        findings.append({
+            "label": "Verification Gates", "ok": None,
+            "text": f"ℹ️ {len(gates_active)} verification gates are active at once "
+                    f"({', '.join(gates_active)}) — a new user may face multiple "
+                    f"join-and-confirm steps for one file."
+        })
+
+    # ── Stale indexer tasks ───────────────────────────────────────────────────
+    try:
+        stale = await db.get_stale_index_tasks(older_than_seconds=7200)
+        if stale:
+            stale_ids = [s["_id"] for s in stale]
+            findings.append({
+                "label": "Indexer", "ok": False,
+                "text": f"⚠️ Indexer task(s) stuck \"running\" for 2h+: `{stale_ids}` — may have crashed."
+            })
+    except Exception:
+        pass
+
+    # ── TMDB key ───────────────────────────────────────────────────────────────
+    if not os.getenv("TMDB_API_KEY"):
+        findings.append({
+            "label": "TMDB", "ok": None,
+            "text": "ℹ️ `TMDB_API_KEY` is not set — new-upload announcements will post without a poster/rating."
+        })
+
+    if not findings:
+        findings.append({"label": "All clear", "ok": True, "text": "✅ No known issues detected."})
+
+    return findings
+
+
 async def run_health_monitor(client):
     """
-    A10: Runs every 10 minutes.
+    Runs every 10 minutes.
     Checks:
       1. Each MongoDB cluster is reachable
       2. No indexer task has been stuck in 'running' for >2 hours

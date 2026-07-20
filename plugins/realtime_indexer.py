@@ -12,16 +12,14 @@ from pyrogram.enums import ParseMode
 from database.db import db
 from tmdb import get_movie_data
 from pyrogram.errors import FloodWait, InputUserDeactivated, UserIsBlocked
+from plugins.filter import send_smart_log
 from plugins.health_monitor import _log_task_crash
+from utils import _html
 
 # load_dotenv() needed so DATABASE_CHANNEL_ID env fallback works correctly
 load_dotenv()
 
 logger = logging.getLogger(__name__)
-
-
-def _html(text: str) -> str:
-    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 # Cap to prevent unbounded RAM growth — LRU: oldest entry is first
 RECENT_POSTS = OrderedDict()
@@ -226,6 +224,17 @@ async def index_new_files(client: Client, message: Message):
             )
         except Exception:
             pass
+    elif return_msg == "All clusters full":
+        # Real-time ingestion has no other failure path — without this alert
+        # every new upload silently vanishes from the index the moment all
+        # clusters hit their 450MB safety margin.
+        asyncio.create_task(send_smart_log(client,
+            f"🛑 **#DatabaseFull**\n\n"
+            f"Real-time indexing failed — every configured cluster is at its 450MB safety margin.\n"
+            f"🎬 **File:** `{media.file_name}`\n"
+            f"**Fix:** Add a new `DATABASE_URI` cluster and restart the bot.\n\n"
+            f"⚠️ This file was **not indexed** and will not appear in search."
+        ))
 
     if success:
         # Ensure queue worker is running

@@ -46,7 +46,7 @@ async def file_manager_menu(client: Client, callback: CallbackQuery):
     await callback.answer()
 
 
-# ── F1: SEARCH & DELETE ───────────────────────────────────────────────────────
+# ── SEARCH & DELETE ───────────────────────────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^fm_search$") & filters.user(ADMIN_ID))
 async def fm_search_prompt(client: Client, callback: CallbackQuery):
@@ -110,7 +110,7 @@ async def fm_delete_file(client: Client, callback: CallbackQuery):
         await callback.answer("❌ File not found — may already be deleted.", show_alert=True)
 
 
-# ── F6: RENAME ────────────────────────────────────────────────────────────────
+# ── RENAME ────────────────────────────────────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^fm_rename#") & filters.user(ADMIN_ID))
 async def fm_rename_prompt(client: Client, callback: CallbackQuery):
@@ -135,7 +135,7 @@ async def fm_editname_prompt(client: Client, callback: CallbackQuery):
     await callback.answer()
 
 
-# ── F3: FIND DUPLICATES ───────────────────────────────────────────────────────
+# ── FIND DUPLICATES ───────────────────────────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^fm_duplicates$") & filters.user(ADMIN_ID))
 async def fm_duplicates(client: Client, callback: CallbackQuery):
@@ -323,7 +323,7 @@ async def fm_delete_all_dupes(client: Client, callback: CallbackQuery):
         )
 
 
-# ── F10: BULK DELETE BY PATTERN ───────────────────────────────────────────────
+# ── BULK DELETE BY PATTERN ────────────────────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^fm_quickpurgecam$") & filters.user(ADMIN_ID))
 async def fm_quickpurge_cam(client: Client, callback: CallbackQuery):
@@ -378,7 +378,7 @@ async def fm_bulk_confirm(client: Client, callback: CallbackQuery):
     )
 
 
-# ── F7: CLUSTER MIGRATION ─────────────────────────────────────────────────────
+# ── CLUSTER MIGRATION ─────────────────────────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^fm_migrate$") & filters.user(ADMIN_ID))
 async def fm_migrate_prompt(client: Client, callback: CallbackQuery):
@@ -429,7 +429,7 @@ async def _run_migration(client, status_msg, from_idx, to_idx):
         await status_msg.edit_text(f"❌ Migration error: `{e}`", reply_markup=_BACK_BTN)
 
 
-# ── F4: FILES BY LANGUAGE ─────────────────────────────────────────────────────
+# ── FILES BY LANGUAGE ─────────────────────────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^fm_bylang$") & filters.user(ADMIN_ID))
 async def fm_by_language(client: Client, callback: CallbackQuery):
@@ -463,7 +463,7 @@ async def fm_by_language(client: Client, callback: CallbackQuery):
         await callback.message.edit_text(f"❌ Error: `{e}`", reply_markup=_BACK_BTN)
 
 
-# ── F9: TOP MISSING FILES ─────────────────────────────────────────────────────
+# ── TOP MISSING FILES ─────────────────────────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^fm_missing$") & filters.user(ADMIN_ID))
 async def fm_missing_files(client: Client, callback: CallbackQuery):
@@ -514,8 +514,10 @@ from pyrogram import ContinuePropagation, StopPropagation
 
 @Client.on_message(
     filters.private & filters.text & filters.user(ADMIN_ID) &
-    ~filters.command(["start", "admin", "ban", "unban", "purge_cams", "reset_db",
-                      "broadcast", "filesearch", "cancel"])
+    ~filters.command(["start", "admin", "ban", "unban", "reset_db",
+                      "broadcast", "filesearch", "cancel"]),
+    group=-1,  # must win the race against filter.py's auto_filter — see admin.py's
+               # matching catch_admin_input handler for the full explanation.
 )
 async def fm_input_handler(client: Client, message: Message):
     admin_id = message.from_user.id

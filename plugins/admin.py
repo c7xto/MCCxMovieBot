@@ -10,15 +10,9 @@ from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton,
     CallbackQuery
 )
-try:
-    from pyrogram.types import LinkPreviewOptions
-    def _no_preview(): return {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
-except ImportError:
-    LinkPreviewOptions = None
-    def _no_preview(): return {"disable_web_page_preview": True}
 from database.db import db
 from plugins.state import get_state as _get_state_fn, set_state as _set_state_fn, clear_state as _clear_state_fn
-from utils import ADMIN_ID
+from utils import ADMIN_ID, _no_preview
 
 # load_dotenv() here so ADMIN_ID is populated before module-level filter decorators run
 load_dotenv()
@@ -29,9 +23,6 @@ logger = logging.getLogger(__name__)
 _BACK_BTN = InlineKeyboardMarkup([
     [InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="back_to_admin")]
 ])
-
-# link_preview_options replacement for deprecated disable_web_page_preview
-# _NO_PREVIEW replaced with _no_preview() compat function above
 
 
 def _get_state(admin_id):
@@ -52,10 +43,9 @@ async def get_admin_menu_data():
     fsub_count = len(config.get('fsub_channels', []))
     fsub_status = f"✅ Active ({fsub_count} ch)" if fsub_count > 0 else "⚫ Disabled"
 
-    # BUG FIX #1 + #7: Unified single read per field.
-    # Previously the status check used config.get('log_channel') which returns 0 for
-    # unset, and 0 is falsy — so it showed ❌ Missing even after saving a valid ID.
-    # Now we explicitly check for None/0/"" so a real channel ID always shows ✅.
+    # config.get('log_channel') returns 0 when unset, and 0 is falsy — a naive
+    # truthy check would show "Missing" even after saving a valid channel ID,
+    # so explicitly check for None/0/"" instead.
     log_val = config.get('log_channel')
     log_display = f"`{log_val}`" if log_val not in [None, 0, ""] else "`Not Set`"
     log_status = "✅ Set" if log_val not in [None, 0, ""] else "❌ Missing"
@@ -104,8 +94,7 @@ _CATEGORY_MENUS = {
     ]),
     "users": ("👥 Users & Groups", [
         ("🔐 Manage FSub Channels",     "fsub_menu"),
-        ("📢 Req Channel FSub",         "req_fsub_menu"),
-        ("🔐🔐 Two-Stage Verification", "two_stage_menu"),
+        ("🔐🔐 Verification Gates",     "verification_gates_menu"),
         ("🏘 Group Manager",            "group_manager_menu"),
         ("🔧 Maintenance Mode",         "admin_toggle_maintenance"),
     ]),
@@ -114,7 +103,6 @@ _CATEGORY_MENUS = {
         ("⚙️ Change Update Link",      "edit_update"),
         ("📡 Set Log Channel ID",      "edit_logchannel"),
         ("📢 Set Update Channel ID",   "edit_updatechid"),
-        ("👤 Set Admin ID",            "edit_adminid"),
         ("⏱ Set Auto-Delete Time",    "edit_autodeletetime"),
         ("📥 Export Config",           "admin_export_config"),
         ("📤 Restore Config",          "admin_restore_config"),
@@ -123,6 +111,7 @@ _CATEGORY_MENUS = {
     "health": ("🩺 Health & System", [
         ("📊 Analytics (Stats + Languages + Groups)", "admin_stats"),
         ("🔍 Channel Health Check",                   "channel_health_check"),
+        ("⚠️ Known Issues",                           "known_issues_check"),
     ]),
 }
 
@@ -152,7 +141,6 @@ async def show_category_menu(client: Client, callback: CallbackQuery):
 @Client.on_message(filters.command("admin") & filters.private & filters.user(ADMIN_ID))
 async def admin_panel(client: Client, message: Message):
     text, markup = await get_admin_menu_data()
-    # FIX: replaced deprecated disable_web_page_preview with link_preview_options
     await message.reply_text(
         text=text, reply_markup=markup, quote=True, **_no_preview()
     )
@@ -243,7 +231,7 @@ async def show_stats(client: Client, callback: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^edit_") & filters.user(ADMIN_ID))
 async def handle_edit_buttons(client: Client, callback: CallbackQuery):
-    # split("_", 1) so names like "logchannel", "adminid" never break
+    # split("_", 1) so names like "logchannel", "autodeletetime" never break
     action = callback.data.split("_", 1)[1]
     _set_state(callback.from_user.id, action)
 
@@ -322,13 +310,6 @@ async def handle_edit_buttons(client: Client, callback: CallbackQuery):
             "Make sure the bot is an **Admin** in that channel first!\n\n"
             "*Type /cancel to abort.*"
         ),
-        "adminid": (
-            "👤 **Send me the new Admin User ID.**\n\n"
-            "This is a numeric Telegram user ID like `123456789`.\n"
-            "⚠️ This updates the live DB record. The `.env` value is still the "
-            "**fallback** used on restart — update that too if you want it permanent.\n\n"
-            "*Type /cancel to abort.*"
-        ),
         "autodeletetime": (
             "⏱ **Send me the new Auto-Delete Time in minutes.**\n\n"
             "This is how long files stay before being deleted after sending.\n"
@@ -403,6 +384,37 @@ async def show_fsub_menu(client: Client, callback: CallbackQuery):
 # ── DATABASE CHANNELS MANAGER ─────────────────────────────────────────────────
 
 
+@Client.on_callback_query(filters.regex(r"^verification_gates_menu$") & filters.user(ADMIN_ID))
+async def show_verification_gates_menu(client: Client, callback: CallbackQuery):
+    """Request-FSub and Two-Stage Verification are two independently-built
+    gates that both run before file delivery (on top of Main FSub, managed
+    separately under "Manage FSub Channels") — grouped here under one
+    submenu instead of two separate top-level entries so their cumulative
+    effect on a new user is visible in one place. Each still has its own
+    config/admin screen below; see plugins/req_fsub.py's
+    check_verification_gates() for how they're combined into one join
+    screen on the user-facing side."""
+    config = await db.get_config()
+    req_count = len(config.get("req_fsub_channels", []))
+    two_stage_active = len([c for c in config.get("two_stage_channels", []) if c]) >= 2
+
+    text = (
+        f"🔐🔐 **Verification Gates**\n\n"
+        f"Extra join-gates on top of Main FSub, checked before a file is delivered. "
+        f"When more than one is active, the user sees a single combined join screen, "
+        f"not separate sequential prompts.\n\n"
+        f"📢 **Request-FSub:** {req_count} channel(s) configured\n"
+        f"🔐🔐 **Two-Stage:** {'✅ Active' if two_stage_active else '⚫ Incomplete'}"
+    )
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 Request-FSub", callback_data="req_fsub_menu")],
+        [InlineKeyboardButton("🔐🔐 Two-Stage Verification", callback_data="two_stage_menu")],
+        [InlineKeyboardButton("🔙 Back", callback_data="back_to_admin")]
+    ])
+    await callback.message.edit_text(text, reply_markup=markup)
+    await callback.answer()
+
+
 @Client.on_callback_query(filters.regex(r"^req_fsub_menu$") & filters.user(ADMIN_ID))
 async def show_req_fsub_menu(client: Client, callback: CallbackQuery):
     config = await db.get_config()
@@ -423,7 +435,7 @@ async def show_req_fsub_menu(client: Client, callback: CallbackQuery):
         [InlineKeyboardButton("➕ Add Channel",   callback_data="req_fsub_add"),
          InlineKeyboardButton("➖ Remove",         callback_data="req_fsub_remove")],
         [InlineKeyboardButton("⏱ Set Interval",   callback_data="req_fsub_interval")],
-        [InlineKeyboardButton("🔙 Back",           callback_data="back_to_admin")]
+        [InlineKeyboardButton("🔙 Back",           callback_data="verification_gates_menu")]
     ])
     await callback.message.edit_text(text, reply_markup=markup)
     await callback.answer()
@@ -502,7 +514,7 @@ async def show_two_stage_menu(client: Client, callback: CallbackQuery):
          InlineKeyboardButton("✏️ Set Channel 2", callback_data="edit_twostage2")],
         [InlineKeyboardButton("🗑 Remove Channel 1", callback_data="twostage_remove1"),
          InlineKeyboardButton("🗑 Remove Channel 2", callback_data="twostage_remove2")],
-        [InlineKeyboardButton("🔙 Back", callback_data="back_to_admin")]
+        [InlineKeyboardButton("🔙 Back", callback_data="verification_gates_menu")]
     ])
     await callback.message.edit_text(text, reply_markup=markup)
     await callback.answer()
@@ -539,18 +551,38 @@ async def show_db_chan_menu(client: Client, callback: CallbackQuery):
 
 # ── INPUT CATCHER ─────────────────────────────────────────────────────────────
 
+# The exact set of state strings this handler's own if/elif chain below
+# recognizes. plugins/admin.py registers first in plugin load order (see
+# bot.py's plugins=dict(root="plugins") -> Pyrogram sorts plugin files
+# alphabetically), so — unlike file_manager.py's "fm_" and group_manager.py's
+# "gm_" prefixed states, which correctly ContinuePropagate past each other —
+# this handler used to fall through any *unrecognized* truthy state straight
+# to an unconditional StopPropagation, silently swallowing every fm_*/gm_*
+# admin input before file_manager.py or group_manager.py ever saw it. Keep
+# this set in sync with the state strings the elif chain below checks.
+_OWN_STATES = {
+    "maingroup", "update", "adddb", "remdb", "media", "addfsub", "remfsub",
+    "twostage1", "twostage2", "welcometext", "logchannel", "updatechid",
+    "autodeletetime", "captiontemplate", "restore_config",
+    "req_fsub_add", "req_fsub_remove", "req_fsub_interval",
+}
+
+
 @Client.on_message(
     filters.private & filters.text & filters.user(ADMIN_ID) &
-    ~filters.command(["start", "admin", "ban", "unban", "reset_db", "reset_index_progress", "broadcast", "cancel"])
+    ~filters.command(["start", "admin", "ban", "unban", "reset_db", "reset_index_progress", "broadcast", "cancel"]),
+    group=-1,  # must win the race against filter.py's auto_filter (default group 0),
+               # which matches any plain text and never ContinuePropagates — see
+               # file_manager.py's / group_manager.py's / updater.py's matching state
+               # catch-alls, all pinned to the same group for the same reason.
 )
 async def catch_admin_input(client: Client, message: Message):
     admin_id = message.from_user.id
     state = _get_state(admin_id)
 
-    if not state:
+    if not state or state not in _OWN_STATES:
         raise ContinuePropagation
 
-    # DEAD END FIX #3: /cancel now returns a back button instead of a dead end
     if message.text.lower() in ("/cancel", "cancel"):
         _clear_state(admin_id)
         await message.reply_text(
@@ -564,7 +596,6 @@ async def catch_admin_input(client: Client, message: Message):
 
     if state == "maingroup":
         await db.update_config("main_group", message.text.strip())
-        # DEAD END FIX #2: back button on every success reply
         await message.reply_text(
             "✅ **Main Group Link Successfully Updated!**",
             reply_markup=_BACK_BTN
@@ -588,7 +619,6 @@ async def catch_admin_input(client: Client, message: Message):
                 reply_markup=_BACK_BTN
             )
         except Exception as e:
-            # DEAD END FIX #4: back button on error replies too
             await message.reply_text(
                 f"❌ **Failed!** Make sure I am an Admin in that channel.\nError: `{e}`",
                 reply_markup=_BACK_BTN
@@ -904,26 +934,6 @@ async def catch_admin_input(client: Client, message: Message):
             await message.reply_text(
                 f"❌ **Cannot access that channel!**\n"
                 f"Make sure the bot is an **Admin** in `{raw}` first.\nError: `{e}`",
-                reply_markup=_BACK_BTN
-            )
-
-    elif state == "adminid":
-        raw = message.text.strip()
-        try:
-            new_admin_id = int(raw)
-            await db.update_config("admin_id", new_admin_id)
-            await message.reply_text(
-                f"✅ **Admin ID Updated in Database!**\n\n"
-                f"New Admin ID: `{new_admin_id}`\n\n"
-                f"⚠️ **Important:** The bot still uses `ADMIN_ID` from your `.env` "
-                f"for command-level access until you restart. Update your `.env` too "
-                f"if you want this change permanent across restarts.",
-                reply_markup=_BACK_BTN
-            )
-        except ValueError:
-            await message.reply_text(
-                "❌ **Invalid format!** Admin ID must be a plain numeric Telegram user ID.\n"
-                "Example: `123456789`",
                 reply_markup=_BACK_BTN
             )
 
@@ -1268,10 +1278,34 @@ async def channel_health_check(client: Client, callback: CallbackQuery):
         await callback.message.edit_text(report_text[:4000] + "\n...", reply_markup=markup)
 
 
-# ── CLOSE PANEL ───────────────────────────────────────────────────────────────
-# FIX #8: Only ONE close_data handler exists now — the duplicate in index.py is removed.
+# ── KNOWN ISSUES ──────────────────────────────────────────────────────────────
 
-# ── C1: MAINTENANCE MODE TOGGLE ──────────────────────────────────────────────
+@Client.on_callback_query(filters.regex(r"^known_issues_check$") & filters.user(ADMIN_ID))
+async def known_issues_check(client: Client, callback: CallbackQuery):
+    """Live status tile — cluster capacity, whitelist-mode misconfiguration,
+    verification-gate stacking, stuck indexer tasks, missing TMDB key.
+    Uses shared check_known_issues() from health_monitor."""
+    from plugins.health_monitor import check_known_issues
+    await callback.message.edit_text("🔍 **Checking for known issues...**")
+    await callback.answer()
+
+    config   = await db.get_config()
+    findings = await check_known_issues(client, config)
+    report_text = "⚠️ **Known Issues**\n\n" + "\n\n".join(f["text"] for f in findings)
+
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_admin")]
+    ])
+    try:
+        await callback.message.edit_text(report_text, reply_markup=markup)
+    except Exception:
+        await callback.message.edit_text(report_text[:4000] + "\n...", reply_markup=markup)
+
+
+# ── CLOSE PANEL ───────────────────────────────────────────────────────────────
+# Only one close_data handler exists — the duplicate in bulk_indexer.py is removed.
+
+# ── MAINTENANCE MODE TOGGLE ──────────────────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^admin_toggle_maintenance$") & filters.user(ADMIN_ID))
 async def toggle_maintenance(client: Client, callback: CallbackQuery):
@@ -1284,7 +1318,7 @@ async def toggle_maintenance(client: Client, callback: CallbackQuery):
     await callback.message.reply_text(status, reply_markup=_BACK_BTN)
 
 
-# ── C9: EXPORT CONFIG ─────────────────────────────────────────────────────────
+# ── EXPORT CONFIG ─────────────────────────────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^admin_export_config$") & filters.user(ADMIN_ID))
 async def export_config(client: Client, callback: CallbackQuery):
@@ -1301,7 +1335,7 @@ async def export_config(client: Client, callback: CallbackQuery):
     )
 
 
-# ── C10: RESTORE CONFIG ───────────────────────────────────────────────────────
+# ── RESTORE CONFIG ────────────────────────────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^admin_restore_config$") & filters.user(ADMIN_ID))
 async def restore_config_prompt(client: Client, callback: CallbackQuery):

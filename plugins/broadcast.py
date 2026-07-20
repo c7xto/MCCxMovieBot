@@ -14,7 +14,7 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# B2: Stores pending broadcast params while admin reviews the preview
+# Stores pending broadcast params while admin reviews the preview
 _pending_broadcasts = {}
 
 

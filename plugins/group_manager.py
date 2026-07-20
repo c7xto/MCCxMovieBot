@@ -23,7 +23,6 @@ _BACK_BTN = InlineKeyboardMarkup([
 @Client.on_callback_query(filters.regex(r"^group_manager_menu$") & filters.user(ADMIN_ID))
 async def group_manager_menu(client: Client, callback: CallbackQuery):
     config = await db.get_config()
-    whitelist_enabled = config.get("group_whitelist_enabled", False)
     whitelist_mode = config.get("group_whitelist_mode", "blacklist")  # "whitelist" or "blacklist"
 
     mode_label = "🔒 Whitelist Mode (only approved groups)" if whitelist_mode == "whitelist" \
@@ -55,7 +54,7 @@ async def group_manager_menu(client: Client, callback: CallbackQuery):
     await callback.answer()
 
 
-# ── G5: LIST & TOP GROUPS ─────────────────────────────────────────────────────
+# ── LIST & TOP GROUPS ─────────────────────────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^gm_list$") & filters.user(ADMIN_ID))
 async def gm_list_groups(client: Client, callback: CallbackQuery):
@@ -99,7 +98,7 @@ async def gm_top_groups(client: Client, callback: CallbackQuery):
     await callback.message.edit_text(text, reply_markup=_BACK_BTN)
 
 
-# ── G3: BAN/UNBAN GROUP ───────────────────────────────────────────────────────
+# ── BAN/UNBAN GROUP ───────────────────────────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^gm_ban_prompt$") & filters.user(ADMIN_ID))
 async def gm_ban_prompt(client: Client, callback: CallbackQuery):
@@ -124,7 +123,7 @@ async def gm_unban_prompt(client: Client, callback: CallbackQuery):
     await callback.answer()
 
 
-# ── G2: PER-GROUP SETTINGS ────────────────────────────────────────────────────
+# ── PER-GROUP SETTINGS ────────────────────────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^gm_settings_prompt$") & filters.user(ADMIN_ID))
 async def gm_settings_prompt(client: Client, callback: CallbackQuery):
@@ -242,7 +241,7 @@ async def gm_set_autodel_prompt(client: Client, callback: CallbackQuery):
     await callback.answer()
 
 
-# ── G1: WHITELIST MODE TOGGLE ─────────────────────────────────────────────────
+# ── WHITELIST MODE TOGGLE ─────────────────────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^gm_toggle_mode$") & filters.user(ADMIN_ID))
 async def gm_toggle_mode(client: Client, callback: CallbackQuery):
@@ -256,7 +255,7 @@ async def gm_toggle_mode(client: Client, callback: CallbackQuery):
     await group_manager_menu(client, callback)
 
 
-# ── G4: BROADCAST TO GROUPS ───────────────────────────────────────────────────
+# ── BROADCAST TO GROUPS ───────────────────────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^gm_broadcast_prompt$") & filters.user(ADMIN_ID))
 async def gm_broadcast_prompt(client: Client, callback: CallbackQuery):
@@ -306,8 +305,13 @@ async def _ban_group(client, reply_to_msg, group_id: int):
 
 @Client.on_message(
     filters.private & filters.text & filters.user(ADMIN_ID) &
-    ~filters.command(["start", "admin", "ban", "unban", "purge_cams",
-                      "reset_db", "broadcast", "filesearch", "cancel"])
+    ~filters.command(["start", "admin", "ban", "unban",
+                      "reset_db", "broadcast", "filesearch", "cancel"]),
+    group=-1,  # must win the race against filter.py's auto_filter — see admin.py's
+               # matching catch_admin_input handler for the full explanation. Without
+               # this, auto_filter (default group 0, registered earlier since
+               # group_manager.py loads after filter.py alphabetically) always
+               # consumes plain admin text first, so this handler never fires.
 )
 async def gm_input_handler(client: Client, message: Message):
     admin_id = message.from_user.id

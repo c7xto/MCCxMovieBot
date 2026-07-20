@@ -1,5 +1,4 @@
 import os
-import re
 import asyncio
 import urllib.parse
 import time
@@ -7,21 +6,10 @@ import random
 import string
 from dotenv import load_dotenv
 from plugins.filter import route_menu
-from utils import is_subscribed_join_only, send_fsub_message
-from tmdb import get_movie_data
+from utils import _no_preview, _html
 from pyrogram import Client, filters
-from pyrogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-try:
-    from pyrogram.types import LinkPreviewOptions
-except ImportError:
-    LinkPreviewOptions = None
-
-def _no_preview():
-    if LinkPreviewOptions is not None:
-        return {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
-    return {"disable_web_page_preview": True}
-from pyrogram.types import Message
-from pyrogram.enums import ParseMode
+from pyrogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, Message
+from pyrogram.enums import ParseMode, ChatAction
 from database.db import db
 
 load_dotenv()
@@ -33,31 +21,90 @@ load_dotenv()
 # it; scoped to start.py for now since this phase only touches this file.
 ICON_SEARCH   = "🔍"
 ICON_MOVIE    = "🎬"
-ICON_TRENDING = "🔥"
 ICON_UPDATES  = "📢"
 ICON_SUCCESS  = "✅"
 ICON_FAIL     = "❌"
 ICON_REQUEST  = "📝"
 
-
-def _html(text: str) -> str:
-    """Escapes a string for safe use inside Telegram HTML-mode messages."""
-    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
 # All config (log channel, media, links) is read from MongoDB inside each
 # handler via db.get_config() — no module-level env reads needed here.
 
+# ── Language toggle ──────────────────────────────────────────────────────────
+# Scoped translation: covers the home/welcome panel, Help menu, and the
+# no-results message — the core chrome a first-time user sees before ever
+# reaching a search result. Does NOT translate search results, file
+# captions, or the admin panel (out of scope for this pass), and does not
+# apply to an admin-customized welcome_text (that's a single free-text
+# field with no per-language variants — the language toggle only affects
+# the *default* welcome copy).
+LANG_NAMES = {"en": "English", "ml": "മലയാളം"}
+
+LANG_STRINGS = {
+    "en": {
+        "welcome_body": (
+            f"{ICON_MOVIE} I'm MCCxMovieBot — a movie &amp; series finder.\n"
+            f"{ICON_SEARCH} Send a title to search."
+        ),
+        "welcome_greeting": "Welcome, {first_name}",
+        "files_counting": "{total_files:,} files and counting.",
+        "onboarding_title": "New here? It's simple:",
+        "onboarding_steps": [
+            "Type any movie or series name",
+            "Tap the file you want",
+            "It lands in this chat instantly",
+        ],
+        "help_steps": [
+            "Type a movie or series name",
+            "Select your language",
+            "Pick your preferred quality",
+            "Tap the file — it's sent to your PM",
+        ],
+        "help_footer": "Can't find it? Use the Request button and we'll upload it within 24h.",
+        "no_results": "No matches for <code>{query}</code>\n\nIt may not be uploaded yet, or there's a typo in the name.",
+    },
+    "ml": {
+        "welcome_body": (
+            f"{ICON_MOVIE} ഞാൻ MCCxMovieBot — സിനിമകളും സീരീസുകളും കണ്ടെത്താൻ സഹായിക്കുന്ന ബോട്ട്.\n"
+            f"{ICON_SEARCH} സെർച്ച് ചെയ്യാൻ ഒരു പേര് അയക്കൂ."
+        ),
+        "welcome_greeting": "സ്വാഗതം, {first_name}",
+        "files_counting": "{total_files:,} ഫയലുകൾ ഇപ്പോൾ ലഭ്യമാണ്.",
+        "onboarding_title": "പുതിയതാണോ? ഇത്ര ലളിതം:",
+        "onboarding_steps": [
+            "ഏതെങ്കിലും സിനിമ/സീരീസ് പേര് ടൈപ്പ് ചെയ്യുക",
+            "വേണ്ട ഫയൽ ടാപ്പ് ചെയ്യുക",
+            "ഇത് ഉടൻ ഈ ചാറ്റിൽ എത്തും",
+        ],
+        "help_steps": [
+            "സിനിമ/സീരീസ് പേര് ടൈപ്പ് ചെയ്യുക",
+            "ഭാഷ തിരഞ്ഞെടുക്കുക",
+            "ക്വാളിറ്റി തിരഞ്ഞെടുക്കുക",
+            "ഫയൽ ടാപ്പ് ചെയ്യുക — ഇത് നിങ്ങളുടെ PM-ൽ ലഭിക്കും",
+        ],
+        "help_footer": "കിട്ടിയില്ലേ? Request ബട്ടൺ ഉപയോഗിക്കൂ — 24 മണിക്കൂറിനുള്ളിൽ അപ്‌ലോഡ് ചെയ്യാം.",
+        "no_results": "<code>{query}</code> എന്നതിന് ഫലങ്ങളൊന്നും ലഭിച്ചില്ല\n\nഇത് ഇതുവരെ അപ്‌ലോഡ് ചെയ്തിട്ടില്ലായിരിക്കാം, അല്ലെങ്കിൽ അക്ഷരത്തെറ്റ് ഉണ്ടാകാം.",
+    },
+}
+
+
+def _lang_button(lang: str) -> InlineKeyboardButton:
+    """Shows the *other* language as the tap target, standard toggle UX."""
+    next_lang = "ml" if lang == "en" else "en"
+    return InlineKeyboardButton(f"🌐 {LANG_NAMES[next_lang]}", callback_data=f"toggle_lang#{next_lang}")
+
 
 def _build_start_ui(config, mention, total_files, bot_username, update_link, group_link,
-                     is_new=False, trending=None, first_name=""):
+                     is_new=False, first_name="", lang="en"):
     """Shared welcome UI builder — used by /start and start_home callback."""
+    strings = LANG_STRINGS.get(lang, LANG_STRINGS["en"])
     default_welcome = (
-        "<b>Hey {first_name} Welcome 🎉 To MCCxMovieBot</b>\n\n"
-        f"{ICON_MOVIE} <b>I Am A Simple Movie &amp; Series Finder Bot.</b>\n\n"
-        f"{ICON_SEARCH} <b>Send A Movie Or Series Name To Get Files.</b>\n\n"
-        "<i>{total_files:,} files and counting.</i>"
+        "<b>" + strings["welcome_greeting"] + "</b>\n\n"
+        + strings["welcome_body"] + "\n\n"
+        "<i>" + strings["files_counting"] + "</i>"
     )
-    raw = config.get("welcome_text", default_welcome)
+    # An admin-customized welcome_text is a single free-text field with no
+    # per-language variant — the language toggle only swaps the *default*.
+    raw = config.get("welcome_text") or default_welcome
     try:
         # Both {mention} and {first_name} are accepted — admin-set welcome
         # text written before this update still uses {mention} and keeps
@@ -70,25 +117,12 @@ def _build_start_ui(config, mention, total_files, bot_username, update_link, gro
     # appended after the (possibly admin-customized) welcome text; returning
     # users just see the normal welcome — no repeated hand-holding.
     if is_new:
-        text += (
-            "\n\n<blockquote>🆕 <b>New here? It's simple:</b>\n"
-            "1️⃣ Type any movie or series name\n"
-            "2️⃣ Tap the file you want\n"
-            "3️⃣ It lands in this chat instantly</blockquote>"
-        )
+        steps = "\n".join(f"{i}. {s}" for i, s in enumerate(strings["onboarding_steps"], 1))
+        text += f"\n\n<blockquote><b>{strings['onboarding_title']}</b>\n{steps}</blockquote>"
 
-    text += f"\n\n👮‍♂️ @{bot_username}"
+    text += f"\n\n@{bot_username}"
 
     buttons = []
-
-    if trending:
-        # Two per row so a full set of 6 only takes 3 rows instead of 6.
-        trend_buttons = [
-            InlineKeyboardButton(f"{ICON_TRENDING} {t[:20]}", callback_data=f"trend#{t[:40]}")
-            for t in trending
-        ]
-        for i in range(0, len(trend_buttons), 2):
-            buttons.append(trend_buttons[i:i + 2])
 
     row1 = [InlineKeyboardButton("👥 Add To Group", url=f"https://t.me/{bot_username}?startgroup=true")]
     if update_link:
@@ -98,98 +132,72 @@ def _build_start_ui(config, mention, total_files, bot_username, update_link, gro
     if group_link:
         buttons.append([InlineKeyboardButton("⚡ Movie Request Group", url=group_link)])
 
-    buttons.append([InlineKeyboardButton("ℹ️ Help", callback_data="help_menu")])
+    buttons.append([InlineKeyboardButton("ℹ️ Help", callback_data="help_menu"), _lang_button(lang)])
     return text, InlineKeyboardMarkup(buttons)
 
 
 async def _execute_search(client, status_msg, query: str, config: dict, user_id=None, first_name=""):
     """Runs a search and renders page 0 of results into status_msg.
-
-    Shared by the /start deep-link search path and the new "🔥 trending"
-    quick-search buttons on the home panel, so both stay in sync with one
-    implementation instead of drifting apart.
+    Shared by every /start deep-link search entry point (search_, req_
+    fulfillment redirects, etc.) so they stay in sync with one implementation.
     """
-    results = await db.get_search_results(query)
-    tmdb_data = None
+    try:
+        await client.send_chat_action(status_msg.chat.id, ChatAction.TYPING)
+    except Exception:
+        pass
 
-    if results:
-        best_filename = results[0]["file_name"]
-        clean_tmdb_query = re.sub(
-            r'(1080p|720p|480p|4K|HDRip|WEB-DL|WEBRip|BluRay|PreDVD|CAM|HD Rip|'
-            r'x264|x265|HEVC|Dual Audio|Multi Audio|'
-            r'Malayalam|Tamil|Telugu|Hindi|English|Kannada)',
-            '', best_filename, flags=re.IGNORECASE
-        )
-        clean_tmdb_query = re.sub(r'[\(\[].*?[\)\]]', '', clean_tmdb_query)
-        clean_tmdb_query = re.sub(r'[^a-zA-Z0-9\s]', ' ', clean_tmdb_query).strip()
-        if len(clean_tmdb_query) > 2:
-            tmdb_data = await get_movie_data(clean_tmdb_query)
-        if not tmdb_data:
-            tmdb_data = await get_movie_data(query)
+    results = await db.get_search_results(query)
 
     if not results:
+        lang = await db.get_user_language(user_id) if user_id is not None else "en"
+        strings = LANG_STRINGS.get(lang, LANG_STRINGS["en"])
         markup = InlineKeyboardMarkup([
             [InlineKeyboardButton(f"{ICON_REQUEST} Request This Movie", callback_data=f"reqmovie#{query[:40]}")]
         ])
         return await status_msg.edit_text(
-            f"😔 <b>Sorry!</b> I couldn't find any files for <code>{_html(query)}</code> right now.\n\n"
-            f"The admin might still be uploading it, or there was a typo in the name!",
+            f"{ICON_SEARCH} " + strings["no_results"].format(query=_html(query)),
             reply_markup=markup, parse_mode=ParseMode.HTML
         )
-
-    # Only searches that actually returned something are worth surfacing as
-    # a "trending" suggestion — see _TrendingCache's docstring in db.py.
-    await db.log_trending_search(query)
 
     await db.clear_old_searches()
     session_id = ''.join(random.choices(string.ascii_letters + string.digits, k=6))
     session_data = {
         "results":          results,
-        "tmdb":             tmdb_data,
         "query":            query,
         "speed":            "0.001s",
         "time":             time.time(),
         "auto_delete_time": int(config.get("auto_delete_time", 300)),
         "user_id":          user_id,
         "first_name":       first_name or "",
-        "sort_mode":        "smart",
     }
     await db.save_search(session_id, session_data)
     return await route_menu(client, status_msg, session_id, 0)
 
 
 async def _handle_file_link(client, message, file_obj_id: str):
-    """Deep-link payload: file_<obj_id> — direct file delivery, gated by
-    the main FSub check."""
+    """Deep-link payload: file_<obj_id> — direct file delivery (mainly the
+    group-search "Open in PM" buttons), gated by the same unified
+    Verification Gates check as the in-DM sendfile# button."""
     file_data = await db.get_file(file_obj_id)
     if not file_data:
         return await message.reply_text(
-            f"{ICON_FAIL} <b>Sorry!</b> This file was deleted or is no longer available.",
+            f"{ICON_FAIL} This file was deleted or is no longer available.",
             parse_mode=ParseMode.HTML
         )
 
-    if not await is_subscribed_join_only(client, message):
-        await send_fsub_message(client, message, pending_file_id=file_obj_id)
-        return
-
-    from plugins.req_fsub import check_and_show_two_stage
-    if not await check_and_show_two_stage(client, message, file_obj_id):
+    from plugins.req_fsub import check_verification_gates
+    if not await check_verification_gates(client, message, file_obj_id):
         return
 
     config = await db.get_config()
     delete_seconds = int(config.get("auto_delete_time", 300))
     delete_minutes = delete_seconds // 60
 
-    from plugins.filter import _auto_delete_file
+    from plugins.filter import _auto_delete_file, _build_caption
     sent = await client.send_cached_media(
         chat_id=message.chat.id,
         file_id=file_data["file_id"],
-        caption=(
-            f"{ICON_MOVIE} <b>{_html(file_data['file_name'])}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"⏳ Deletes in <b>{delete_minutes} mins</b>  •  Forward to keep\n"
-            f"{ICON_UPDATES} @{client.me.username}"
-        ),
+        caption=_build_caption(config, file_data, delete_minutes, client.me.username),
         parse_mode=ParseMode.HTML
     )
     asyncio.create_task(_auto_delete_file(sent, file_data['file_name'], client.me.username, delete_seconds))
@@ -202,9 +210,9 @@ async def _handle_request_link(message, raw_query: str):
         [InlineKeyboardButton(f"{ICON_SUCCESS} Confirm Request", callback_data=f"reqmovie#{movie_name[:40]}")]
     ])
     return await message.reply_text(
-        f"{ICON_REQUEST} <b>Movie Request Ticket</b>\n\n"
-        f"You are requesting: <code>{_html(movie_name)}</code>\n\n"
-        f"Tap below to send this directly to the admins!",
+        f"{ICON_REQUEST} <b>Movie Request</b>\n\n"
+        f"Requesting: <code>{_html(movie_name)}</code>\n\n"
+        f"Tap below to send this to the admins.",
         reply_markup=markup, parse_mode=ParseMode.HTML, quote=True
     )
 
@@ -270,12 +278,12 @@ async def start_handler(client: Client, message: Message):
         else:
             return await _handle_search_payload(client, message, config, payload)
 
-    # No payload — render the home panel, with trending searches attached.
-    trending = await db.get_trending_searches(limit=6)
+    # No payload — render the home panel.
+    lang = await db.get_user_language(message.from_user.id)
     caption_text, reply_markup = _build_start_ui(
         config, message.from_user.mention, total_files, client.me.username,
-        UPDATE_CHANNEL_LINK, MAIN_GROUP_LINK, is_new=is_new, trending=trending,
-        first_name=message.from_user.first_name
+        UPDATE_CHANNEL_LINK, MAIN_GROUP_LINK, is_new=is_new,
+        first_name=message.from_user.first_name, lang=lang
     )
 
     try:
@@ -292,15 +300,10 @@ async def start_handler(client: Client, message: Message):
 
 @Client.on_callback_query(filters.regex(r"^help_menu$"))
 async def help_menu_callback(client: Client, callback: CallbackQuery):
-    help_text = (
-        "<blockquote>"
-        "1. Type a movie or series name\n"
-        "2. Select your language\n"
-        "3. Pick your preferred quality\n"
-        "4. Tap the file — it's sent to your PM"
-        "</blockquote>\n\n"
-        "<i>Can't find it? Use the Request button and we'll upload it within 24h.</i>"
-    )
+    lang = await db.get_user_language(callback.from_user.id)
+    strings = LANG_STRINGS.get(lang, LANG_STRINGS["en"])
+    steps = "\n".join(f"{i}. {s}" for i, s in enumerate(strings["help_steps"], 1))
+    help_text = f"<blockquote>{steps}</blockquote>\n\n<i>{strings['help_footer']}</i>"
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton("◀️ Back", callback_data="start_home")]
     ])
@@ -322,12 +325,12 @@ async def start_home_callback(client: Client, callback: CallbackQuery):
     MAIN_GROUP_LINK = config.get("main_group", "")
 
     total_files = await db.get_total_files()
-    trending = await db.get_trending_searches(limit=6)
+    lang = await db.get_user_language(callback.from_user.id)
 
     caption_text, reply_markup = _build_start_ui(
         config, callback.from_user.mention, total_files, client.me.username,
-        UPDATE_CHANNEL_LINK, MAIN_GROUP_LINK, is_new=False, trending=trending,
-        first_name=callback.from_user.first_name
+        UPDATE_CHANNEL_LINK, MAIN_GROUP_LINK, is_new=False,
+        first_name=callback.from_user.first_name, lang=lang
     )
 
     try:
@@ -340,26 +343,13 @@ async def start_home_callback(client: Client, callback: CallbackQuery):
     await callback.answer()
 
 
-@Client.on_callback_query(filters.regex(r"^trend#"))
-async def trend_search_callback(client: Client, callback: CallbackQuery):
-    """Tap-to-search on a "🔥 Trending" button from the home panel."""
-    query = callback.data.split("#", 1)[1] if "#" in callback.data else ""
-    if not query:
+@Client.on_callback_query(filters.regex(r"^toggle_lang#"))
+async def toggle_lang_callback(client: Client, callback: CallbackQuery):
+    new_lang = callback.data.split("#", 1)[1]
+    if new_lang not in LANG_STRINGS:
         return await callback.answer()
-
-    await callback.answer(f"{ICON_SEARCH} Searching...")
-    config = await db.get_config()
-
-    # Always send a fresh message rather than editing the home panel in
-    # place — the home panel is very often a video/photo message
-    # (start_media), and route_menu()/show_results() expect a plain
-    # text-editable status message, the same contract every other search
-    # entry point in this file already relies on.
-    status_msg = await callback.message.reply_text(
-        f"{ICON_SEARCH} <b>Searching for</b> <code>{_html(query)}</code>...",
-        parse_mode=ParseMode.HTML
-    )
-    await _execute_search(
-        client, status_msg, query, config,
-        user_id=callback.from_user.id, first_name=callback.from_user.first_name
-    )
+    await db.set_user_language(callback.from_user.id, new_lang)
+    await callback.answer(f"🌐 {LANG_NAMES[new_lang]}")
+    # Re-render the home panel in the new language — same code path as
+    # start_home_callback so the two never drift apart.
+    await start_home_callback(client, callback)

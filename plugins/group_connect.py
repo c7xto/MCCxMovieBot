@@ -6,25 +6,18 @@ import asyncio
 import logging
 from urllib.parse import quote
 from pyrogram import Client, filters
-from pyrogram.enums import ParseMode
+from pyrogram.enums import ParseMode, ChatAction
 from pyrogram.errors import MessageNotModified, FloodWait
 from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 )
-try:
-    from pyrogram.types import LinkPreviewOptions
-    def _no_preview(): return {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
-except ImportError:
-    LinkPreviewOptions = None
-    def _no_preview(): return {"disable_web_page_preview": True}
-
 from database.db import db
 from plugins.filter import (
-    send_smart_log, extract_attributes, _html, _fmt_size,
+    send_smart_log, extract_attributes, _fmt_size,
     _sort_results, clean_query, LANG_EMOJI
 )
 from plugins.health_monitor import _log_task_crash
-from tmdb import get_movie_data
+from utils import _no_preview, _html
 
 logger = logging.getLogger(__name__)
 
@@ -86,26 +79,23 @@ def _build_group_buttons(page_files, client_username, session_id, page,
     return buttons
 
 
-def _build_caption(query, tmdb, total, speed, del_mins):
-    """Identical caption style as filter.py show_results."""
-    title_display = _html(tmdb["title"] if tmdb else query.title())
-    caption = f"🎬 <b>{title_display}</b>\n"
-
-    if tmdb:
-        if tmdb.get("overview"):
-            caption += f"<blockquote>{_html(tmdb['overview'])}</blockquote>\n"
-        if tmdb.get("rating"):
-            caption += f"⭐ <b>{tmdb['rating']}/10</b>  •  "
-        caption += f"📦 {total} files  •  ⚡ {speed}\n"
-        caption += f"🗑 Auto-deletes in {del_mins} mins\n\n"
-    else:
-        caption += (
-            f"<blockquote>📦 {total} files found  •  ⚡ {speed}\n"
-            f"🗑 Auto-deletes in {del_mins} mins</blockquote>\n\n"
-        )
-
-    caption += "👇 Tap a file to receive it in your PM:"
+def _build_caption(query, total, speed, del_mins):
+    """Search-results caption for the group chat — same minimal style as
+    filter.py's _render_results_view, adapted for the single-page group view."""
+    caption  = f"🔍 <code>{_html(query)}</code>\n\n"
+    caption += f"{total} files · Auto-deletes in {del_mins} min\n\n"
+    caption += "Tap a file below to receive it in your PM"
     return caption
+
+
+def _is_whitelist_ok(config: dict, group_doc) -> bool:
+    """True if this group may interact with the bot under the current
+    whitelist/blacklist mode. In blacklist mode (default) every non-banned
+    group is allowed; in whitelist mode only groups explicitly marked
+    `whitelisted` in connected_groups are."""
+    if config.get("group_whitelist_mode", "blacklist") != "whitelist":
+        return True
+    return bool(group_doc and group_doc.get("whitelisted", False))
 
 
 # ─── Bot added to group ───────────────────────────────────────────────────────
@@ -122,6 +112,21 @@ async def auto_connect_group(client: Client, message: Message):
                 await client.leave_chat(message.chat.id)
             except Exception:
                 pass
+            return
+
+        config = await db.get_config()
+        if not await db.is_group_whitelisted(message.chat.id) and \
+                config.get("group_whitelist_mode", "blacklist") == "whitelist":
+            try:
+                await client.leave_chat(message.chat.id)
+            except Exception:
+                pass
+            asyncio.create_task(send_smart_log(client,
+                f"🔒 **#WhitelistBlocked**\n\n📌 {message.chat.title}\n"
+                f"🆔 `{message.chat.id}`\n\n"
+                f"Whitelist mode is ON and this group isn't approved — left automatically. "
+                f"Whitelist it in Group Manager, then re-add the bot."
+            ))
             return
 
         await db.add_group(message.chat.id, message.chat.title)
@@ -150,7 +155,7 @@ async def auto_connect_group(client: Client, message: Message):
 
 # ─── Group text search ────────────────────────────────────────────────────────
 
-@Client.on_message(filters.group & filters.text & ~filters.command(["start", "help", "connect"]))
+@Client.on_message(filters.group & filters.text & ~filters.command(["start", "help"]))
 async def group_search(client: Client, message: Message):
     if not message.from_user:
         return
@@ -166,6 +171,14 @@ async def group_search(client: Client, message: Message):
         return
 
     config = await db.get_config()
+    group  = await db.get_group(message.chat.id)
+    if not _is_whitelist_ok(config, group):
+        try:
+            await client.leave_chat(message.chat.id)
+        except Exception:
+            pass
+        return
+
     if config.get("maintenance_mode"):
         return
 
@@ -190,6 +203,11 @@ async def group_search(client: Client, message: Message):
 
     if not query:
         return
+
+    try:
+        await client.send_chat_action(message.chat.id, ChatAction.TYPING)
+    except Exception:
+        pass
 
     start_time = time.time()
     results    = await db.get_search_results(query)
@@ -217,9 +235,8 @@ async def group_search(client: Client, message: Message):
             [InlineKeyboardButton("🔍 Search on Google", url=google_url)]
         ])
         not_found_msg = await message.reply_text(
-            f"🔍 <b>No results for</b> <code>{query}</code>\n\n"
-            f"<blockquote>Not in our database yet.\n"
-            f"Check spelling or tap Request below.</blockquote>",
+            f"🔍 No results for <code>{query}</code>\n\n"
+            f"It may not be uploaded yet — check the spelling or tap Request below.",
             reply_markup=markup, quote=True, parse_mode=ParseMode.HTML,
             **_no_preview()
         )
@@ -234,36 +251,19 @@ async def group_search(client: Client, message: Message):
     time_taken = time.time() - start_time
     await db.clear_old_searches()
 
-    # Fetch TMDB data (same logic as filter.py)
-    tmdb_data = None
-    try:
-        best_name  = results[0]["file_name"]
-        clean_tmdb = re.sub(
-            r"(1080p|720p|480p|4K|HDRip|WEB-DL|WEBRip|BluRay|PreDVD|CAM|"
-            r"HD.Rip|x264|x265|HEVC|Dual.Audio|Multi.Audio|"
-            r"Malayalam|Tamil|Telugu|Hindi|English|Kannada)",
-            "", best_name, flags=re.IGNORECASE
-        )
-        clean_tmdb = re.sub(r"[\(\[].*?[\)\]]", "", clean_tmdb)
-        clean_tmdb = re.sub(r"[^a-zA-Z0-9\s]", " ", clean_tmdb).strip()
-        if len(clean_tmdb) > 2:
-            tmdb_data = await get_movie_data(clean_tmdb)
-        if not tmdb_data:
-            tmdb_data = await get_movie_data(query)
-    except Exception:
-        tmdb_data = None
-
     session_id   = "".join(random.choices(string.ascii_letters + string.digits, k=6))
     sorted_files = _sort_results(results)
 
-    _del_secs = int(config.get("auto_delete_time", 300))
-    _del_mins = max(1, _del_secs // 60)
+    # Per-group override takes priority over the global default — set via
+    # Group Manager -> Group Settings -> Set Auto-Delete.
+    custom_del = (group.get("settings", {}) if group else {}).get("auto_delete_time")
+    _del_secs  = int(custom_del) if custom_del else int(config.get("auto_delete_time", 300))
+    _del_mins  = max(1, _del_secs // 60)
     speed     = f"{time_taken:.3f}s"
 
     session_data = {
         "results":          sorted_files,
         "query":            query,
-        "tmdb":             tmdb_data,
         "speed":            speed,
         "time":             time.time(),
         "auto_delete_time": _del_secs,
@@ -278,7 +278,7 @@ async def group_search(client: Client, message: Message):
     total_pages = max(1, (total + per_page - 1) // per_page)
     page_files  = sorted_files[:per_page]
 
-    caption = _build_caption(query, tmdb_data, total, speed, _del_mins)
+    caption = _build_caption(query, total, speed, _del_mins)
     buttons = _build_group_buttons(
         page_files, client.me.username, session_id, 0, total, total_pages
     )
@@ -287,35 +287,14 @@ async def group_search(client: Client, message: Message):
     )])
     markup = InlineKeyboardMarkup(buttons)
 
-    # Page 0 with TMDB poster → send as photo (same as filter.py)
     status_msg = await message.reply_text("🔍", quote=True)
-    if tmdb_data and tmdb_data.get("poster"):
-        try:
-            await status_msg.delete()
-            result_msg = await message.reply_photo(
-                photo=tmdb_data["poster"],
-                caption=caption,
-                reply_markup=markup,
-                parse_mode=ParseMode.HTML
-            )
-        except Exception:
-            result_msg = await message.reply_text(
-                text=caption,
-                reply_markup=markup,
-                parse_mode=ParseMode.HTML
-            )
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
-    else:
-        try:
-            await status_msg.edit_text(
-                text=caption, reply_markup=markup, parse_mode=ParseMode.HTML
-            )
-            result_msg = status_msg
-        except Exception:
-            result_msg = status_msg
+    try:
+        await status_msg.edit_text(
+            text=caption, reply_markup=markup, parse_mode=ParseMode.HTML
+        )
+        result_msg = status_msg
+    except Exception:
+        result_msg = status_msg
 
     # Auto-delete the result message after auto_delete_time
     async def _auto_delete(msg):
@@ -342,7 +321,6 @@ async def handle_group_pagination(client: Client, callback: CallbackQuery):
         return
 
     results     = data["results"]
-    tmdb        = data.get("tmdb")
     query       = data["query"]
     per_page    = 8
     total       = len(results)
@@ -354,7 +332,7 @@ async def handle_group_pagination(client: Client, callback: CallbackQuery):
     _del_secs = int(data.get("auto_delete_time", 300))
     _del_mins = max(1, _del_secs // 60)
 
-    caption = _build_caption(query, tmdb, total, data.get("speed", ""), _del_mins)
+    caption = _build_caption(query, total, data.get("speed", ""), _del_mins)
     buttons = _build_group_buttons(
         page_files, client.me.username, session_id, page, total, total_pages
     )
@@ -363,12 +341,8 @@ async def handle_group_pagination(client: Client, callback: CallbackQuery):
     )])
     markup = InlineKeyboardMarkup(buttons)
 
-    msg = callback.message
     try:
-        if getattr(msg, "photo", None):
-            await msg.edit_caption(caption=caption, reply_markup=markup, parse_mode=ParseMode.HTML)
-        else:
-            await msg.edit_text(text=caption, reply_markup=markup, parse_mode=ParseMode.HTML)
+        await callback.message.edit_text(text=caption, reply_markup=markup, parse_mode=ParseMode.HTML)
     except MessageNotModified:
         pass
     except Exception as e:

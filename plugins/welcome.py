@@ -5,14 +5,9 @@ from pyrogram import Client, filters
 from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton, ChatMemberUpdated
 )
-try:
-    from pyrogram.types import LinkPreviewOptions
-    def _no_preview(): return {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
-except ImportError:
-    LinkPreviewOptions = None
-    def _no_preview(): return {"disable_web_page_preview": True}
 from pyrogram.enums import ChatMemberStatus, ParseMode
 from database.db import db
+from utils import _no_preview
 
 load_dotenv()
 logger = logging.getLogger(__name__)
