@@ -100,7 +100,7 @@ def _build_start_ui(config, mention, total_files, bot_username, update_link, gro
     return text, InlineKeyboardMarkup(buttons)
 
 
-async def _execute_search(client, status_msg, query: str, config: dict):
+async def _execute_search(client, status_msg, query: str, config: dict, user_id=None):
     """Runs a search and renders page 0 of results into status_msg.
 
     Shared by the /start deep-link search path and the new "🔥 trending"
@@ -147,7 +147,9 @@ async def _execute_search(client, status_msg, query: str, config: dict):
         "query":            query,
         "speed":            "0.001s",
         "time":             time.time(),
-        "auto_delete_time": int(config.get("auto_delete_time", 300))
+        "auto_delete_time": int(config.get("auto_delete_time", 300)),
+        "user_id":          user_id,
+        "sort_mode":        "smart",
     }
     await db.save_search(session_id, session_data)
     return await route_menu(client, status_msg, session_id, 0)
@@ -211,7 +213,7 @@ async def _handle_search_payload(client, message, config, payload: str):
     status_msg = await message.reply_text(
         f"{ICON_SEARCH} <b>Searching databases...</b>", parse_mode=ParseMode.HTML, quote=True
     )
-    return await _execute_search(client, status_msg, query, config)
+    return await _execute_search(client, status_msg, query, config, user_id=message.from_user.id)
 
 
 @Client.on_message(filters.command("start") & filters.private)
@@ -345,4 +347,4 @@ async def trend_search_callback(client: Client, callback: CallbackQuery):
         f"{ICON_SEARCH} <b>Searching for</b> <code>{_html(query)}</code>...",
         parse_mode=ParseMode.HTML
     )
-    await _execute_search(client, status_msg, query, config)
+    await _execute_search(client, status_msg, query, config, user_id=callback.from_user.id)

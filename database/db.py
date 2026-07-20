@@ -1034,6 +1034,27 @@ class Database:
         except Exception:
             pass
 
+    async def get_data_saver(self, user_id: int) -> bool:
+        """Mobile Data Saver preference — an additive field on the existing
+        users doc, not a new collection. A single find_one on an indexed
+        _id is cheap enough to call on every result-view render, unlike the
+        multi-cluster gather() fan-outs elsewhere in this class."""
+        if self.users_col is None:
+            return False
+        try:
+            doc = await self.users_col.find_one({"_id": user_id}, {"data_saver": 1})
+            return bool(doc.get("data_saver", False)) if doc else False
+        except Exception:
+            return False
+
+    async def set_data_saver(self, user_id: int, enabled: bool):
+        if self.users_col is None:
+            return
+        try:
+            await self.users_col.update_one({"_id": user_id}, {"$set": {"data_saver": enabled}}, upsert=True)
+        except Exception:
+            pass
+
     async def save_pending_request(self, user_id, movie_name):
         if self.main_db is None:
             return

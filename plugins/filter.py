@@ -43,6 +43,14 @@ LANG_EMOJI = {
     "Dual Audio": "🎧", "Multi Audio": "🎵", "Other": "🌐"
 }
 
+# ── Sort modes for the results-view "sort toggle" row. "smart" is the
+# existing series-aware/size-desc default (_sort_results, unchanged).
+_SORT_LABELS = {
+    "smart": "✨ Smart",
+    "size":  "📦 Size",
+    "new":   "🆕 Newest",
+}
+
 
 def _html(text: str) -> str:
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -128,6 +136,10 @@ def _is_series(filename: str) -> bool:
     return bool(_SERIES_RE.search(filename))
 
 
+def _has_series_content(results: list) -> bool:
+    return any(_is_series(f.get("file_name", "")) for f in results)
+
+
 def _series_sort_key(f):
     name = f.get("file_name", "")
     s = _SEASON_NUM_RE.search(name)
@@ -138,12 +150,35 @@ def _series_sort_key(f):
 
 
 def _sort_results(results: list) -> list:
+    """"Smart" sort — the pre-existing default: series-aware chronological
+    order if any series content is detected, else size descending."""
     if not results:
         return results
     has_series = any(_is_series(f.get("file_name", "")) for f in results)
     if has_series:
         return sorted(results, key=_series_sort_key)
     return sorted(results, key=lambda f: f.get("file_size", 0), reverse=True)
+
+
+def _apply_sort(results: list, mode: str) -> list:
+    """Applies one of the "sort toggle" modes to a full results list.
+    "new" sorts by the raw ObjectId (monotonically time-ordered, same trick
+    already used elsewhere in this codebase — e.g. db.py's duplicate
+    cleanup uses ObjectId.generation_time) rather than needing a separate
+    upload-timestamp field."""
+    if mode == "size":
+        return sorted(results, key=lambda f: f.get("file_size", 0), reverse=True)
+    if mode == "new":
+        return sorted(results, key=lambda f: f.get("_id"), reverse=True)
+    return _sort_results(results)
+
+
+def _sort_row(session_id: str, current_mode: str) -> list:
+    row = []
+    for mode, label in _SORT_LABELS.items():
+        text = f"✅ {label}" if mode == current_mode else label
+        row.append(InlineKeyboardButton(text, callback_data=f"sort#{session_id}#{mode}"))
+    return row
 
 
 def _build_caption(config, file_data, delete_minutes, bot_username):
@@ -190,54 +225,20 @@ def _build_caption(config, file_data, delete_minutes, bot_username):
     )
 
 
-async def show_results(client, message, session_id, page):
-    data = await db.get_search(session_id)
-    if not data:
-        try:
-            await message.edit_text("⚠️ Session expired. Search again.")
-        except Exception:
-            pass
-        return
-
-    results     = data["results"]
-    query       = data["query"]
-    tmdb        = data.get("tmdb")
-    per_page    = 8
-    total       = len(results)
+def _build_result_buttons(results: list, session_id: str, page: int, per_page: int = 8):
+    """Builds the file-button rows plus Prev/Next row for one page of
+    results. Used for the plain movie-results view and the expanded
+    (per-episode) series view — they render identically once expanded."""
+    total = len(results)
     total_pages = max(1, (total + per_page - 1) // per_page)
-    page        = max(0, min(page, total_pages - 1))
-    start_idx   = page * per_page
-    page_files  = results[start_idx: start_idx + per_page]
-
-    _del_secs = int(data.get("auto_delete_time", 300))
-    _del_mins = max(1, _del_secs // 60)
-
-    title_display = _html(tmdb["title"] if tmdb else query.title())
-
-    caption = (
-        f"🎬 <b>{title_display}</b>\n"
-    )
-
-    if tmdb:
-        if tmdb.get("overview"):
-            caption += f"<blockquote>{_html(tmdb['overview'])}</blockquote>\n"
-        if tmdb.get("rating"):
-            caption += f"⭐ <b>{tmdb['rating']}/10</b>  •  "
-        caption += f"📦 {total} files  •  ⚡ {data.get('speed', '')}\n"
-        caption += f"🗑 Auto-deletes in {_del_mins} mins\n\n"
-    else:
-        caption += (
-            f"<blockquote>📦 {total} files found  •  ⚡ {data.get('speed', '')}\n"
-            f"🗑 Auto-deletes in {_del_mins} mins</blockquote>\n\n"
-        )
-
-    caption += "👇 Tap a file to receive it in your PM:"
+    page = max(0, min(page, total_pages - 1))
+    start_idx = page * per_page
+    page_files = results[start_idx: start_idx + per_page]
 
     buttons = []
     for f in page_files:
         f_lang, f_qual = extract_attributes(f["file_name"])
         size_str = _fmt_size(f)
-
         name = re.sub(r'\s+', ' ', f["file_name"]).strip()
 
         meta_parts = []
@@ -270,31 +271,120 @@ async def show_results(client, message, session_id, page):
     if nav:
         buttons.append(nav)
 
+    return buttons, page
+
+
+async def _render_results_view(client, message, session_id: str, page: int, data: dict, user_id=None):
+    """Single shared renderer for every results screen — the initial
+    search render, Prev/Next pagination, sort-mode switches, the series
+    expand toggle, and the Data Saver toggle all funnel through this one
+    function so they can never drift out of sync with each other (the old
+    code duplicated this whole block between show_results and
+    handle_pagination).
+    """
+    results   = data["results"]
+    query     = data["query"]
+    tmdb      = data.get("tmdb")
+    sort_mode = data.get("sort_mode", "smart")
+    series_expanded = data.get("series_expanded", False)
+
+    total     = len(results)
+    _del_secs = int(data.get("auto_delete_time", 300))
+    _del_mins = max(1, _del_secs // 60)
+
+    uid = user_id if user_id is not None else data.get("user_id")
+    data_saver = await db.get_data_saver(uid) if uid is not None else False
+
+    title_display = _html(tmdb["title"] if tmdb else query.title())
+    caption = f"🎬 <b>{title_display}</b>\n"
+
+    if tmdb:
+        if tmdb.get("overview"):
+            # tap-to-reveal — keeps plot details out of the way until the
+            # user actually wants them (also a mild spoiler guard).
+            caption += f"<blockquote><tg-spoiler>{_html(tmdb['overview'])}</tg-spoiler></blockquote>\n"
+        if tmdb.get("rating"):
+            caption += f"⭐ <b>{tmdb['rating']}/10</b>  •  "
+        caption += f"📦 {total} files  •  ⚡ {data.get('speed', '')}\n"
+        caption += f"🗑 Auto-deletes in {_del_mins} mins\n\n"
+    else:
+        caption += (
+            f"<blockquote>📦 {total} files found  •  ⚡ {data.get('speed', '')}\n"
+            f"🗑 Auto-deletes in {_del_mins} mins</blockquote>\n\n"
+        )
+
+    has_series = _has_series_content(results)
+    buttons = []
+
+    if has_series and not series_expanded:
+        caption += "👇 Grouped as a series — tap to see every episode:"
+        buttons.append([InlineKeyboardButton(
+            f"📺 View All Episodes ({total} found)",
+            callback_data=f"expandseries#{session_id}"
+        )])
+        page = 0
+    else:
+        caption += "👇 Tap a file to receive it in your PM:"
+        file_buttons, page = _build_result_buttons(results, session_id, page)
+        buttons.extend(file_buttons)
+
+    buttons.append(_sort_row(session_id, sort_mode))
+
+    utility_row = [InlineKeyboardButton("🔍 New Search", callback_data="new_search_hint")]
+    if uid is not None:
+        saver_label = "📶 Data Saver: ON" if data_saver else "📶 Data Saver: OFF"
+        utility_row.append(InlineKeyboardButton(saver_label, callback_data=f"datasaver#{session_id}"))
+    buttons.append(utility_row)
+
     buttons.append([InlineKeyboardButton("🏠 Home", callback_data="start_home")])
     markup = InlineKeyboardMarkup(buttons)
 
-    # Page 0 with TMDB poster → send as photo replacing the 🔍 placeholder
-    if page == 0 and tmdb and tmdb.get("poster"):
-        try:
+    has_poster = bool(tmdb and tmdb.get("poster"))
+    is_media_msg = bool(
+        getattr(message, "photo", None) or getattr(message, "video", None) or
+        getattr(message, "animation", None) or getattr(message, "document", None)
+    )
+
+    try:
+        if is_media_msg:
+            if data_saver:
+                # Downgrade: the session was already showing the poster and
+                # the user just enabled Data Saver — Telegram can't turn a
+                # photo message into a text message in place, so replace it.
+                chat_id = message.chat.id
+                await message.delete()
+                await client.send_message(
+                    chat_id, caption, reply_markup=markup,
+                    parse_mode=ParseMode.HTML, **_no_preview()
+                )
+            else:
+                await message.edit_caption(caption=caption, reply_markup=markup, parse_mode=ParseMode.HTML)
+        elif page == 0 and has_poster and not data_saver:
+            # First render of this session with a poster available and Data
+            # Saver off — upgrade the plain status message into a photo.
             chat_id = message.chat.id
             await message.delete()
             await client.send_photo(
-                chat_id=chat_id,
-                photo=tmdb["poster"],
-                caption=caption,
-                reply_markup=markup,
-                parse_mode=ParseMode.HTML
+                chat_id=chat_id, photo=tmdb["poster"], caption=caption,
+                reply_markup=markup, parse_mode=ParseMode.HTML
             )
-            return
-        except Exception:
-            pass  # fall through to text if photo fails
-
-    try:
-        await message.edit_text(text=caption, reply_markup=markup, parse_mode=ParseMode.HTML)
+        else:
+            await message.edit_text(text=caption, reply_markup=markup, parse_mode=ParseMode.HTML)
     except MessageNotModified:
         pass
     except Exception as e:
-        logger.error(f"show_results error: {e}")
+        logger.error(f"_render_results_view error: {e}")
+
+
+async def show_results(client, message, session_id, page):
+    data = await db.get_search(session_id)
+    if not data:
+        try:
+            await message.edit_text("⚠️ Session expired. Search again.")
+        except Exception:
+            pass
+        return
+    await _render_results_view(client, message, session_id, page, data)
 
 
 route_menu = show_results
@@ -404,6 +494,12 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
 
     time_taken = time.time() - start_time
     await db.clear_old_searches()
+
+    # Only searches that actually returned something are worth surfacing as
+    # a "trending" suggestion on the home panel — see _TrendingCache's
+    # docstring in db.py.
+    await db.log_trending_search(query)
+
     session_id = "".join(random.choices(string.ascii_letters + string.digits, k=6))
 
     # Fetch TMDB data if API key is set
@@ -431,7 +527,9 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
         "tmdb":             tmdb_data,
         "speed":            f"{time_taken:.3f}s",
         "time":             time.time(),
-        "auto_delete_time": int(config.get("auto_delete_time", 300))
+        "auto_delete_time": int(config.get("auto_delete_time", 300)),
+        "user_id":          user_id,
+        "sort_mode":        "smart",
     }
     await db.save_search(session_id, session_data)
 
@@ -451,81 +549,78 @@ async def handle_pagination(client: Client, callback: CallbackQuery):
         await callback.answer("⚠️ Session expired.", show_alert=True)
         return
 
-    results     = data["results"]
-    tmdb        = data.get("tmdb")
-    per_page    = 8
-    total       = len(results)
-    total_pages = max(1, (total + per_page - 1) // per_page)
-    page        = max(0, min(page, total_pages - 1))
-    start_idx   = page * per_page
-    page_files  = results[start_idx: start_idx + per_page]
+    await _render_results_view(client, callback.message, session_id, page, data, user_id=callback.from_user.id)
+    await callback.answer()
 
-    _del_secs = int(data.get("auto_delete_time", 300))
-    _del_mins = max(1, _del_secs // 60)
 
-    title_display = _html(tmdb["title"] if tmdb else data["query"].title())
-    caption = f"🎬 <b>{title_display}</b>\n"
+@Client.on_callback_query(filters.regex(r"^sort#"))
+async def handle_sort(client: Client, callback: CallbackQuery):
+    parts = callback.data.split("#")
+    if len(parts) < 3:
+        return await callback.answer()
+    session_id, mode = parts[1], parts[2]
+    if mode not in _SORT_LABELS:
+        return await callback.answer()
 
-    if tmdb:
-        if tmdb.get("overview"):
-            caption += f"<blockquote>{_html(tmdb['overview'])}</blockquote>\n"
-        if tmdb.get("rating"):
-            caption += f"⭐ <b>{tmdb['rating']}/10</b>  •  "
-        caption += f"📦 {total} files  •  ⚡ {data.get('speed', '')}\n"
-        caption += f"🗑 Auto-deletes in {_del_mins} mins\n\n"
-    else:
-        caption += (
-            f"<blockquote>📦 {total} files  •  ⚡ {data.get('speed', '')}\n"
-            f"🗑 Auto-deletes in {_del_mins} mins</blockquote>\n\n"
-        )
-    caption += "👇 Tap a file to receive it in your PM:"
+    data = await db.get_search(session_id)
+    if not data:
+        return await callback.answer("⚠️ Session expired.", show_alert=True)
 
-    buttons = []
-    for f in page_files:
-        f_lang, f_qual = extract_attributes(f["file_name"])
-        size_str = _fmt_size(f)
-        name     = re.sub(r'\s+', ' ', f["file_name"]).strip()
-        meta_parts = []
-        if f_qual not in ["Other", ""]:
-            meta_parts.append(f_qual)
-        if f_lang not in ["Other", ""]:
-            meta_parts.append(f_lang)
-        meta     = " | ".join(meta_parts)
-        size_tag = f"[{size_str}]"
-        if meta:
-            available = 48 - len(size_tag) - len(meta) - 4
-            truncated = name[:max(10, available)] + ("…" if len(name) > max(10, available) else "")
-            btn_text  = f"{size_tag} {truncated} | {meta}"
-        else:
-            available = 52 - len(size_tag) - 1
-            truncated = name[:available] + ("…" if len(name) > available else "")
-            btn_text  = f"{size_tag} {truncated}"
-        buttons.append([InlineKeyboardButton(btn_text, callback_data=f"sendfile#{f['_id']}")])
+    data["results"]   = _apply_sort(data["results"], mode)
+    data["sort_mode"] = mode
+    await db.save_search(session_id, data)
 
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"page#{session_id}#{page-1}"))
-    if total_pages > 1:
-        nav.append(InlineKeyboardButton(f"📄 {page+1}/{total_pages}", callback_data="ignore"))
-    if page < total_pages - 1:
-        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"page#{session_id}#{page+1}"))
-    if nav:
-        buttons.append(nav)
-    buttons.append([InlineKeyboardButton("🏠 Home", callback_data="start_home")])
-    markup = InlineKeyboardMarkup(buttons)
+    await callback.answer(f"Sorted: {_SORT_LABELS[mode]}")
+    await _render_results_view(client, callback.message, session_id, 0, data, user_id=callback.from_user.id)
 
-    msg = callback.message
-    try:
-        if getattr(msg, "photo", None) or getattr(msg, "document", None):
-            await msg.edit_caption(caption=caption, reply_markup=markup, parse_mode=ParseMode.HTML)
-        else:
-            await msg.edit_text(text=caption, reply_markup=markup, parse_mode=ParseMode.HTML)
-    except MessageNotModified:
-        pass
-    except Exception as e:
-        logger.error(f"Pagination error: {e}")
+
+@Client.on_callback_query(filters.regex(r"^expandseries#"))
+async def handle_expand_series(client: Client, callback: CallbackQuery):
+    session_id = callback.data.split("#", 1)[1]
+
+    data = await db.get_search(session_id)
+    if not data:
+        return await callback.answer("⚠️ Session expired.", show_alert=True)
+
+    data["series_expanded"] = True
+    await db.save_search(session_id, data)
 
     await callback.answer()
+    await _render_results_view(client, callback.message, session_id, 0, data, user_id=callback.from_user.id)
+
+
+@Client.on_callback_query(filters.regex(r"^datasaver#"))
+async def handle_data_saver_toggle(client: Client, callback: CallbackQuery):
+    session_id = callback.data.split("#", 1)[1]
+
+    data = await db.get_search(session_id)
+    if not data:
+        return await callback.answer("⚠️ Session expired.", show_alert=True)
+
+    user_id   = callback.from_user.id
+    new_value = not await db.get_data_saver(user_id)
+    await db.set_data_saver(user_id, new_value)
+
+    await callback.answer(f"📶 Data Saver {'ON' if new_value else 'OFF'}", show_alert=False)
+    # No page number travels in this callback's data — reset to page 0,
+    # same as the sort and expand-series toggles.
+    await _render_results_view(client, callback.message, session_id, 0, data, user_id=user_id)
+
+
+@Client.on_callback_query(filters.regex(r"^new_search_hint$"))
+async def new_search_hint_callback(client: Client, callback: CallbackQuery):
+    await callback.answer()
+    prompt_text = "🔍 <b>Type any movie or series name to search!</b>"
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="start_home")]])
+    msg = callback.message
+    try:
+        if getattr(msg, "photo", None) or getattr(msg, "video", None) or \
+           getattr(msg, "animation", None) or getattr(msg, "document", None):
+            await msg.edit_caption(caption=prompt_text, reply_markup=markup, parse_mode=ParseMode.HTML)
+        else:
+            await msg.edit_text(text=prompt_text, reply_markup=markup, parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
 
 
 @Client.on_callback_query(filters.regex(r"^ignore$"))
