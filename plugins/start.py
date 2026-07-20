@@ -49,18 +49,20 @@ def _html(text: str) -> str:
 
 
 def _build_start_ui(config, mention, total_files, bot_username, update_link, group_link,
-                     is_new=False, trending=None):
+                     is_new=False, trending=None, first_name=""):
     """Shared welcome UI builder — used by /start and start_home callback."""
     default_welcome = (
-        "<b>👋 Hey {mention}!</b>\n\n"
-        "🎬 <b>{total_files:,}</b> files ready to deliver.\n"
-        "Malayalam • Tamil • Telugu • Hindi &amp; more\n\n"
-        "Just type any movie name to search.\n"
-        "<i>Files land in your PM instantly.</i>"
+        "<b>Hey {first_name} Welcome 🎉 To MCCxMovieBot</b>\n\n"
+        f"{ICON_MOVIE} <b>I Am A Simple Movie &amp; Series Finder Bot.</b>\n\n"
+        f"{ICON_SEARCH} <b>Send A Movie Or Series Name To Get Files.</b>\n\n"
+        "<i>{total_files:,} files and counting.</i>"
     )
     raw = config.get("welcome_text", default_welcome)
     try:
-        text = raw.format(mention=mention, total_files=total_files)
+        # Both {mention} and {first_name} are accepted — admin-set welcome
+        # text written before this update still uses {mention} and keeps
+        # working exactly as before.
+        text = raw.format(mention=mention, first_name=first_name or mention, total_files=total_files)
     except Exception:
         text = raw
 
@@ -88,19 +90,19 @@ def _build_start_ui(config, mention, total_files, bot_username, update_link, gro
         for i in range(0, len(trend_buttons), 2):
             buttons.append(trend_buttons[i:i + 2])
 
-    top_row = []
+    row1 = [InlineKeyboardButton("👥 Add To Group", url=f"https://t.me/{bot_username}?startgroup=true")]
     if update_link:
-        top_row.append(InlineKeyboardButton(f"{ICON_UPDATES} Updates", url=update_link))
+        row1.append(InlineKeyboardButton(f"{ICON_UPDATES} Join Our Channel", url=update_link))
+    buttons.append(row1)
+
     if group_link:
-        top_row.append(InlineKeyboardButton("👥 Group", url=group_link))
-    if top_row:
-        buttons.append(top_row)
-    buttons.append([InlineKeyboardButton("➕ Add to Group", url=f"https://t.me/{bot_username}?startgroup=true")])
+        buttons.append([InlineKeyboardButton("⚡ Movie Request Group", url=group_link)])
+
     buttons.append([InlineKeyboardButton("ℹ️ Help", callback_data="help_menu")])
     return text, InlineKeyboardMarkup(buttons)
 
 
-async def _execute_search(client, status_msg, query: str, config: dict, user_id=None):
+async def _execute_search(client, status_msg, query: str, config: dict, user_id=None, first_name=""):
     """Runs a search and renders page 0 of results into status_msg.
 
     Shared by the /start deep-link search path and the new "🔥 trending"
@@ -149,6 +151,7 @@ async def _execute_search(client, status_msg, query: str, config: dict, user_id=
         "time":             time.time(),
         "auto_delete_time": int(config.get("auto_delete_time", 300)),
         "user_id":          user_id,
+        "first_name":       first_name or "",
         "sort_mode":        "smart",
     }
     await db.save_search(session_id, session_data)
@@ -213,7 +216,10 @@ async def _handle_search_payload(client, message, config, payload: str):
     status_msg = await message.reply_text(
         f"{ICON_SEARCH} <b>Searching databases...</b>", parse_mode=ParseMode.HTML, quote=True
     )
-    return await _execute_search(client, status_msg, query, config, user_id=message.from_user.id)
+    return await _execute_search(
+        client, status_msg, query, config,
+        user_id=message.from_user.id, first_name=message.from_user.first_name
+    )
 
 
 @Client.on_message(filters.command("start") & filters.private)
@@ -264,7 +270,8 @@ async def start_handler(client: Client, message: Message):
     trending = await db.get_trending_searches(limit=6)
     caption_text, reply_markup = _build_start_ui(
         config, message.from_user.mention, total_files, client.me.username,
-        UPDATE_CHANNEL_LINK, MAIN_GROUP_LINK, is_new=is_new, trending=trending
+        UPDATE_CHANNEL_LINK, MAIN_GROUP_LINK, is_new=is_new, trending=trending,
+        first_name=message.from_user.first_name
     )
 
     try:
@@ -315,7 +322,8 @@ async def start_home_callback(client: Client, callback: CallbackQuery):
 
     caption_text, reply_markup = _build_start_ui(
         config, callback.from_user.mention, total_files, client.me.username,
-        UPDATE_CHANNEL_LINK, MAIN_GROUP_LINK, is_new=False, trending=trending
+        UPDATE_CHANNEL_LINK, MAIN_GROUP_LINK, is_new=False, trending=trending,
+        first_name=callback.from_user.first_name
     )
 
     try:
@@ -347,4 +355,7 @@ async def trend_search_callback(client: Client, callback: CallbackQuery):
         f"{ICON_SEARCH} <b>Searching for</b> <code>{_html(query)}</code>...",
         parse_mode=ParseMode.HTML
     )
-    await _execute_search(client, status_msg, query, config, user_id=callback.from_user.id)
+    await _execute_search(
+        client, status_msg, query, config,
+        user_id=callback.from_user.id, first_name=callback.from_user.first_name
+    )

@@ -284,7 +284,8 @@ async def handle_edit_buttons(client: Client, callback: CallbackQuery):
         "welcometext": (
             "📝 **Send me the new Welcome Message.**\n\n"
             "**Tip:** You can use standard Telegram HTML tags (`<b>`, `<i>`, `<blockquote>`).\n"
-            "Type `{mention}` wherever you want the user's name to appear!\n\n"
+            "Type `{mention}` for an @-tag, `{first_name}` for their plain first name, "
+            "or `{total_files:,}` for the live file count!\n\n"
             "*Type /cancel to abort.*"
         ),
         "logchannel": (

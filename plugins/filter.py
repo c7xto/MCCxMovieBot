@@ -209,18 +209,20 @@ def _build_caption(config, file_data, delete_minutes, bot_username):
         "Dual Audio": "🎧", "Multi Audio": "🎵"
     }
     lang_icon = lang_emojis.get(f_lang, "🎬")
-    parts     = []
+    tag_parts = []
     if f_lang not in ["Other", ""]:
-        parts.append(f"{lang_icon} {f_lang}")
+        tag_parts.append(f"{lang_icon} {f_lang}")
     if f_qual not in ["Other", ""]:
-        parts.append(f"🎞 {f_qual}")
-    parts.append(f"💿 {size_str}")
-    meta_line = "  •  ".join(parts)
+        tag_parts.append(f"🎞 {f_qual}")
+    tags_line = f"{'  •  '.join(tag_parts)}\n" if tag_parts else ""
 
     return (
-        f"🍿 <b>{_html(file_data['file_name'])}</b>\n"
-        f"<blockquote>{meta_line}\n\n"
-        f"⏳ Auto-deletes in <b>{delete_minutes} mins</b> — forward to save!</blockquote>\n"
+        f"📥 <b>{_html(file_data['file_name'])}</b>\n"
+        f"📦 Size: {size_str}\n"
+        f"{tags_line}\n"
+        f"👇 Use the links below to join or download...\n\n"
+        f"<blockquote>⚠️ <b>Files will be deleted in {delete_minutes} minutes. If you want to keep "
+        f"this file, kindly forward it to any chat (Saved Messages) and start the download...</b></blockquote>\n"
         f"📢 @{bot_username}"
     )
 
@@ -265,13 +267,13 @@ def _build_result_buttons(results: list, session_id: str, page: int, per_page: i
     if page > 0:
         nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"page#{session_id}#{page-1}"))
     if total_pages > 1:
-        nav.append(InlineKeyboardButton(f"📄 {page+1}/{total_pages}", callback_data="ignore"))
+        nav.append(InlineKeyboardButton(f"🟢 {page+1}/{total_pages} 🟢", callback_data="ignore"))
     if page < total_pages - 1:
         nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"page#{session_id}#{page+1}"))
     if nav:
         buttons.append(nav)
 
-    return buttons, page
+    return buttons, page, total_pages
 
 
 async def _render_results_view(client, message, session_id: str, page: int, data: dict, user_id=None):
@@ -294,27 +296,35 @@ async def _render_results_view(client, message, session_id: str, page: int, data
 
     uid = user_id if user_id is not None else data.get("user_id")
     data_saver = await db.get_data_saver(uid) if uid is not None else False
+    first_name = data.get("first_name", "")
 
-    title_display = _html(tmdb["title"] if tmdb else query.title())
-    caption = f"🎬 <b>{title_display}</b>\n"
+    has_series = _has_series_content(results)
+    buttons = []
+
+    if has_series and not series_expanded:
+        page, total_pages = 0, 1
+    else:
+        file_buttons, page, total_pages = _build_result_buttons(results, session_id, page)
+        buttons.extend(file_buttons)
+
+    caption = (
+        f"🔍 <b>Results Found For {_html(query)}</b>\n"
+        f"🗣️ : {_html(first_name)}\n\n"
+        f"📁 <b>Files: {total} - 📚 Page: {page+1}/{total_pages}</b>\n\n"
+    )
 
     if tmdb:
+        title_display = _html(tmdb["title"])
+        caption += f"🎬 <b>{title_display}</b>\n"
         if tmdb.get("overview"):
             # tap-to-reveal — keeps plot details out of the way until the
             # user actually wants them (also a mild spoiler guard).
             caption += f"<blockquote><tg-spoiler>{_html(tmdb['overview'])}</tg-spoiler></blockquote>\n"
         if tmdb.get("rating"):
-            caption += f"⭐ <b>{tmdb['rating']}/10</b>  •  "
-        caption += f"📦 {total} files  •  ⚡ {data.get('speed', '')}\n"
-        caption += f"🗑 Auto-deletes in {_del_mins} mins\n\n"
-    else:
-        caption += (
-            f"<blockquote>📦 {total} files found  •  ⚡ {data.get('speed', '')}\n"
-            f"🗑 Auto-deletes in {_del_mins} mins</blockquote>\n\n"
-        )
+            caption += f"⭐ <b>{tmdb['rating']}/10</b>\n"
+        caption += "\n"
 
-    has_series = _has_series_content(results)
-    buttons = []
+    caption += f"🗑 Auto-deletes in {_del_mins} mins\n\n"
 
     if has_series and not series_expanded:
         caption += "👇 Grouped as a series — tap to see every episode:"
@@ -322,11 +332,8 @@ async def _render_results_view(client, message, session_id: str, page: int, data
             f"📺 View All Episodes ({total} found)",
             callback_data=f"expandseries#{session_id}"
         )])
-        page = 0
     else:
         caption += "👇 Tap a file to receive it in your PM:"
-        file_buttons, page = _build_result_buttons(results, session_id, page)
-        buttons.extend(file_buttons)
 
     buttons.append(_sort_row(session_id, sort_mode))
 
@@ -469,25 +476,27 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
             ))
 
         suggestions = await db.get_prefix_suggestions(query, limit=3)
-        sug_buttons = []
+        sug_buttons = [
+            [InlineKeyboardButton("🔎 Correct Spelling (Google)", url=google_url)]
+        ]
         for sug in suggestions:
             safe_sug = re.sub(r"[^a-zA-Z0-9]", "_", sug)[:40]
             sug_buttons.append([InlineKeyboardButton(
-                f"🔎 {sug[:30]}",
+                f"💡 {sug[:30]}",
                 url=f"https://t.me/{client.me.username}?start=search_{safe_sug}"
             )])
 
         sug_buttons += [
-            [InlineKeyboardButton("🔍 Search on Google", url=google_url)],
             [InlineKeyboardButton("📝 Request This Movie", callback_data=f"reqmovie#{safe_query}")],
             [InlineKeyboardButton("🏠 Home", callback_data="start_home")]
         ]
 
-        hint = "\n💡 <b>Did you mean one of these?</b>" if suggestions else ""
+        first_name = _html(message.from_user.first_name or "")
         return await message.reply_text(
-            f"🔍 <b>No results for</b> <code>{query}</code>\n\n"
-            f"<blockquote>Not in our database yet.\n"
-            f"Check spelling or tap Request below.{hint}</blockquote>",
+            f"<b>Hey {first_name} something Is Wrong ❌</b>\n\n"
+            f"🔹 Check IMDb and check the OTT release or Join the Channel below\n"
+            f"🔹 Click spelling button below to correct the spelling of the movie And More Information 📥\n\n"
+            f"📢 Join Our Community",
             reply_markup=InlineKeyboardMarkup(sug_buttons),
             parse_mode=ParseMode.HTML, **_no_preview()
         )
@@ -529,6 +538,7 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
         "time":             time.time(),
         "auto_delete_time": int(config.get("auto_delete_time", 300)),
         "user_id":          user_id,
+        "first_name":       message.from_user.first_name or "",
         "sort_mode":        "smart",
     }
     await db.save_search(session_id, session_data)
