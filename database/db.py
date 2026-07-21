@@ -4,6 +4,7 @@ import time
 import json
 import asyncio
 import logging
+from datetime import datetime, timezone
 from collections import OrderedDict
 from functools import lru_cache
 from bson.objectid import ObjectId
@@ -191,6 +192,19 @@ class Database:
                 await self.main_db["missed_searches"].create_index([("count", -1)])
                 await self.main_db["pending_requests"].create_index("movie_name")
                 await self.main_db["connected_groups"].create_index("search_count")
+                # TTL cleanup — additive only, never touches existing
+                # documents. Both fields are populated going forward
+                # (log_missed_search() / save_pending_request());
+                # documents written before this change simply lack the
+                # field and are skipped by MongoDB's TTL monitor until
+                # they're naturally written to again (re-searched /
+                # re-requested).
+                await self.main_db["missed_searches"].create_index(
+                    "last_searched_at", expireAfterSeconds=90 * 24 * 3600  # 90 days of no repeat searches
+                )
+                await self.main_db["pending_requests"].create_index(
+                    "requested_at", expireAfterSeconds=180 * 24 * 3600  # 180 days — generous so a slow-to-fulfill request still gets auto-notified
+                )
             except Exception:
                 pass
         if self.registry_col is not None:
@@ -826,7 +840,14 @@ class Database:
         cooldown     = 3600
         existing     = await col.find_one({"_id": cleaned})
         should_alert = existing is None or (now - existing.get("last_alerted", 0)) > cooldown
-        update = {"$inc": {"count": 1}, "$set": {"last_searched": now, "original": query}}
+        # last_searched_at (a real BSON date) drives the TTL index in
+        # ensure_indexes() — last_searched (epoch float) is kept as-is for
+        # any existing reader of that field; MongoDB TTL only acts on Date
+        # fields, so the two coexist rather than replacing one with the other.
+        update = {
+            "$inc": {"count": 1},
+            "$set": {"last_searched": now, "original": query, "last_searched_at": datetime.now(timezone.utc)},
+        }
         if should_alert:
             update["$set"]["last_alerted"] = now
         try:
@@ -1137,9 +1158,17 @@ class Database:
         if self.main_db is None:
             return
         requests_col = self.main_db["pending_requests"]
+        # requested_at (a real BSON date) drives the TTL index in
+        # ensure_indexes() — timestamp (epoch float) is kept as-is for any
+        # existing reader of that field, same coexistence approach as
+        # log_missed_search()'s last_searched_at above.
         await requests_col.update_one(
             {"user_id": user_id, "movie_name": movie_name.lower().strip()},
-            {"$set": {"user_id": user_id, "movie_name": movie_name.lower().strip(), "original_name": movie_name, "timestamp": time.time()}},
+            {"$set": {
+                "user_id": user_id, "movie_name": movie_name.lower().strip(),
+                "original_name": movie_name, "timestamp": time.time(),
+                "requested_at": datetime.now(timezone.utc),
+            }},
             upsert=True
         )
 

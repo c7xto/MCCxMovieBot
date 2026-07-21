@@ -82,6 +82,186 @@ def extract_attributes(filename):
     return lang, qual
 
 
+# ── Display-only title cleanup ───────────────────────────────────────────────
+# Never touches the stored file_name — purely how a filename is *rendered*
+# in a button label or delivered-file caption.
+_EXT_RE = re.compile(r'\.(mkv|mp4|avi|mov|zip|srt)$', re.IGNORECASE)
+_YEAR_RE = re.compile(r'^(19\d{2}|20\d{2})$')
+_PAREN_YEAR_RE = re.compile(r'[\(\[](\d{4})[\)\]]')
+_BRACKET_GROUP_RE = re.compile(r'[\[\(].*?[\]\)]')
+_TITLE_SEP_RE = re.compile(r'[._]')
+_TITLE_WS_RE = re.compile(r'\s+')
+
+# Codec/subtitle/release-group tags that aren't in LANGUAGES/QUALITIES but
+# still need to be recognized as "metadata, not title" when walking backward
+# through a filename's tokens (see _display_title below).
+_JUNK_WORDS = {"x264", "x265", "hevc", "aac", "esub", "hsub", "10bit",
+               "hdcam", "tsrip", "dvdrip", "hq", "nf", "amzn", "brrip", "bdrip"}
+_QUALITY_LOWER = {q.lower() for q in QUALITIES}
+_LANGUAGE_LOWER = {l.lower() for l in LANGUAGES}
+
+
+def _is_year_token(tok: str) -> bool:
+    return bool(_YEAR_RE.match(tok))
+
+
+def _is_metadata_word(tok: str) -> bool:
+    """Quality/language/codec-junk classification — deliberately excludes
+    year tokens, which _display_title handles separately (a filename can
+    legitimately contain two 4-digit-looking tokens — a numeric title like
+    "1917"/"2012" AND its real release year — and only one of them should
+    ever be consumed as metadata)."""
+    low = tok.lower()
+    if low in _QUALITY_LOWER or low in _LANGUAGE_LOWER or low in _JUNK_WORDS:
+        return True
+    if '-' in low:
+        parts = [p for p in low.split('-') if p]
+        if parts and all(p in _JUNK_WORDS or p in _QUALITY_LOWER for p in parts):
+            return True
+    return False
+
+
+def _display_title(filename: str) -> tuple:
+    """Derives a clean display title + year from a raw indexed filename, for
+    presentation only (button labels / delivered-file captions) — never
+    touches the stored file_name.
+
+    Walks the filename's tokens backward from the end, classifying each
+    trailing token (or 2-token phrase, for "Dual Audio"/"HD Rip"-style
+    entries) as quality/language/year/codec metadata, and stops at the
+    first token (from the end) that isn't recognized — everything up to
+    and including that token is the real title. This checks the whole
+    trailing run rather than "does a marker appear anywhere in the
+    filename", so a title that merely *contains* a language/quality word
+    ("The Malayalam Movie") is never truncated mid-title — a cut only
+    happens once the marker is genuinely part of an unbroken metadata tail
+    at the end of the string. Season/episode markers (S01E01 etc.) are
+    deliberately never classified as metadata, so they stay part of the
+    title for series files — otherwise every episode of a show would
+    render an identical caption/label with no way to tell them apart.
+    """
+    name = _EXT_RE.sub('', filename)
+
+    # A parenthesized/bracketed 4-digit year is unambiguous regardless of
+    # what the rest of the title looks like (a numeric title like "300" or
+    # "2012" is never itself wrapped in its own parens).
+    paren_match = _PAREN_YEAR_RE.search(name)
+    paren_year = paren_match.group(1) if paren_match else None
+
+    # Strip every complete bracket group (site tags like [TamilMV], the
+    # year annotation just captured above, etc.) — replace with a space,
+    # not empty, so two words butting up against a bracket don't fuse.
+    name = _BRACKET_GROUP_RE.sub(' ', name)
+    # Normalize remaining separators to spaces before tokenizing —
+    # underscore is a \w character, so naive \b-based regex matching would
+    # silently fail against underscore-separated filenames otherwise.
+    norm = _TITLE_SEP_RE.sub(' ', name)
+    tokens = [t for t in _TITLE_WS_RE.split(norm) if t]
+
+    i = len(tokens)
+    year_consumed = False
+    while i > 0:
+        if i >= 2:
+            phrase = f"{tokens[i-2]} {tokens[i-1]}".lower()
+            if phrase in _QUALITY_LOWER or phrase in _LANGUAGE_LOWER:
+                i -= 2
+                continue
+        tok = tokens[i-1]
+        if _is_year_token(tok):
+            if year_consumed:
+                break  # a 2nd year-shaped token further back is the title, not metadata
+            year_consumed = True
+            i -= 1
+            continue
+        if _is_metadata_word(tok):
+            i -= 1
+            continue
+        break
+
+    title = " ".join(tokens[:i]).strip()
+    tail_tokens = tokens[i:]
+
+    if not title:
+        title = " ".join(tokens)  # nothing recognized — no safe cut point
+
+    if paren_year:
+        year = paren_year
+    else:
+        year = next((t for t in tail_tokens if _is_year_token(t)), "")
+
+    return (title or filename.strip(), year)
+
+
+def _variant_label(f, show_title: bool, title=None, year=None) -> str:
+    """Builds one file's button label as Title (Year) · Language · Quality ·
+    Size — or, when show_title is False, just Language · Quality · Size.
+    The latter is used for the single-result hero card's metadata line,
+    where the title is already the bolded caption headline just above it."""
+    if title is None:
+        title, year = _display_title(f["file_name"])
+    f_lang, f_qual = extract_attributes(f["file_name"])
+    size_str = _fmt_size(f)
+
+    parts = []
+    if show_title:
+        parts.append(f"{title} ({year})" if year else title)
+    if f_lang not in ("Other", ""):
+        parts.append(f_lang)
+    if f_qual not in ("Other", ""):
+        parts.append(f_qual)
+    parts.append(size_str)
+
+    label = " · ".join(parts)
+    return label if len(label) <= 52 else label[:51] + "…"
+
+
+def _build_movie_result_buttons(results: list, session_id: str, page: int, per_page: int = 8):
+    """Movie-search button builder — groups same-title files (different
+    quality/language variants) next to each other instead of leaving them
+    scattered by the size-based sort, and shows a clean Title (Year) ·
+    Language · Quality · Size label instead of the raw indexed filename.
+    Every button (grouped or not) is independently tappable and self-
+    labeled — no separate non-clickable "header" row, since a keyboard
+    button that does nothing on tap is worse UX than a bit of repeated
+    title text. Grouping is purely a rendering-order choice: pagination
+    math (page/total_pages) and the sendfile# callback on every button are
+    unchanged, so this never adds a tap versus the un-grouped list. Series
+    results use the separate, untouched _build_result_buttons() below
+    instead — grouping by title would otherwise put every episode of a
+    series next to each other with an identical label."""
+    total = len(results)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    start_idx = page * per_page
+    page_files = results[start_idx: start_idx + per_page]
+
+    groups = OrderedDict()
+    for f in page_files:
+        title, year = _display_title(f["file_name"])
+        key = title.lower()
+        if key not in groups:
+            groups[key] = {"title": title, "year": year, "files": []}
+        groups[key]["files"].append(f)
+
+    buttons = []
+    for group in groups.values():
+        for f in group["files"]:
+            label = _variant_label(f, show_title=True, title=group["title"], year=group["year"])
+            buttons.append([InlineKeyboardButton(label, callback_data=f"sendfile#{f['_id']}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"page#{session_id}#{page-1}"))
+    if total_pages > 1:
+        nav.append(InlineKeyboardButton(f"🟢 {page+1}/{total_pages} 🟢", callback_data="ignore"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"page#{session_id}#{page+1}"))
+    if nav:
+        buttons.append(nav)
+
+    return buttons, page, total_pages
+
+
 async def _auto_delete_search(status_msg, original_msg, manual_query):
     await asyncio.sleep(300)
     try:
@@ -161,6 +341,7 @@ def _build_caption(config, file_data, delete_minutes, bot_username):
         except (KeyError, ValueError):
             pass
 
+    title, year = _display_title(file_data.get("file_name", ""))
     f_lang, f_qual = extract_attributes(file_data.get("file_name", ""))
     size_mb  = file_data.get("file_size", 0) / (1024 * 1024)
     size_str = f"{size_mb / 1024:.2f} GB" if size_mb >= 1024 else f"{size_mb:.0f} MB"
@@ -170,18 +351,20 @@ def _build_caption(config, file_data, delete_minutes, bot_username):
         "Hindi": "🇮🇳", "English": "🌍", "Kannada": "🏵",
         "Dual Audio": "🎧", "Multi Audio": "🎵"
     }
-    meta_parts = [f"📦 {size_str}"]
+    meta_parts = []
     if f_lang not in ["Other", ""]:
         meta_parts.append(f"{lang_emojis.get(f_lang, '🎬')} {f_lang}")
     if f_qual not in ["Other", ""]:
         meta_parts.append(f"🎞 {f_qual}")
-    meta_line = "   ".join(meta_parts)
+    meta_parts.append(f"📦 {size_str}")
+    meta_line = "  ·  ".join(meta_parts)
+
+    title_line = f"🎬 <b>{_html(title)}{f' ({year})' if year else ''}</b>"
 
     return (
-        f"🎬 <b>{_html(file_data['file_name'])}</b>\n\n"
+        f"{title_line}\n\n"
         f"{meta_line}\n\n"
-        f"⚠️ Deletes in {delete_minutes} min — forward to Saved Messages to keep it\n\n"
-        f"@{bot_username}"
+        f"⏳ Auto-deletes in {delete_minutes} min — forward to Saved Messages to keep it"
     )
 
 
@@ -250,28 +433,52 @@ async def _render_results_view(client, message, session_id: str, page: int, data
     _del_mins = max(1, _del_secs // 60)
 
     has_series = _has_series_content(results)
-    buttons = []
 
-    if has_series and not series_expanded:
-        page, total_pages = 0, 1
+    # A single, unambiguous match gets a direct "hero" card instead of the
+    # list view — still exactly one tap to the file, same sendfile#
+    # callback and verification-gate path as every other result.
+    if total == 1 and not has_series:
+        f = results[0]
+        title, year = _display_title(f["file_name"])
+        meta = _variant_label(f, show_title=False)
+        caption = (
+            f"🎬 <b>{_html(title)}{f' ({year})' if year else ''}</b>\n"
+            f"{meta}\n\n"
+            f"Auto-deletes in {_del_mins} min"
+        )
+        buttons = [
+            [InlineKeyboardButton("⬇️ Download Now", callback_data=f"sendfile#{f['_id']}")],
+            [InlineKeyboardButton("🏠 Home", callback_data="start_home")],
+        ]
+        markup = InlineKeyboardMarkup(buttons)
     else:
-        file_buttons, page, total_pages = _build_result_buttons(results, session_id, page)
-        buttons.extend(file_buttons)
+        buttons = []
 
-    caption  = f"🔍 <code>{_html(query)}</code>\n\n"
-    caption += f"{total} files · Page {page+1}/{total_pages} · Auto-deletes in {_del_mins} min\n\n"
+        if has_series and not series_expanded:
+            page, total_pages = 0, 1
+        elif has_series:
+            file_buttons, page, total_pages = _build_result_buttons(results, session_id, page)
+            buttons.extend(file_buttons)
+        else:
+            file_buttons, page, total_pages = _build_movie_result_buttons(results, session_id, page)
+            buttons.extend(file_buttons)
 
-    if has_series and not series_expanded:
-        caption += "Grouped as a series — tap to see every episode:"
-        buttons.append([InlineKeyboardButton(
-            f"📺 View All Episodes ({total} found)",
-            callback_data=f"expandseries#{session_id}"
-        )])
-    else:
-        caption += "Tap a file below to receive it in your PM"
+        caption = (
+            f"🎬 Results for \"{_html(query)}\"\n"
+            f"{total} found · auto-deletes in {_del_mins} min\n\n"
+        )
 
-    buttons.append([InlineKeyboardButton("🏠 Home", callback_data="start_home")])
-    markup = InlineKeyboardMarkup(buttons)
+        if has_series and not series_expanded:
+            caption += "Grouped as a series — tap to see every episode:"
+            buttons.append([InlineKeyboardButton(
+                f"📺 View All Episodes ({total} found)",
+                callback_data=f"expandseries#{session_id}"
+            )])
+        else:
+            caption += "Tap a file to receive it in your PM"
+
+        buttons.append([InlineKeyboardButton("🏠 Home", callback_data="start_home")])
+        markup = InlineKeyboardMarkup(buttons)
 
     # Results render as plain text only now — there's no TMDB poster to
     # upgrade a status message into a photo with. The media-message branch
@@ -395,28 +602,33 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
             ))
 
         suggestions = await db.get_prefix_suggestions(query, limit=3)
-        sug_buttons = [
-            [InlineKeyboardButton("🔎 Correct Spelling (Google)", url=google_url)]
-        ]
+        sug_row = []
         for sug in suggestions:
             safe_sug = re.sub(r"[^a-zA-Z0-9]", "_", sug)[:40]
-            sug_buttons.append([InlineKeyboardButton(
-                f"💡 {sug[:30]}",
+            sug_row.append(InlineKeyboardButton(
+                f"💡 {sug[:20]}",
                 url=f"https://t.me/{client.me.username}?start=search_{safe_sug}"
-            )])
+            ))
 
+        sug_buttons = [sug_row] if sug_row else []
         sug_buttons += [
-            [InlineKeyboardButton("📝 Request This Movie", callback_data=f"reqmovie#{safe_query}")],
+            [InlineKeyboardButton("📝 Request This Movie", callback_data=f"reqmovie#{safe_query}"),
+             InlineKeyboardButton("🔎 Google", url=google_url)],
             [InlineKeyboardButton("🏠 Home", callback_data="start_home")]
         ]
 
-        return await message.reply_text(
-            f"🔍 No matches for <code>{_html(query)}</code>\n\n"
-            f"It may not be uploaded yet, or there's a typo — try a spelling "
-            f"suggestion below, or request it directly.",
+        no_results_msg = await message.reply_text(
+            f"🔍 Nothing found for <code>{_html(query)}</code>\n\n"
+            f"It's probably not uploaded yet — try a suggestion below, or "
+            f"request it and we'll notify you the moment it's added.",
             reply_markup=InlineKeyboardMarkup(sug_buttons),
             parse_mode=ParseMode.HTML, **_no_preview()
         )
+        # Previously left in chat forever — no cleanup path existed for a
+        # PM no-results screen. Reuses the same auto-delete/ manual_query
+        # convention as a successful search so the two behave consistently.
+        asyncio.create_task(_auto_delete_search(no_results_msg, message, manual_query))
+        return
 
     time_taken = time.time() - start_time
     await db.clear_old_searches()
@@ -434,7 +646,7 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
     }
     await db.save_search(session_id, session_data)
 
-    status_msg = await message.reply_text("🔍", quote=True)
+    status_msg = await message.reply_text("🔍 Searching…", quote=True)
     await show_results(client, status_msg, session_id, 0)
     asyncio.create_task(_auto_delete_search(status_msg, message, manual_query))
 
@@ -514,6 +726,23 @@ async def send_movie_file(client: Client, callback: CallbackQuery):
         logger.error(f"send_cached_media failed: {e}")
 
 
+async def _fsub_needs_join(client, channel_id, user_id) -> bool:
+    """True if this user still needs to join channel_id — same per-channel
+    try/except semantics check_fsub_callback always used: KICKED/BANNED/LEFT
+    or UserNotParticipant means still needs to join; any other error is
+    treated as already-joined (fail open, consistent with
+    utils.is_subscribed elsewhere)."""
+    try:
+        ch = int(channel_id) if str(channel_id).lstrip('-').isdigit() else str(channel_id)
+        member = await client.get_chat_member(ch, user_id)
+        return member.status.name in ["KICKED", "BANNED", "LEFT"]
+    except UserNotParticipant:
+        return True
+    except Exception as e:
+        logger.warning(f"FSub check error on channel {channel_id}: {e}")
+        return False
+
+
 @Client.on_callback_query(filters.regex(r"^check_fsub#"))
 async def check_fsub_callback(client: Client, callback: CallbackQuery):
     file_part       = callback.data.split("#")[1]
@@ -523,24 +752,32 @@ async def check_fsub_callback(client: Client, callback: CallbackQuery):
     channels = config.get("fsub_channels", [])
     user_id  = callback.from_user.id
 
-    remaining = []
+    # Parse first, preserving each channel's original 1-based position (i)
+    # in `channels` for the "Channel {i}" fallback name below, exactly as
+    # the old sequential loop did.
+    valid = []
     for i, entry in enumerate(channels, 1):
         channel_id, _ = _parse_fsub_entry(entry)
-        if not channel_id:
-            continue
+        if channel_id:
+            valid.append((i, entry, channel_id))
 
-        # Same membership check as utils.is_subscribed, per-channel so we can
-        # report exactly which channels are still outstanding.
-        try:
-            ch = int(channel_id) if str(channel_id).lstrip('-').isdigit() else str(channel_id)
-            member = await client.get_chat_member(ch, user_id)
-            if member.status.name not in ["KICKED", "BANNED", "LEFT"]:
-                continue  # already joined
-        except UserNotParticipant:
-            pass
-        except Exception as e:
-            logger.warning(f"FSub check error on channel {channel_id}: {e}")
-            continue  # treat as joined on error, consistent with is_subscribed
+    # Membership checks are independent Telegram API calls — run them
+    # concurrently instead of one at a time.
+    raw_flags = await asyncio.gather(
+        *[_fsub_needs_join(client, channel_id, user_id) for _, _, channel_id in valid],
+        return_exceptions=True
+    ) if valid else []
+    # _fsub_needs_join already fails open (returns False = "doesn't need to
+    # join") on any error internally — same defense-in-depth reasoning as
+    # req_fsub.py's gather calls: this should never actually see an
+    # exception object, but guards against a future change silently
+    # breaking the fail-open guarantee.
+    needs_join_flags = [False if isinstance(r, BaseException) else r for r in raw_flags]
+
+    remaining = []
+    for (i, entry, channel_id), needs_join in zip(valid, needs_join_flags):
+        if not needs_join:
+            continue  # already joined
 
         # Same join-link resolution as utils.send_fsub_message.
         try:

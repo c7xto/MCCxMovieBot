@@ -189,11 +189,31 @@ async def _collect_outstanding_gates(client, user_id: int):
     # so they all fit on one combined screen instead of a sequential chain.
     req_channels = config.get("req_fsub_channels", [])
     if req_channels and await db.check_req_fsub_due(user_id):
-        unjoined = []
-        for entry in req_channels:
-            channel_id = entry.get("id") if isinstance(entry, dict) else entry
-            if channel_id and not await _has_requested_or_joined(client, channel_id, user_id):
-                unjoined.append((entry, channel_id))
+        # Membership checks are independent Telegram API calls — run them
+        # concurrently instead of one at a time, same result, lower latency
+        # on the file-delivery critical path. Falsy channel_id entries are
+        # filtered out first so they're never awaited, matching the
+        # original loop's "if channel_id and not await ..." short-circuit.
+        candidates = [
+            (entry, entry.get("id") if isinstance(entry, dict) else entry)
+            for entry in req_channels
+        ]
+        candidates = [(entry, cid) for entry, cid in candidates if cid]
+        raw_flags = await asyncio.gather(
+            *[_has_requested_or_joined(client, cid, user_id) for _, cid in candidates],
+            return_exceptions=True
+        ) if candidates else []
+        # _has_requested_or_joined already fails open (returns True) on any
+        # error internally, so raw_flags should never actually contain an
+        # exception object — return_exceptions=True plus this fallback is
+        # defense-in-depth so a future change to that function can't turn
+        # one bad channel into an unhandled exception that aborts the whole
+        # gate check instead of failing open like every other error path here.
+        joined_flags = [True if isinstance(r, BaseException) else r for r in raw_flags]
+        unjoined = [
+            (entry, cid) for (entry, cid), joined in zip(candidates, joined_flags)
+            if not joined
+        ]
         if unjoined:
             # Resets the due-interval the moment the gate is shown, so a
             # user who ignores it isn't re-prompted again mid-interval.
@@ -208,11 +228,20 @@ async def _collect_outstanding_gates(client, user_id: int):
     # joined yet; both at once rather than gated Step 1 -> Step 2.
     active_two_stage = [c for c in config.get("two_stage_channels", []) if c]
     if len(active_two_stage) >= 2 and await db.check_two_stage_due(user_id):
-        unjoined_stage = []
-        for entry in active_two_stage:
-            channel_id = entry.get("id") if isinstance(entry, dict) else entry
-            if not await _has_requested_or_joined(client, channel_id, user_id):
-                unjoined_stage.append(entry)
+        # Same concurrency treatment as the Request-FSub block above.
+        stage_ids = [
+            entry.get("id") if isinstance(entry, dict) else entry
+            for entry in active_two_stage
+        ]
+        raw_flags = await asyncio.gather(
+            *[_has_requested_or_joined(client, cid, user_id) for cid in stage_ids],
+            return_exceptions=True
+        )
+        # Same defense-in-depth fallback as the Request-FSub block above.
+        joined_flags = [True if isinstance(r, BaseException) else r for r in raw_flags]
+        unjoined_stage = [
+            entry for entry, joined in zip(active_two_stage, joined_flags) if not joined
+        ]
         if unjoined_stage:
             for entry in unjoined_stage:
                 channel_id = entry.get("id") if isinstance(entry, dict) else entry
@@ -251,8 +280,8 @@ async def check_verification_gates(client, event, file_obj_id: str) -> bool:
         return True
 
     text = (
-        f"🔐 <b>One more step — {len(missing)} channel(s) to join</b>\n\n"
-        f"<blockquote>Join everything below, then tap "
+        f"🔐 <b>Almost there — join {len(missing)} channel(s) to unlock this file</b>\n\n"
+        f"<blockquote>Tap each one below, then hit "
         f"<b>✅ Continue</b>.</blockquote>"
     )
     markup = _gates_markup(missing, file_obj_id)
@@ -279,7 +308,7 @@ async def vgate_check_callback(client: Client, callback: CallbackQuery):
         try:
             await callback.message.edit_text(
                 f"🔐 <b>Still missing {len(missing)} channel(s)</b>\n\n"
-                f"<blockquote>Join everything below, then tap "
+                f"<blockquote>Tap each one below, then hit "
                 f"<b>✅ Continue</b>.</blockquote>",
                 reply_markup=_gates_markup(missing, file_obj_id),
                 parse_mode=ParseMode.HTML

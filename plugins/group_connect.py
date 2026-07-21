@@ -4,6 +4,7 @@ import random
 import string
 import asyncio
 import logging
+from collections import OrderedDict
 from urllib.parse import quote
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode, ChatAction
@@ -13,8 +14,8 @@ from pyrogram.types import (
 )
 from database.db import db
 from plugins.filter import (
-    send_smart_log, extract_attributes, _fmt_size,
-    _sort_results, clean_query, LANG_EMOJI
+    send_smart_log, _sort_results, clean_query, LANG_EMOJI,
+    _display_title, _variant_label
 )
 from plugins.health_monitor import _log_task_crash
 from utils import _no_preview, _html
@@ -27,35 +28,26 @@ logger = logging.getLogger(__name__)
 def _build_group_buttons(page_files, client_username, session_id, page,
                           total, total_pages):
     """
-    Build the same file-button rows as filter.py, but each button is a URL
-    that opens the bot DM and sends the file (via ?start=file_<id>).
+    Build the same title-grouped, clean-label button rows as filter.py's
+    _build_movie_result_buttons(), but each button is a URL that opens the
+    bot DM and sends the file (via ?start=file_<id>) instead of a callback,
+    since group chats deliver via PM handoff, not directly. Every button is
+    independently tappable and self-labeled — no non-clickable header row.
     """
-    buttons = []
+    groups = OrderedDict()
     for f in page_files:
-        f_lang, f_qual = extract_attributes(f["file_name"])
-        size_str = _fmt_size(f)
-        name = re.sub(r'\s+', ' ', f["file_name"]).strip()
+        title, year = _display_title(f["file_name"])
+        key = title.lower()
+        if key not in groups:
+            groups[key] = {"title": title, "year": year, "files": []}
+        groups[key]["files"].append(f)
 
-        meta_parts = []
-        if f_qual not in ["Other", ""]:
-            meta_parts.append(f_qual)
-        if f_lang not in ["Other", ""]:
-            meta_parts.append(f_lang)
-
-        meta     = " | ".join(meta_parts)
-        size_tag = f"[{size_str}]"
-
-        if meta:
-            available = 48 - len(size_tag) - len(meta) - 4
-            truncated = name[:max(10, available)] + ("…" if len(name) > max(10, available) else "")
-            btn_text  = f"{size_tag} {truncated} | {meta}"
-        else:
-            available = 52 - len(size_tag) - 1
-            truncated = name[:available] + ("…" if len(name) > available else "")
-            btn_text  = f"{size_tag} {truncated}"
-
-        bot_url = f"https://t.me/{client_username}?start=file_{f['_id']}"
-        buttons.append([InlineKeyboardButton(btn_text, url=bot_url)])
+    buttons = []
+    for group in groups.values():
+        for f in group["files"]:
+            label = _variant_label(f, show_title=True, title=group["title"], year=group["year"])
+            bot_url = f"https://t.me/{client_username}?start=file_{f['_id']}"
+            buttons.append([InlineKeyboardButton(label, url=bot_url)])
 
     # Navigation row — pagination goes back to DM full search for group
     nav = []
@@ -82,10 +74,11 @@ def _build_group_buttons(page_files, client_username, session_id, page,
 def _build_caption(query, total, speed, del_mins):
     """Search-results caption for the group chat — same minimal style as
     filter.py's _render_results_view, adapted for the single-page group view."""
-    caption  = f"🔍 <code>{_html(query)}</code>\n\n"
-    caption += f"{total} files · Auto-deletes in {del_mins} min\n\n"
-    caption += "Tap a file below to receive it in your PM"
-    return caption
+    return (
+        f"🎬 Results for \"{_html(query)}\"\n"
+        f"{total} found · auto-deletes in {del_mins} min\n\n"
+        f"Tap a file to receive it in your PM"
+    )
 
 
 def _is_whitelist_ok(config: dict, group_doc) -> bool:
@@ -231,12 +224,12 @@ async def group_search(client: Client, message: Message):
         google_url = f"https://www.google.com/search?q={quote(query)}"
         markup = InlineKeyboardMarkup([
             [InlineKeyboardButton("📝 Request This Movie",
-             url=f"https://t.me/{client.me.username}?start=req_{safe_query}")],
-            [InlineKeyboardButton("🔍 Search on Google", url=google_url)]
+             url=f"https://t.me/{client.me.username}?start=req_{safe_query}"),
+             InlineKeyboardButton("🔎 Google", url=google_url)]
         ])
         not_found_msg = await message.reply_text(
-            f"🔍 No results for <code>{query}</code>\n\n"
-            f"It may not be uploaded yet — check the spelling or tap Request below.",
+            f"🔍 Nothing found for <code>{query}</code>\n\n"
+            f"It's probably not uploaded yet — tap Request below and we'll notify you.",
             reply_markup=markup, quote=True, parse_mode=ParseMode.HTML,
             **_no_preview()
         )
@@ -278,16 +271,34 @@ async def group_search(client: Client, message: Message):
     total_pages = max(1, (total + per_page - 1) // per_page)
     page_files  = sorted_files[:per_page]
 
-    caption = _build_caption(query, total, speed, _del_mins)
-    buttons = _build_group_buttons(
-        page_files, client.me.username, session_id, 0, total, total_pages
-    )
-    buttons.append([InlineKeyboardButton(
-        "🤖 Open Bot", url=f"https://t.me/{client.me.username}"
-    )])
+    # A single, unambiguous match gets a direct "Get It Now" card instead of
+    # the list view — still exactly one tap (opens PM, delivers the file),
+    # same deep-link/gating path as every other result.
+    if total == 1:
+        f = sorted_files[0]
+        title, year = _display_title(f["file_name"])
+        meta = _variant_label(f, show_title=False)
+        caption = (
+            f"🎬 <b>{_html(title)}{f' ({year})' if year else ''}</b>\n"
+            f"{meta}\n\n"
+            f"Auto-deletes in {_del_mins} min"
+        )
+        bot_url = f"https://t.me/{client.me.username}?start=file_{f['_id']}"
+        buttons = [
+            [InlineKeyboardButton("⬇️ Get It Now", url=bot_url)],
+            [InlineKeyboardButton("🤖 Open Bot", url=f"https://t.me/{client.me.username}")],
+        ]
+    else:
+        caption = _build_caption(query, total, speed, _del_mins)
+        buttons = _build_group_buttons(
+            page_files, client.me.username, session_id, 0, total, total_pages
+        )
+        buttons.append([InlineKeyboardButton(
+            "🤖 Open Bot", url=f"https://t.me/{client.me.username}"
+        )])
     markup = InlineKeyboardMarkup(buttons)
 
-    status_msg = await message.reply_text("🔍", quote=True)
+    status_msg = await message.reply_text("🔍 Searching…", quote=True)
     try:
         await status_msg.edit_text(
             text=caption, reply_markup=markup, parse_mode=ParseMode.HTML

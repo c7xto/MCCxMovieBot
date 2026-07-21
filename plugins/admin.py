@@ -6,13 +6,14 @@ from dotenv import load_dotenv
 from pyrogram import ContinuePropagation, StopPropagation
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait
+from pyrogram.enums import ParseMode
 from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton,
     CallbackQuery
 )
 from database.db import db
 from plugins.state import get_state as _get_state_fn, set_state as _set_state_fn, clear_state as _clear_state_fn
-from utils import ADMIN_ID, _no_preview
+from utils import ADMIN_ID, _no_preview, HELP_STEPS_EN, HELP_FOOTER_EN
 
 # load_dotenv() here so ADMIN_ID is populated before module-level filter decorators run
 load_dotenv()
@@ -1134,18 +1135,13 @@ async def stats_cmd(client: Client, message: Message):
 
 @Client.on_message(filters.command("help"))
 async def help_cmd(client: Client, message: Message):
+    steps = "\n".join(f"{i}. {s}" for i, s in enumerate(HELP_STEPS_EN, 1))
     help_text = (
-        f"📖 **How to use MCCxBot**\n\n"
-        f"<blockquote>"
-        f"1. Type a movie or series name\n"
-        f"2. Select your language\n"
-        f"3. Pick your preferred quality\n"
-        f"4. Tap the file — it's sent to your PM instantly"
-        f"</blockquote>\n\n"
+        f"📖 <b>How to use MCCxBot</b>\n\n"
+        f"<blockquote>{steps}</blockquote>\n\n"
         f"🎬 <b>Examples:</b>\n"
         f"<code>Leo</code>  •  <code>Aadujeevitham</code>  •  <code>KGF 2</code>\n\n"
-        f"❓ Can\'t find it? Use the <b>Request</b> button and we\'ll upload "
-        f"it within 24 hours."
+        f"❓ {HELP_FOOTER_EN}"
     )
 
     is_group = message.chat.type.name in ["GROUP", "SUPERGROUP"]

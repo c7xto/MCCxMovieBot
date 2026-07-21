@@ -1,9 +1,35 @@
 import os
 import re
+import time
+import asyncio
+from collections import OrderedDict
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.errors import InputUserDeactivated, UserIsBlocked
 from database.db import db
+
+# Per-user request cooldown — same bounded-LRU pattern and naming style as
+# filter.py's USER_SEARCH_COOLDOWN/_COOLDOWN_MAX/COOLDOWN_TIME, applied to
+# /request and the "Request This Movie" button so both entry points share
+# one spam guard (enforced once, inside send_request_ticket() below,
+# instead of duplicated in each handler).
+_COOLDOWN_MAX = 10000
+USER_REQUEST_COOLDOWN = OrderedDict()  # LRU: oldest entry is first
+COOLDOWN_TIME = 30  # seconds — long enough to stop rapid-fire spam, short
+                    # enough that requesting a few different titles in one
+                    # sitting is never blocked
+
+
+async def _delayed_delete(msg, delay=2):
+    """Background auto-delete for the transient cooldown warning — fire-
+    and-forget via create_task (see call site), matching every other
+    auto-delete in this codebase, instead of an inline blocking sleep that
+    would hold the handler open for 2 extra seconds doing nothing useful."""
+    await asyncio.sleep(delay)
+    try:
+        await msg.delete()
+    except Exception:
+        pass
 
 # ── /request command ──────────────────────────────────────────────────────────
 @Client.on_message(filters.command("request") & filters.private)
@@ -23,6 +49,23 @@ async def handle_movie_request(client: Client, callback: CallbackQuery):
 
 # ── Ticket generator ────────────────────────────────────────────────────────────
 async def send_request_ticket(client, user, movie_name, message_obj, is_callback=False):
+    current_time = time.time()
+    if user.id in USER_REQUEST_COOLDOWN:
+        passed = current_time - USER_REQUEST_COOLDOWN[user.id]
+        USER_REQUEST_COOLDOWN.move_to_end(user.id)
+        if passed < COOLDOWN_TIME:
+            wait_msg = await message_obj.reply_text(
+                f"⏳ Wait `{int(COOLDOWN_TIME - passed) + 1}s` before submitting another request.",
+                quote=not is_callback
+            )
+            asyncio.create_task(_delayed_delete(wait_msg))
+            return
+
+    if len(USER_REQUEST_COOLDOWN) >= _COOLDOWN_MAX:
+        USER_REQUEST_COOLDOWN.popitem(last=False)  # evict least-recently-used
+    USER_REQUEST_COOLDOWN[user.id] = current_time
+    USER_REQUEST_COOLDOWN.move_to_end(user.id)
+
     config = await db.get_config()
     log_channel = config.get("log_channel", 0)
     

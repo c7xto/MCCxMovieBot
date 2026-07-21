@@ -6,7 +6,7 @@ import random
 import string
 from dotenv import load_dotenv
 from plugins.filter import route_menu
-from utils import _no_preview, _html
+from utils import _no_preview, _html, HELP_STEPS_EN, HELP_FOOTER_EN
 from pyrogram import Client, filters
 from pyrogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, Message
 from pyrogram.enums import ParseMode, ChatAction
@@ -53,13 +53,8 @@ LANG_STRINGS = {
             "Tap the file you want",
             "It lands in this chat instantly",
         ],
-        "help_steps": [
-            "Type a movie or series name",
-            "Select your language",
-            "Pick your preferred quality",
-            "Tap the file — it's sent to your PM",
-        ],
-        "help_footer": "Can't find it? Use the Request button and we'll upload it within 24h.",
+        "help_steps": HELP_STEPS_EN,
+        "help_footer": HELP_FOOTER_EN,
         "no_results": "No matches for <code>{query}</code>\n\nIt may not be uploaded yet, or there's a typo in the name.",
     },
     "ml": {
@@ -77,9 +72,8 @@ LANG_STRINGS = {
         ],
         "help_steps": [
             "സിനിമ/സീരീസ് പേര് ടൈപ്പ് ചെയ്യുക",
-            "ഭാഷ തിരഞ്ഞെടുക്കുക",
-            "ക്വാളിറ്റി തിരഞ്ഞെടുക്കുക",
-            "ഫയൽ ടാപ്പ് ചെയ്യുക — ഇത് നിങ്ങളുടെ PM-ൽ ലഭിക്കും",
+            "വേണ്ട ഫയൽ ടാപ്പ് ചെയ്യുക",
+            "ഇത് ഉടൻ നിങ്ങളുടെ PM-ൽ ലഭിക്കും",
         ],
         "help_footer": "കിട്ടിയില്ലേ? Request ബട്ടൺ ഉപയോഗിക്കൂ — 24 മണിക്കൂറിനുള്ളിൽ അപ്‌ലോഡ് ചെയ്യാം.",
         "no_results": "<code>{query}</code> എന്നതിന് ഫലങ്ങളൊന്നും ലഭിച്ചില്ല\n\nഇത് ഇതുവരെ അപ്‌ലോഡ് ചെയ്തിട്ടില്ലായിരിക്കാം, അല്ലെങ്കിൽ അക്ഷരത്തെറ്റ് ഉണ്ടാകാം.",

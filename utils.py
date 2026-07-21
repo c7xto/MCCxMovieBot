@@ -1,4 +1,6 @@
 import os
+import time
+import asyncio
 import logging
 from dotenv import load_dotenv
 from pyrogram.errors import UserNotParticipant
@@ -27,6 +29,62 @@ def _html(text) -> str:
 # list so multi-admin setups (ADMIN_ID=123,456) work everywhere, not just
 # in broadcast.py. Import this everywhere instead of re-parsing os.getenv.
 ADMIN_ID = [int(x.strip()) for x in os.getenv("ADMIN_ID", "0").split(",") if x.strip()]
+
+# Canonical help copy — single source both /help (admin.py) and the "ℹ️ Help"
+# button (start.py) build from, so the two surfaces can't silently diverge
+# again. English only — start.py's Malayalam translation is maintained
+# separately since it's hand-translated, not derived from this.
+HELP_STEPS_EN = [
+    "Type a movie or series name",
+    "Tap the file you want",
+    "It's sent straight to your PM",
+]
+HELP_FOOTER_EN = "Can't find it? Use the <b>Request</b> button and we'll upload it within 24h."
+
+# TTL-cached wrapper around db.get_total_files() — send_fsub_message() calls
+# this on every message from a not-yet-subscribed user, and a live count is a
+# full fan-out across every configured cluster just to render cosmetic
+# "unlock X files" copy.
+_total_files_cache = None
+_total_files_cache_ts = 0.0
+_TOTAL_FILES_TTL = 60  # seconds
+# Guards the refresh path so a cold/expired cache under concurrent traffic
+# triggers exactly one db.get_total_files() call — every other caller
+# waiting on the lock sees the now-fresh cache on re-check instead of firing
+# its own redundant cross-cluster fan-out.
+_total_files_lock = asyncio.Lock()
+
+
+async def _get_total_files_cached() -> int:
+    global _total_files_cache, _total_files_cache_ts
+    now = time.time()
+    if _total_files_cache is not None and (now - _total_files_cache_ts) < _TOTAL_FILES_TTL:
+        return _total_files_cache
+
+    async with _total_files_lock:
+        # Re-check — another coroutine may have already refreshed the cache
+        # while this one was waiting for the lock.
+        now = time.time()
+        if _total_files_cache is not None and (now - _total_files_cache_ts) < _TOTAL_FILES_TTL:
+            return _total_files_cache
+
+        total = await db.get_total_files()
+        # db.get_total_files() swallows per-cluster failures into a 0
+        # contribution instead of raising, so a 0 here is ambiguous between
+        # "genuinely empty library" and "every cluster just failed". A drop
+        # from a previously-known-good non-zero count to 0 within one
+        # refresh cycle is a failure artifact, not real data (a library
+        # doesn't lose everything in under a minute) — so a 0 is only
+        # trusted (and cached) when there's no prior good value to protect:
+        # the very first fetch, or the cache already held 0. Otherwise the
+        # stale-but-plausible cached value is returned and the timestamp is
+        # left untouched, so the next call retries instead of serving a
+        # wrong number for the rest of the TTL window.
+        if total > 0 or not _total_files_cache:
+            _total_files_cache = total
+            _total_files_cache_ts = now
+            return total
+        return _total_files_cache
 
 
 def _parse_fsub_entry(entry):
@@ -138,16 +196,16 @@ async def send_fsub_message(client, message, pending_file_id=None):
     markup = InlineKeyboardMarkup(buttons)
 
     mention = message.from_user.mention if message.from_user else "there"
-    # Get file count for unlock framing
+    # Get file count for unlock framing — cached, see _get_total_files_cached above
     try:
-        total_files = await db.get_total_files()
+        total_files = await _get_total_files_cached()
         files_str = f"{total_files:,}"
     except Exception:
         files_str = "millions of"
 
     text = (
         f"🔐 <b>One step away!</b>\n\n"
-        f"Join our channel to unlock {files_str} files — free forever.\n\n"
+        f"Join our channel to unlock {files_str} files, free forever.\n\n"
         f"<blockquote>Tap join, then tap <b>✅ Done — Let Me In</b></blockquote>"
     )
     await message.reply_text(
