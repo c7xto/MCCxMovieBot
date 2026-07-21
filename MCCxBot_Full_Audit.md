@@ -3,7 +3,20 @@
 Every `.py` file (bot.py, utils.py, tmdb.py, database/db.py, all 15 files in
 plugins/, both tools/ scripts) plus README.md, BOT_FEATURES.md and
 BOT_BLUEPRINT.md were read in full before writing this. Line numbers below
-refer to the current state of the files on disk.
+refer to the state of the files on disk at the time this audit was written.
+
+> **Status update:** the 🔴 Critical bugs (#1-#3), the 🟠 High orphaned-feature
+> bugs #4/#5/#6, the dead `duplicate_scan_results` write (#7), the
+> `index.py`/`indexer.py` rename (#11), the `dbstats` caching gap (#16), the
+> self-updater's unpinned-branch risk (Phase 6), and the missing TMDB cache
+> (Phase 5 #2) were **all fixed in the very next commit** after this audit was
+> written, before this file was added to the repo. Those sections below are
+> kept as-written for the historical record of what was found and why it
+> mattered; each fixed item is now marked accordingly. File paths that
+> changed as part of the fix (`index.py` → `bulk_indexer.py`, `indexer.py` →
+> `realtime_indexer.py`) have been updated so path references stay valid.
+> Everything not called out as fixed here is still open. See
+> `ARCHITECTURE_PROPOSAL.md` for the follow-on work scoped after this pass.
 
 **Top-line verdict:** this is not a typical "vibe-coded" Telegram bot. The
 codebase already shows real engineering discipline — a centralized
@@ -38,13 +51,13 @@ plugins/
   filter.py (796)         PM search + file delivery (the core handler)
   file_manager.py (634)   duplicate/bulk-delete/migrate/rename tools
   group_manager.py (412)  group ban/whitelist/settings admin screens
-  index.py (392)          bulk "Super-Indexer" (forward → index a channel)
+  bulk_indexer.py (392)   bulk "Super-Indexer" (forward → index a channel)
   group_connect.py (376)  group search + bot-added-to-group welcome
   req_fsub.py (397)       Request-FSub + Two-Stage Verification gates
   start.py (365)          /start, deep-link router, home panel
   updater.py (214)        GitHub self-updater (os.execv restart)
   broadcast.py (223)      /broadcast to users/groups, schedule, preview
-  indexer.py (287)        real-time indexer + rate-limited auto-poster
+  realtime_indexer.py (287) real-time indexer + rate-limited auto-poster
   health_monitor.py (178) cluster ping loop, cache reaper, crash logger
   welcome.py (86)         group welcome via chat_member_updated
   request.py (102)        /request ticket + manual "mark uploaded"
@@ -182,8 +195,8 @@ plugins/group_connect.py
 plugins/req_fsub.py
  └─ database.db, plugins.filter (_build_caption, _auto_delete_file — local import)
 
-plugins/index.py            → database.db, utils.ADMIN_ID, plugins.filter.send_smart_log, plugins.health_monitor
-plugins/indexer.py           → database.db, tmdb, plugins.health_monitor
+plugins/bulk_indexer.py      → database.db, utils.ADMIN_ID, plugins.filter.send_smart_log, plugins.health_monitor
+plugins/realtime_indexer.py  → database.db, tmdb, plugins.health_monitor
 plugins/admin.py             → database.db, plugins.state, utils.ADMIN_ID, plugins.health_monitor.check_all_channels
 plugins/file_manager.py      → database.db, plugins.state, plugins.health_monitor, utils.ADMIN_ID
 plugins/group_manager.py     → database.db, plugins.state, utils.ADMIN_ID
@@ -213,18 +226,18 @@ to read about.
 
 | # | File / Line | Problem | Why it's bad | Fix |
 |---|---|---|---|---|
-| 1 | `database/db.py:460-501` `save_files_bulk()` | When **every** cluster's pre-check (`size >= 450`) trips, the function returns `(0, duplicates)` normally — it never raises. | `plugins/index.py`'s `run_indexer()` (lines 138-143) only detects "database full" by pattern-matching an **exception message** (`"space quota"`/`"over your space"`). Since the common case (the deliberate 450MB safety margin) never raises, the bulk indexer runs a channel to 100% completion, reports "🎉 SUPER-INDEX COMPLETE!", and silently saved **zero** files once all clusters fill — with no "add a new cluster" message, ever, for this path. Only the rarer case of Mongo itself throwing a real quota exception is reported correctly. | Make the pre-check-full case return a distinct sentinel (e.g. `(0, duplicates, all_full=True)`) or raise a dedicated `AllClustersFullError`, and have `run_indexer` treat it identically to the exception-path "Database Full" branch it already has. |
-| 2 | `plugins/indexer.py:197-241` `index_new_files()` | `success, return_msg = await db.save_file(media)` — the `if log_channel and success:` and `if success:` blocks both simply do nothing when `success` is `False`. | Real-time single-file indexing has **zero failure path**. If clusters fill up during normal operation, every new upload to the DB channel vanishes from the index with no admin notification at all — worse than bug #1, because this is the higher-frequency, ongoing ingestion path (every new upload), not a one-off bulk job. | Add an `else` branch: if `return_msg == "All clusters full"`, send an alert to the log channel (reuse `send_smart_log`) so the admin finds out the moment it happens, not weeks later when a movie can't be found in search. |
-| 3 | `database/db.py:690-715` `migrate_cluster()` | Copies every document from the source cluster's `movies` collection into the destination via `insert_many`, but **never deletes from the source**, and bypasses `file_registry` entirely (inserts directly instead of going through `save_file`/`save_files_bulk`, which the codebase's own blueprint explicitly warns against — BOT_BLUEPRINT.md §3). | The entire point of "Cluster Migration" (admin panel → File Manager → 📦 Cluster Migration) is to relieve a full cluster. As written, it **duplicates storage instead of moving it** — the source cluster's space is never freed (defeating the feature's purpose), and the file now physically exists in two clusters while `file_registry` still only reflects one. Search-facing results are saved from visibly duplicating (because `get_search_results` dedupes by `file_id` after merging), but the underlying storage bug means migrating *accelerates* hitting the 512MB cap on two clusters instead of relieving one. | After a successful `insert_many` into the destination, delete the same batch's `_id`s from the source collection. Route new documents through `_registry_bulk_reserve`-aware logic (or just re-tag them under a note that they're already registered) instead of a raw `insert_many`. |
+| 1 | `database/db.py:442-490` `save_files_bulk()` | ✅ **FIXED.** When **every** cluster's pre-check (`size >= 450`) trips, the function used to return `(0, duplicates)` normally — it never raised. | `plugins/bulk_indexer.py`'s `run_indexer()` only detected "database full" by pattern-matching an **exception message** (`"space quota"`/`"over your space"`). Since the common case (the deliberate 450MB safety margin) never raised, the bulk indexer ran a channel to 100% completion, reported "🎉 SUPER-INDEX COMPLETE!", and silently saved **zero** files once all clusters filled — with no "add a new cluster" message, ever, for this path. | **Done.** `save_files_bulk()` now raises a dedicated `AllClustersFullError(remaining, duplicates)` (`database/db.py:483-488`) when nothing could be stored, instead of returning a silent zero. |
+| 2 | `plugins/realtime_indexer.py:196-250` `index_new_files()` | ✅ **FIXED.** `success, return_msg = await db.save_file(media)` — the `if log_channel and success:` and `if success:` blocks both used to simply do nothing when `success` was `False`. | Real-time single-file indexing had **zero failure path**. If clusters filled up during normal operation, every new upload to the DB channel vanished from the index with no admin notification at all — worse than bug #1, because this is the higher-frequency, ongoing ingestion path (every new upload), not a one-off bulk job. | **Done.** An `elif return_msg == "All clusters full":` branch (`realtime_indexer.py:227-237`) now sends a `send_smart_log` alert to the log channel the moment it happens. |
+| 3 | `database/db.py:670-724` `migrate_cluster()` | ✅ **FIXED.** Copied every document from the source cluster's `movies` collection into the destination via `insert_many`, but used to **never delete from the source**, and bypassed `file_registry` entirely. | The entire point of "Cluster Migration" (admin panel → File Manager → 📦 Cluster Migration) is to relieve a full cluster. As it was written, it **duplicated storage instead of moving it** — the source cluster's space was never freed, and the file physically existed in two clusters while `file_registry` still only reflected one. | **Done.** `migrate_cluster()` now copies each batch, then deletes the same `_id`s from the source collection only after the destination insert is confirmed (`database/db.py:690-713`), with a logged warning if the source-side delete fails so the duplication is at least visible. |
 
 ### 🟠 High — orphaned / dead features (admin believes something is enforced; it isn't)
 
 | # | File / Line | Problem | Why it's bad | Fix |
 |---|---|---|---|---|
-| 4 | `plugins/group_manager.py:374-408` writes `group.settings.auto_delete_time`; `plugins/group_connect.py:259` reads only `config.get("auto_delete_time", 300)` (the **global** default) | The per-group auto-delete override (advertised in BOT_FEATURES.md §8: *"Per-group settings: individual auto-delete time override"*) is fully built on the write side (admin UI, DB field, confirmation message) and **never read** anywhere. `gm_view_settings` even displays the stored value back to the admin, implying it's live. | An admin sets a group's auto-delete to e.g. 2 minutes, sees "✅ Auto-delete for group X set to 2 minute(s)", and every file in that group still deletes after the global default. Trust-breaking once discovered. | In `group_search()`, fetch `group = await db.get_group(message.chat.id)` and prefer `group.get("settings", {}).get("auto_delete_time")` over the global config value. |
-| 5 | `plugins/group_manager.py:247-256` (`gm_toggle_mode`) sets `bot_config.group_whitelist_mode`; **no handler anywhere checks it** | "Whitelist Mode (only approved groups)" is a real, tappable, persisted admin toggle with zero enforcement. `group_connect.py`'s `group_search()` and `auto_connect_group()` only check `is_group_banned()` — never `is_group_whitelisted()` (which exists in `db.py:364-368` and is otherwise unused) or the whitelist mode flag at all. | Any group can use the bot regardless of whitelist state — the admin-facing promise ("only approved groups") is not backed by any code. | Add the check to `auto_connect_group()` (leave non-whitelisted groups immediately when in whitelist mode, same pattern already used for banned groups) and to `group_search()`. |
-| 6 | `database/db.py` `get_config()` default dict seeds `"group_whitelist_enabled": False`, but every actual read/write in the codebase uses a **different** key, `"group_whitelist_mode"` | Config-schema drift: one field is dead weight seeded on every fresh `bot_config` document and never touched again. | Confusing for anyone reading the schema cold (BOT_BLUEPRINT.md's own schema table lists both, without flagging the mismatch). | Delete `group_whitelist_enabled` from the default dict; `group_whitelist_mode` ("whitelist"/"blacklist") is the real field. |
-| 7 | `database/db.py:643-650` inside `find_duplicate_files()` | Drops and rewrites a `duplicate_scan_results` Mongo collection on every admin-triggered scan — but the actual UI (`file_manager.py`'s `_run_duplicate_scan` / `_cached_dupes`) reads the **in-memory return value** of the same function, never the Mongo collection. | Pure write-and-never-read: burns write ops and precious free-tier storage (results can include up to 100 groups × up to 10 IDs each) for a collection nothing ever queries back. | Delete the `dupes_col.drop()` / `insert_many()` block, or repurpose it as an actual audit trail if that's ever wanted (currently it's neither). |
+| 4 | `plugins/group_manager.py:374-408` writes `group.settings.auto_delete_time`; `plugins/group_connect.py:259` used to read only `config.get("auto_delete_time", 300)` (the **global** default) | ✅ **FIXED.** The per-group auto-delete override (advertised in BOT_FEATURES.md §8: *"Per-group settings: individual auto-delete time override"*) was fully built on the write side (admin UI, DB field, confirmation message) and **never read** anywhere. | An admin would set a group's auto-delete to e.g. 2 minutes, see "✅ Auto-delete for group X set to 2 minute(s)", and every file in that group would still delete after the global default. | **Done.** `group_search()` now reads `group.get("settings", {}).get("auto_delete_time")` and falls back to the global config value only when unset (`plugins/group_connect.py:259-260`). |
+| 5 | `plugins/group_manager.py:247-256` (`gm_toggle_mode`) sets `bot_config.group_whitelist_mode`; used to have **no handler anywhere checking it** | ✅ **FIXED.** "Whitelist Mode (only approved groups)" was a real, tappable, persisted admin toggle with zero enforcement. | Any group could use the bot regardless of whitelist state — the admin-facing promise ("only approved groups") wasn't backed by any code. | **Done.** `group_search()` and `auto_connect_group()` in `plugins/group_connect.py:96,118-119` now check `is_group_whitelisted()` against `group_whitelist_mode` before allowing a group through. |
+| 6 | `database/db.py` `get_config()` default dict used to seed `"group_whitelist_enabled": False`, a **different** key than the one actually used, `"group_whitelist_mode"` | ✅ **FIXED.** Config-schema drift: one field was dead weight seeded on every fresh `bot_config` document and never touched again. | Confusing for anyone reading the schema cold. | **Done.** `group_whitelist_enabled` no longer appears in `database/db.py`; `group_whitelist_mode` is the only field now. |
+| 7 | `database/db.py` inside `find_duplicate_files()` | ✅ **FIXED.** Used to drop and rewrite a `duplicate_scan_results` Mongo collection on every admin-triggered scan — but the actual UI (`file_manager.py`'s `_run_duplicate_scan` / `_cached_dupes`) read the **in-memory return value** of the same function, never the Mongo collection. | Pure write-and-never-read: burned write ops and precious free-tier storage for a collection nothing ever queried back. | **Done.** The `duplicate_scan_results` Mongo write is gone from `database/db.py` entirely. |
 | 8 | `database/db.py:68` `admin_id` config field (edited via admin.py's "👤 Set Admin ID") | Writing this field only ever changes what's *displayed* back in the admin panel — actual access control is 100% `ADMIN_ID` from `.env`, parsed once at import time in `utils.py`. `admin.py` line ~918 does warn about this in the confirmation text, so it's not silent, but it's still a footgun for anyone who taps it expecting to add a co-admin. | An operator could reasonably believe they just granted someone admin access and not restart the bot, leaving that person with zero actual access while believing otherwise. | Either wire it to `ADMIN_ID` at runtime (append to the in-memory list, not just Mongo) or remove the field/button entirely and document that admin changes require an env var + restart. |
 
 ### 🟡 Medium — duplicated logic / naming / maintainability
@@ -232,13 +245,13 @@ to read about.
 | # | File / Line | Problem | Fix |
 |---|---|---|---|
 | 9 | `_no_preview()` reimplemented independently in `utils.py:6-11`, `start.py:14-22`, `filter.py:17-22`, `admin.py:33-34` (imported nowhere, redefined ad hoc), `group_connect.py:14-19`, `welcome.py:8-13` | Six copies of the same 6-line `LinkPreviewOptions` compatibility shim. Move to `utils.py` (already defines one) and import it everywhere else instead of re-declaring. |
-| 10 | `_html()` escape helper duplicated in `start.py:43-45`, `filter.py:55-56`, `indexer.py:23-24` (group_connect.py correctly imports it from `filter.py` — the right pattern, just not applied consistently) | Same fix: one shared `utils.py` (or a small `formatting.py`) helper, imported everywhere. |
-| 11 | `plugins/index.py` (bulk "Super-Indexer") vs `plugins/indexer.py` (real-time indexer) | Two files differing by one letter, doing genuinely different things. Easy to grep the wrong one, easy for a new contributor to open the wrong file. Rename to `bulk_indexer.py` / `realtime_indexer.py`. |
+| 10 | `_html()` escape helper duplicated in `start.py:43-45`, `filter.py:55-56`, `realtime_indexer.py:23-24` (group_connect.py correctly imports it from `filter.py` — the right pattern, just not applied consistently) | Same fix: one shared `utils.py` (or a small `formatting.py`) helper, imported everywhere. |
+| 11 | `plugins/index.py` (bulk "Super-Indexer") vs `plugins/indexer.py` (real-time indexer) | ✅ **FIXED.** Two files differing by one letter, doing genuinely different things — easy to grep the wrong one. **Done:** renamed to `plugins/bulk_indexer.py` / `plugins/realtime_indexer.py`. |
 | 12 | `plugins/filter.py:403-405` excludes `"about"` and `"purge_cams"` from the auto-filter catch-all — neither command exists (`purge_cams` was explicitly removed per `admin.py`'s own comment at line ~1045); `plugins/group_connect.py:153` excludes `"connect"`, which also has no handler | Harmless today (just prevents those words being treated as searches) but it's drift — a future reader will assume these commands exist somewhere. Delete stale entries when a command is removed. |
 | 13 | `plugins/request.py:30-32` | `if is_callback: return await message_obj.reply_text(error_msg) else: return await message_obj.reply_text(error_msg)` — identical branches, dead conditional. Collapse to one line. |
-| 14 | `plugins/request.py` manual "✅ Mark Uploaded & Notify User" (`mark_request_done`, lines 63-103) never checks whether `indexer.py`'s `_fulfill_matching_requests()` already auto-fulfilled the same request | If auto-fulfillment already notified the user and deleted the pending-request row, an admin who later taps the stale ticket button sends a **second** "your movie is ready" notification. Have `mark_request_done` check `db` for the pending request first and short-circuit with "already fulfilled" if it's gone. |
+| 14 | `plugins/request.py` manual "✅ Mark Uploaded & Notify User" (`mark_request_done`, lines 63-103) never checks whether `realtime_indexer.py`'s `_fulfill_matching_requests()` already auto-fulfilled the same request | If auto-fulfillment already notified the user and deleted the pending-request row, an admin who later taps the stale ticket button sends a **second** "your movie is ready" notification. Have `mark_request_done` check `db` for the pending request first and short-circuit with "already fulfilled" if it's gone. |
 | 15 | Comment style: `# FIX #8:`, `# BUG FIX #1 + #7:`, `# DEAD END FIX #3`, `# B2:`, `# C1:`, `# C9:`/`# C10:`, `# F1:`/`F3`/`F4`/`F6`/`F7`/`F9`/`F10`, `# G1:`-`G5:`, `# A10:` scattered through `admin.py`, `file_manager.py`, `group_manager.py`, `health_monitor.py` | These read like an internal ticket tracker's IDs pasted directly into source instead of living in commit messages / an issue tracker. Harmless functionally, but meaningless to a new contributor without the original numbering scheme. Low priority cleanup. |
-| 16 | `database/db.py`: `get_db_size()` (a live `dbstats` Mongo command) is called once per candidate cluster, sequentially, inside `save_file()` and `save_files_bulk()`'s cluster-selection loop | Once earlier clusters fill up, every save has to sequentially call `dbstats` on each already-full cluster before reaching one with room — added round-trip latency on every save, worse the more clusters have filled. Cache cluster sizes with a short TTL (similar pattern to `_config_cache`) instead of calling `dbstats` on every single insert/batch. |
+| 16 | `database/db.py`: `get_db_size()` (a live `dbstats` Mongo command) used to be called once per candidate cluster, sequentially, inside `save_file()` and `save_files_bulk()`'s cluster-selection loop | ✅ **FIXED.** Once earlier clusters filled up, every save had to sequentially call `dbstats` on each already-full cluster before reaching one with room. **Done:** `get_db_size()` now caches per-cluster sizes with a 30s TTL (`database/db.py:351-370`, `_db_size_cache`), collapsing bursts of saves into one real `dbstats` query. |
 
 ### ✅ What's already solid (worth saying, not just what's wrong)
 
@@ -366,16 +379,14 @@ Ranked by actual user-facing impact, not theoretical hotness.
    dramatically faster on the median case and eliminate the worst case
    entirely.
 
-2. **No TMDB response cache.** Every search for the same movie, by any
+2. **No TMDB response cache.** ✅ **FIXED.** Every search for the same movie, by any
    number of different users, across PM and every connected group, and
-   every real-time auto-post, calls TMDB fresh. TMDB's practical rate
-   limits mean a bot with real traffic will start seeing failed/slow
-   lookups precisely when it's most popular (i.e., when many users search
-   the same trending title at once). **Fix:** a simple in-process TTL
-   cache keyed by the cleaned title (12-24h TTL is plenty for movie
-   metadata, which barely changes) collapses what could be thousands of
-   duplicate calls per day for the same handful of trending titles into
-   one.
+   every real-time auto-post, used to call TMDB fresh. TMDB's practical rate
+   limits mean a bot with real traffic would start seeing failed/slow
+   lookups precisely when it's most popular. **Done:** `tmdb.py` now has an
+   in-process TTL cache keyed by the cleaned title (`_cache`, 24h TTL,
+   `tmdb.py:14-41`) collapsing duplicate calls for the same trending titles
+   into one.
 
 3. **Search is not index-backed for the query shapes actually used.**
    `get_search_results()` and `admin_search_files()` both build
@@ -429,7 +440,7 @@ Ranked by actual user-facing impact, not theoretical hotness.
 
 | Area | Finding |
 |---|---|
-| **Self-updater (`plugins/updater.py`)** | 🔴 **The single biggest risk in the codebase.** `/update` pulls the entire file tree from a hardcoded public GitHub repo/branch (`c7xto/mccxmoviebot@main`) and overwrites every local file except `.env`, then `os.execv()`s into the new code — with **no commit pinning, no signature/checksum verification, no diff review step**. Any compromise of that GitHub account or repo (or a malicious merge) becomes full remote code execution on the bot host — with the Telegram bot token, all 5 MongoDB credentials, and the admin's trust — the instant any admin taps "Update Bot." Restricting the trigger to `ADMIN_ID` only protects against non-admins; it does nothing if the *supply chain* is compromised, which is the actual threat model for auto-updaters. **Fix:** at minimum, pin to a specific commit SHA an admin has to explicitly approve per update (show the commit message/diff link before applying), or drop this feature in favor of a normal `git pull` + manual restart, or CI/CD-based deploys. |
+| **Self-updater (`plugins/updater.py`)** | ✅ **FIXED.** Was 🔴 **the single biggest risk in the codebase.** `/update` used to pull the entire file tree from a hardcoded public GitHub repo/branch (`c7xto/mccxmoviebot@main`) and overwrite every local file except `.env`, then `os.execv()` into the new code — with **no commit pinning, no signature/checksum verification, no diff review step**. Any compromise of that GitHub account or repo (or a malicious merge) would have become full remote code execution on the bot host the instant any admin tapped "Update Bot." **Done:** `/update` now requires an explicit commit SHA (`_SHA_RE`-validated), fetches and shows the commit's message/author/diff link for admin review, requires a second confirm tap, and records the deployed SHA both locally (`.deployed_sha`) and in `bot_config` (`plugins/updater.py:40-327`). |
 | Admin bypasses | The `admin_id` Mongo field (Phase 2, #8) doesn't grant access — not a vulnerability, but worth re-flagging here since "does changing this setting actually change who has power" is exactly a security question. |
 | Callback injection / user spoofing | Callback data is Telegram-signed and scoped to the message; every handler that parses IDs out of `callback_data` does so inside `try/except` with sane fallbacks. No injection surface found — Telegram's own callback mechanism is the trust boundary here, correctly relied upon rather than re-implemented. |
 | Flood / spam | Per-user 2-second cooldown exists for **text searches** only (`USER_SEARCH_COOLDOWN`, capped at 10,000 LRU entries). Callback-query taps (pagination, sort, send-file) have **no rate limit at all**. A user rapid-tapping "Next" or a file button repeatedly can't hurt the DB (reads are cheap, cached) but can spawn many concurrent `_auto_delete_file`/`_auto_delete_search` sleeping tasks. Low real risk at current scale; worth a lightweight per-callback-type cooldown if this ever needs to withstand deliberate abuse. |
@@ -453,11 +464,11 @@ Ranked by actual user-facing impact, not theoretical hotness.
 | Data Saver toggle | **Keep** | Genuinely thoughtful, persisted per-user, correctly handles the photo↔text message-type swap. |
 | Trending searches | **Keep, then improve** | Good retention mechanic already; extend with per-user personalization (Phase 8) rather than only a single global list. |
 | Series grouping / expand | **Keep** | Solves a real problem (episode-list flooding) cleanly. |
-| Duplicate finder (exact + fuzzy) | **Keep, fix the dead Mongo write** | Valuable admin tool; drop the never-read `duplicate_scan_results` persistence (Phase 2 #7). |
-| Cluster migration tool | **Replace** | Currently broken (Phase 2 #3 — duplicates instead of moving). Either fix properly (delete-after-copy, registry-aware) or remove the button until it's fixed — a "migration" tool that silently doesn't migrate is worse than no tool. |
-| Per-group auto-delete override | **Fix or delete** | Currently dead (Phase 2 #4). Either wire it up or remove the UI so admins stop trusting a setting that does nothing. |
-| Group whitelist/blacklist mode | **Fix or delete** | Currently unenforced (Phase 2 #5). Same call: wire it up (straightforward) or remove the toggle. |
-| Self-updater (`/update`) | **Replace** | Convenient, but the current design (Phase 6) is a real supply-chain risk. Replace with pinned-commit approval or a standard git-based deploy flow. |
+| Duplicate finder (exact + fuzzy) | **Keep** | ✅ Fixed — the never-read `duplicate_scan_results` persistence (Phase 2 #7) is gone. |
+| Cluster migration tool | **Keep** | ✅ Fixed — was broken (Phase 2 #3, duplicated instead of moving); now deletes from the source after a confirmed copy. |
+| Per-group auto-delete override | **Keep** | ✅ Fixed (Phase 2 #4) — now actually read in `group_search()`. |
+| Group whitelist/blacklist mode | **Keep** | ✅ Fixed (Phase 2 #5) — now enforced in `group_search()`/`auto_connect_group()`. |
+| Self-updater (`/update`) | **Keep** | ✅ Fixed (Phase 6) — now requires a pinned, admin-approved commit SHA with a review/confirm step. |
 | Broadcast (preview/schedule/pin/auto-delete) | **Keep** | Well-built; scheduled broadcasts not surviving a restart is a known, honestly-labeled limitation, not a hidden bug. |
 | Admin panel two-tier navigation | **Keep** | Already a deliberate, documented improvement over a flat 19-button menu — good information architecture. |
 | Movie request system (manual + auto-fulfillment) | **Merge the notification logic** | Two separate code paths building near-identical "your movie is ready" messages (Phase 2 #14); consolidate into one shared helper and add the already-fulfilled check. |
@@ -640,13 +651,18 @@ correct design already (explicitly a deliberate improvement over a flat
 Refinements:
 - Collapse **Request-FSub** and **Two-Stage Verification** into a single
   "Verification Gates" submenu once merged (Phase 7), instead of two
-  separate top-level entries under Users & Groups.
+  separate top-level entries under Users & Groups. ✅ **Done on the
+  navigation side** — `admin.py` now has a "🔐🔐 Verification Gates" submenu
+  (`verification_gates_menu`) fronting both; the two systems still have
+  separate config fields (`req_fsub_channels` vs `two_stage_channels`)
+  underneath, so a true data-model merge (Phase 7) is still open.
 - Add a **"⚠️ Known Issues"** tile to Health & System that surfaces
-  bugs #1-#6 above as live checks (e.g. "Cluster 3 is full — new uploads
-  are being silently rejected" or "Whitelist mode is ON but not enforced")
-  until they're actually fixed in code — turns a silent failure into a
-  visible one immediately, which is strictly better even before the
-  underlying bug is patched.
+  silent-failure bugs as live checks (e.g. "Cluster 3 is full — new uploads
+  are being silently rejected") until they're actually fixed in code —
+  turns a silent failure into a visible one immediately. Bugs #1-#6 are now
+  fixed, so the only currently-open item this would surface is #8
+  (`admin_id` footgun); still worth building as a general mechanism for
+  whatever's found next.
 
 ### Keyboards & navigation
 
@@ -778,34 +794,34 @@ query, not a `Ctrl+F` through log-channel messages.
 ## PHASE 11 — Prioritized Refactor Roadmap
 
 ### Critical (fix before anything else — silent data loss / real security exposure)
-- Fix bug #1: `save_files_bulk` silent full-database failure. *Effort: S (half day).*
-- Fix bug #2: `index_new_files` missing failure-path alert. *Effort: XS (1-2 hours).*
-- Fix bug #3: `migrate_cluster` duplicating instead of moving. *Effort: M (1 day incl. testing against a real cluster pair).*
-- Pin or gate the self-updater (Phase 6). *Effort: M (1 day) for commit-pinning; L (2-3 days) to replace with a proper CI/CD flow.*
+- ✅ Bug #1: `save_files_bulk` silent full-database failure — **fixed** (`AllClustersFullError`).
+- ✅ Bug #2: `index_new_files` missing failure-path alert — **fixed** (`realtime_indexer.py:227-237`).
+- ✅ Bug #3: `migrate_cluster` duplicating instead of moving — **fixed** (deletes from source after confirmed copy).
+- ✅ Self-updater (Phase 6) — **fixed** (pinned-commit approval flow shipped).
 
 ### High (real user-facing or admin-trust impact)
-- Decouple TMDB from the search-render critical path (Phase 5 #1). *Effort: M (1 day) — biggest perceived-speed win available.*
-- Add a TMDB response cache (Phase 5 #2). *Effort: S (half day).*
-- Wire up or remove: per-group auto-delete override, whitelist-mode enforcement, `admin_id` field (Phase 2 #4/#5/#8). *Effort: S each.*
-- Consolidate Request-FSub + Two-Stage Verification into one gate system (Phase 3/7). *Effort: L (2-3 days) — touches admin UI, DB schema, and both delivery paths.*
+- Decouple TMDB from the search-render critical path (Phase 5 #1). *Effort: M (1 day) — biggest perceived-speed win available. Still open.*
+- ✅ TMDB response cache (Phase 5 #2) — **fixed** (`tmdb.py` `_cache`, 24h TTL).
+- ✅ Per-group auto-delete override, whitelist-mode enforcement (Phase 2 #4/#5) — **fixed**. `admin_id` field (Phase 2 #8) is still open.
+- Consolidate Request-FSub + Two-Stage Verification into one gate system (Phase 3/7). *Effort: L (2-3 days) — the admin-UI navigation was consolidated into a "Verification Gates" submenu this pass, but the two config schemas/delivery paths underneath are still separate. Still open.*
 
 ### Medium (maintainability, won't bite anyone today but will bite the next contributor)
-- Deduplicate `_no_preview()`/`_html()` into shared modules (Phase 2 #9/#10). *Effort: S (half day).*
-- Rename `index.py`/`indexer.py` to something unambiguous (Phase 2 #11). *Effort: XS.*
-- Remove stale command-exclusion entries (`about`, `purge_cams`, `connect`) (Phase 2 #12). *Effort: XS.*
-- Drop the dead `duplicate_scan_results` Mongo write (Phase 2 #7). *Effort: XS.*
-- Consolidate the two "movie ready" notification code paths (Phase 2 #14). *Effort: S.*
+- Deduplicate `_no_preview()`/`_html()` into shared modules (Phase 2 #9/#10). *Effort: S (half day). Still open.*
+- ✅ Rename `index.py`/`indexer.py` to something unambiguous (Phase 2 #11) — **fixed** (`bulk_indexer.py`/`realtime_indexer.py`).
+- Remove stale command-exclusion entries (`about`, `purge_cams`, `connect`) (Phase 2 #12). *Effort: XS. Still open.*
+- ✅ Drop the dead `duplicate_scan_results` Mongo write (Phase 2 #7) — **fixed**.
+- Consolidate the two "movie ready" notification code paths (Phase 2 #14). *Effort: S. Still open.*
 
 ### Low (cosmetic / nice-to-have cleanup)
-- Clean up ticket-number-style comments (Phase 2 #15).
-- Cache cluster `dbstats` sizes with a short TTL (Phase 2 #16 / Phase 5 #4). *Effort: S.*
-- Drop the `🗣️ : {first_name}` line from the results caption (Phase 3/9). *Effort: XS.*
+- Clean up ticket-number-style comments (Phase 2 #15). Still open.
+- ✅ Cache cluster `dbstats` sizes with a short TTL (Phase 2 #16 / Phase 5 #4) — **fixed** (`_db_size_cache`, 30s TTL).
+- Drop the `🗣️ : {first_name}` line from the results caption (Phase 3/9). *Effort: XS. Still open.*
 
 ### Quick wins (disproportionate payoff for the effort)
 - Typing indicator during search (Phase 4). *Effort: XS.*
 - Reorder home panel to lead with Trending/Favorites over promo buttons (Phase 9). *Effort: XS.*
 - "Report broken file" one-tap button (Phase 8 #46). *Effort: S.*
-- Health & System "Known Issues" live-check tile (Phase 9). *Effort: S — and it makes every Critical/High bug visible to the admin immediately, even before each is individually fixed.*
+- Health & System "Known Issues" live-check tile (Phase 9). *Effort: S — now mainly relevant to bug #8 and whatever's found next, since #1-#7 are already fixed.*
 
 ### Long-term (the Phase 10 rebuild)
 - Full-text search migration (Atlas Search). *Effort: XL (1-2 weeks incl. reindexing ~1.5M+ documents and dual-running to validate result parity).*
@@ -820,9 +836,15 @@ query, not a `Ctrl+F` through log-channel messages.
 The strongest thing this codebase has going for it is that it's already
 self-aware — the blueprint document, the crash-callback convention, the
 `file_registry` fix for a real prior bug, all show a team that iterates on
-its own mistakes. The three silent-failure bugs found here (#1-#3) are the
+its own mistakes. The three silent-failure bugs found here (#1-#3) were the
 kind that specifically hide *because* the rest of the error handling is so
-consistently good elsewhere — they're the exceptions to an otherwise solid
-pattern, not evidence the pattern is missing. Fix those three first; they
-are actively costing files and cluster space today, silently, and nothing
-else in this audit comes close to that level of real, ongoing harm.
+consistently good elsewhere — they were the exceptions to an otherwise solid
+pattern, not evidence the pattern is missing. **Update: #1-#3, along with
+#4/#5/#6/#7/#11/#16 and the self-updater/TMDB-cache findings, were fixed in
+the commit immediately following this audit** (see the status note at the
+top of this document and `ARCHITECTURE_PROPOSAL.md` for what's scoped next).
+What's left open from this audit: bug #8 (`admin_id` footgun), #9/#10/#12-15
+(duplication/cleanup), the TMDB-blocking-render latency issue (Phase 5 #1),
+the regex-scan search architecture (Phase 5 #3), and the Request-FSub/
+Two-Stage data-model merge (Phase 7) — none of which carry the same silent
+data-loss/security severity as the items already fixed.
