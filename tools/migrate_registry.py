@@ -4,7 +4,7 @@ tools/migrate_registry.py
 One-time backfill migration for the centralized `file_registry` collection.
 
 Background: `database/db.py`'s save_file()/save_files_bulk() now treat
-`file_registry` (on the primary cluster) as the single source of truth for
+`file_registry` (on the operations cluster when available) as the single source of truth for
 cross-cluster file_id uniqueness, replacing the old per-cluster existence
 checks. That only works going forward unless every file_id already sitting
 in the ~1.5M existing documents across all configured clusters is backfilled
@@ -57,6 +57,7 @@ logger = logging.getLogger("migrate_registry")
 
 BATCH_SIZE      = 5000    # file_ids per bulk_write to file_registry
 PROGRESS_EVERY  = 100_000  # log a progress line at least this often
+MAX_BATCH_RETRIES = 5
 
 
 async def _flush_batch(batch: list) -> tuple:
@@ -70,23 +71,44 @@ async def _flush_batch(batch: list) -> tuple:
         return 0, 0
 
     ops = [InsertOne({"file_id": fid}) for fid in batch]
-    try:
-        result = await db.registry_col.bulk_write(ops, ordered=False)
-        return result.inserted_count, 0
-    except BulkWriteError as bwe:
-        write_errors  = bwe.details.get("writeErrors", [])
-        dup_count     = sum(1 for e in write_errors if e.get("code") == 11000)
-        other_errors  = [e for e in write_errors if e.get("code") != 11000]
-        if other_errors:
-            logger.warning(
-                f"{len(other_errors)} non-duplicate-key errors in batch "
-                f"(sample: {other_errors[0].get('errmsg', '')[:150]})"
+    for attempt in range(1, MAX_BATCH_RETRIES + 1):
+        try:
+            result = await db.registry_col.bulk_write(ops, ordered=False)
+            return result.inserted_count, 0
+        except BulkWriteError as bwe:
+            write_errors = bwe.details.get("writeErrors", [])
+            dup_count = sum(1 for e in write_errors if e.get("code") == 11000)
+            other_errors = [e for e in write_errors if e.get("code") != 11000]
+            if not other_errors:
+                return bwe.details.get("nInserted", 0), dup_count
+            error = RuntimeError(
+                f"{len(other_errors)} non-duplicate write error(s); "
+                f"sample: {other_errors[0].get('errmsg', '')[:150]}"
             )
-        inserted = bwe.details.get("nInserted", 0)
-        return inserted, dup_count
-    except Exception as e:
-        logger.warning(f"Batch flush failed entirely ({len(batch)} ids) — will retry on next run: {e}")
-        return 0, 0
+        except Exception as exc:
+            error = exc
+
+        if attempt == MAX_BATCH_RETRIES:
+            logger.error(
+                "Batch flush failed after %s attempts (%s ids): %s",
+                MAX_BATCH_RETRIES,
+                len(batch),
+                error,
+            )
+            raise error
+
+        delay = min(2 ** (attempt - 1), 15)
+        logger.warning(
+            "Batch flush attempt %s/%s failed (%s ids); retrying in %ss: %s",
+            attempt,
+            MAX_BATCH_RETRIES,
+            len(batch),
+            delay,
+            error,
+        )
+        await asyncio.sleep(delay)
+
+    raise RuntimeError("unreachable batch retry state")
 
 
 async def _scan_cluster(cluster_idx: int, col, progress: dict, lock: asyncio.Lock, total_estimate: int, start: float):

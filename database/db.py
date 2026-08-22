@@ -225,8 +225,12 @@ class Database:
             # truth for file_id uniqueness across all sharded clusters, since
             # the per-cluster unique index on `movies.file_id` only protects
             # within one cluster's collection.
-            self.registry_col = self.main_db["file_registry"]
-            self.deletion_col = self.main_db["scheduled_deletions"]
+            # Derived/high-churn operational data belongs on the operations
+            # database.  Keeping it off the primary movie/config cluster lets
+            # an installation whose first Atlas M0 cluster is read-only at its
+            # quota continue to register files and schedule message cleanup.
+            self.registry_col = _ops_db["file_registry"]
+            self.deletion_col = _ops_db["scheduled_deletions"]
 
     async def ensure_indexes(self):
         for i, col in enumerate(self.file_cols):
@@ -254,9 +258,13 @@ class Database:
                 await self.main_db["pending_requests"].create_index(
                     "requested_at", expireAfterSeconds=180 * 24 * 3600  # 180 days — generous so a slow-to-fulfill request still gets auto-notified
                 )
-                await self.main_db["scheduled_deletions"].create_index("due_at")
             except Exception as e:
                 logger.warning("Could not ensure auxiliary indexes: %s", e)
+        if self.deletion_col is not None:
+            try:
+                await self.deletion_col.create_index("due_at")
+            except Exception as e:
+                logger.warning("Could not ensure scheduled-deletion index: %s", e)
         if self.registry_col is not None:
             try:
                 await self.registry_col.create_index("file_id", unique=True)
