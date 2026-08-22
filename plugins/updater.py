@@ -1,7 +1,8 @@
 """
 updater.py — GitHub self-updater, pinned to an admin-approved commit SHA.
 Pulls a single specific commit (never "whatever is on main right now") and
-restarts the bot. Only .env is never touched. Everything else gets updated.
+restarts the bot. Runtime secrets, Telegram sessions, and deployment state
+are never overwritten.
 
 Why pinned: blindly pulling the head of a public branch on every /update tap
 means a compromised GitHub account, a bad merge, or a malicious PR becomes
@@ -21,6 +22,11 @@ import re
 import sys
 import asyncio
 import logging
+import json
+import shutil
+import tempfile
+import compileall
+from pathlib import Path
 import aiohttp
 from dotenv import load_dotenv
 from pyrogram import Client, filters, ContinuePropagation, StopPropagation
@@ -36,13 +42,26 @@ logger = logging.getLogger(__name__)
 
 GITHUB_REPO   = "c7xto/mccxmoviebot"
 GITHUB_BRANCH = "main"
+PROJECT_ROOT  = Path(__file__).resolve().parents[1]
+_DEPLOYED_FILES = PROJECT_ROOT / ".deployed_files.json"
 
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
 
 
 def _skip(path: str) -> bool:
-    """Only .env is protected — everything else gets updated."""
-    return path.replace("\\", "/").split("/")[-1] == ".env"
+    """Protect runtime credentials and state from repository updates."""
+    name = path.replace("\\", "/").split("/")[-1]
+    return (
+        name in {".env", ".deployed_sha", ".deployed_files.json"}
+        or name.endswith((".session", ".session-journal"))
+    )
+
+
+def _safe_relative(path: str) -> Path:
+    candidate = Path(path.replace("\\", "/"))
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise RuntimeError(f"Unsafe update path: {path}")
+    return candidate
 
 
 async def _get_commit(session: aiohttp.ClientSession, sha: str) -> dict:
@@ -92,13 +111,35 @@ async def _download(session: aiohttp.ClientSession, sha: str, path: str) -> byte
         return await r.read()
 
 
+async def _install_requirements(requirements_path: Path) -> tuple[bool, str]:
+    """Install a staged dependency lock with the bot's current interpreter."""
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+        "-r",
+        str(requirements_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        output, _ = await asyncio.wait_for(process.communicate(), timeout=300)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.communicate()
+        return False, "Dependency installation timed out after 5 minutes."
+    detail = output.decode("utf-8", errors="replace")[-3000:]
+    return process.returncode == 0, detail
+
+
 def _write_file(path: str, content: bytes):
     """Synchronous disk I/O — always call via asyncio.to_thread so it
     doesn't block the event loop for every user while an update runs."""
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    with open(path, "wb") as f:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as f:
         f.write(content)
 
 
@@ -106,7 +147,7 @@ async def _do_update(client: Client, status: Message, sha: str):
     # Step 1 — fetch file list for this exact commit
     try:
         await status.edit_text(
-            f"🔄 **Step 1/3** — Fetching file list for `{sha[:12]}`...",
+            f"🔄 **Step 1/4** — Fetching file list for `{sha[:12]}`...",
             parse_mode=ParseMode.MARKDOWN,
         )
     except Exception:
@@ -122,35 +163,149 @@ async def _do_update(client: Client, status: Message, sha: str):
         )
         return
 
-    to_update = [f for f in all_files if not _skip(f)]
+    try:
+        # Keep URL paths POSIX-style even when the bot runs on Windows.
+        to_update = [_safe_relative(f).as_posix() for f in all_files if not _skip(f)]
+    except RuntimeError as e:
+        await status.edit_text(f"❌ **Update rejected**\n\n`{e}`", parse_mode=ParseMode.MARKDOWN)
+        return
     protected = len(all_files) - len(to_update)
 
     try:
         await status.edit_text(
-            f"🔄 **Step 2/3** — Downloading `{len(to_update)}` files...\n"
-            f"_({protected} protected file(s) skipped: .env)_",
+            f"🔄 **Step 2/4** — Downloading `{len(to_update)}` files...\n"
+            f"_({protected} runtime secret/state file(s) protected)_",
             parse_mode=ParseMode.MARKDOWN,
         )
     except Exception:
         pass
 
-    # Step 2 — download and write
+    # Step 2 — stage the complete release before touching the live tree.
+    # A single failed download or compile check aborts with zero live changes.
     updated, failed = [], []
-    async with aiohttp.ClientSession() as s:
-        for path in to_update:
+    with tempfile.TemporaryDirectory(prefix="mccx-update-") as stage_name, \
+         tempfile.TemporaryDirectory(prefix="mccx-backup-") as backup_name:
+        stage_root = Path(stage_name)
+        backup_root = Path(backup_name)
+        semaphore = asyncio.Semaphore(8)
+
+        async def _stage_one(session, path):
+            async with semaphore:
+                try:
+                    content = await _download(session, sha, path)
+                    await asyncio.to_thread(_write_file, stage_root / path, content)
+                    return None
+                except Exception as e:
+                    return f"{path} ({e})"
+
+        async with aiohttp.ClientSession() as s:
+            failures = await asyncio.gather(*[_stage_one(s, path) for path in to_update])
+        failed = [failure for failure in failures if failure]
+        if failed:
+            await status.edit_text(
+                f"❌ **Update aborted safely**\n\n"
+                f"{len(failed)} file(s) failed to download. The live bot was not changed.\n"
+                + "\n".join(f"• `{item}`" for item in failed[:5]),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
+        compile_ok = await asyncio.to_thread(
+            compileall.compile_dir, str(stage_root), quiet=1, force=True
+        )
+        if not compile_ok:
+            await status.edit_text(
+                "❌ **Update aborted safely**\n\nThe staged release failed Python compilation. "
+                "The live bot was not changed.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
+        staged_requirements = stage_root / "requirements.txt"
+        live_requirements = PROJECT_ROOT / "requirements.txt"
+        requirements_changed = (
+            staged_requirements.is_file()
+            and (
+                not live_requirements.is_file()
+                or staged_requirements.read_bytes() != live_requirements.read_bytes()
+            )
+        )
+        if requirements_changed:
+            await status.edit_text(
+                "🔄 **Step 3/4** — Installing verified dependencies...",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            dependencies_ok, detail = await _install_requirements(staged_requirements)
+            if not dependencies_ok:
+                logger.error("Updater dependency installation failed:\n%s", detail)
+                await status.edit_text(
+                    "❌ **Update aborted safely**\n\nDependency installation failed. "
+                    "The live source tree was not changed; check the server log for details.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
+
+        await status.edit_text(
+            "🔄 **Step 4/4** — Applying the staged release...",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+        previous_files = set()
+        if _DEPLOYED_FILES.exists():
             try:
-                content = await _download(s, sha, path)
-                await asyncio.to_thread(_write_file, path, content)
-                updated.append(path)
-            except Exception as e:
-                failed.append(f"{path} ({e})")
-                logger.warning(f"Updater: failed {path}: {e}")
+                previous_files = set(json.loads(_DEPLOYED_FILES.read_text(encoding="utf-8")))
+            except (OSError, ValueError, TypeError):
+                logger.warning("Could not read prior deployed-file manifest; stale cleanup skipped.")
+        stale_files = sorted(previous_files - set(to_update))
+        affected = list(to_update) + stale_files
+        existed = set()
+
+        try:
+            # Back up every path that will change, then apply the release.
+            for rel in affected:
+                live = PROJECT_ROOT / rel
+                if live.is_file():
+                    existed.add(rel)
+                    backup = backup_root / rel
+                    backup.parent.mkdir(parents=True, exist_ok=True)
+                    await asyncio.to_thread(shutil.copy2, live, backup)
+
+            for rel in to_update:
+                live = PROJECT_ROOT / rel
+                live.parent.mkdir(parents=True, exist_ok=True)
+                await asyncio.to_thread(shutil.copy2, stage_root / rel, live)
+                updated.append(rel)
+
+            for rel in stale_files:
+                live = PROJECT_ROOT / rel
+                if live.is_file() and not _skip(rel):
+                    live.unlink()
+
+            _DEPLOYED_FILES.write_text(json.dumps(sorted(to_update), indent=2), encoding="utf-8")
+        except Exception as e:
+            logger.exception("Updater apply failed; rolling back")
+            for rel in affected:
+                live = PROJECT_ROOT / rel
+                backup = backup_root / rel
+                try:
+                    if backup.is_file():
+                        live.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(backup, live)
+                    elif rel not in existed and live.is_file():
+                        live.unlink()
+                except OSError:
+                    logger.exception("Updater rollback failed for %s", rel)
+            await status.edit_text(
+                f"❌ **Update failed and was rolled back**\n\n`{e}`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
 
     # Persist which commit is now deployed — both locally (survives even if
     # Mongo is unreachable) and in bot_config (so the admin panel can show
     # it without SSHing in).
     try:
-        await asyncio.to_thread(_write_file, ".deployed_sha", sha.encode())
+        await asyncio.to_thread(_write_file, PROJECT_ROOT / ".deployed_sha", sha.encode())
     except Exception as e:
         logger.warning(f"Could not record deployed SHA locally: {e}")
     try:
@@ -163,7 +318,7 @@ async def _do_update(client: Client, status: Message, sha: str):
         "✅ **Update complete!**\n",
         f"📌 Commit  : `{sha[:12]}`",
         f"📦 Updated : `{len(updated)}` files",
-        f"🔒 Skipped : `.env` _(protected)_",
+        f"🔒 Protected: runtime secrets/state",
     ]
     if failed:
         lines.append(f"❌ Failed  : `{len(failed)}`")
@@ -215,8 +370,8 @@ async def _show_commit_review(client: Client, target, sha: str, *, is_callback: 
         f"Author: {_html(author)}\n"
         f"Date: {date}\n"
         f"Message: {_html(message_1st)}\n\n"
-        "All files will be replaced with this commit's contents. `.env` will "
-        "never be touched.\n\n"
+        "Repository files will be replaced with this commit's contents. "
+        "Runtime secrets, session files and deployment state are protected.\n\n"
         "Review the diff on GitHub before confirming."
     )
     markup = InlineKeyboardMarkup([
