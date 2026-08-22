@@ -4,5 +4,6 @@ __pycache__/
 .deployed_sha
 .deployed_files.json
 .venv/
+.venv*/
 .pytest_cache/
 .ruff_cache/
