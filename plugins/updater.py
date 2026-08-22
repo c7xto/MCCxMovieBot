@@ -410,7 +410,7 @@ async def cmd_update(client: Client, message: Message):
         await _show_commit_review(client, message, parts[1].strip().lower(), is_callback=False)
         return
     set_state(message.from_user.id, "upd_wait_sha")
-    await message.reply_text(_PROMPT_TEXT, reply_markup=_BROWSE_MARKUP, parse_mode=ParseMode.MARKDOWN, quote=True)
+    await message.reply_text(_PROMPT_TEXT, reply_markup=_BROWSE_MARKUP, parse_mode=ParseMode.MARKDOWN, reply_parameters=None)
 
 
 # ── Admin panel button → prompt for a SHA ──────────────────────────────────────

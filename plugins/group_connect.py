@@ -140,7 +140,7 @@ async def auto_connect_group(client: Client, message: Message):
         await message.reply_text(
             f"🎬 <b>MCCxBot connected to {message.chat.title}!</b>\n\n"
             f"Type any movie or series name to search.",
-            reply_markup=keyboard, quote=True, parse_mode=ParseMode.HTML
+            reply_markup=keyboard, parse_mode=ParseMode.HTML
         )
         break
 
@@ -150,6 +150,11 @@ async def auto_connect_group(client: Client, message: Message):
 @Client.on_message(filters.group & filters.text & ~filters.command(["start", "help"]))
 async def group_search(client: Client, message: Message):
     if not message.from_user:
+        return
+    # Commands belong to command handlers (or other bots), never to the
+    # movie-search pipeline. This also covers /command@other_bot forms that a
+    # fixed command exclusion list cannot enumerate safely.
+    if (message.text or "").lstrip().startswith("/"):
         return
 
     if await db.is_banned(message.from_user.id):
@@ -229,7 +234,7 @@ async def group_search(client: Client, message: Message):
         not_found_msg = await message.reply_text(
             f"🔍 Nothing found for <code>{query}</code>\n\n"
             f"It's probably not uploaded yet — tap Request below and we'll notify you.",
-            reply_markup=markup, quote=True, parse_mode=ParseMode.HTML,
+            reply_markup=markup, parse_mode=ParseMode.HTML,
             **_no_preview()
         )
         await asyncio.sleep(15)
@@ -298,19 +303,23 @@ async def group_search(client: Client, message: Message):
         )])
     markup = InlineKeyboardMarkup(buttons)
 
-    status_msg = await message.reply_text(
-        "🔎 <b>Searching the movie library…</b>", quote=True, parse_mode=ParseMode.HTML
-    )
+    # Send the finished card directly.  Kurigram can wait indefinitely when
+    # editing a just-sent group message on some MTProto sessions; that left
+    # users staring at "Searching…" forever even though results were ready.
+    # A bounded direct send avoids that edit round-trip entirely.
     try:
-        await status_msg.edit_text(
-            text=caption, reply_markup=markup, parse_mode=ParseMode.HTML
+        result_msg = await asyncio.wait_for(
+            message.reply_text(
+                text=caption,
+                reply_markup=markup,
+                parse_mode=ParseMode.HTML,
+            ),
+            timeout=20,
         )
-        result_msg = status_msg
     except Exception as exc:
-        # Never leave a group search stuck on the temporary "Searching"
-        # message.  Log Telegram's actual rejection and retry with a smaller,
-        # callback-free keyboard that stays well below markup limits.
-        logger.exception("Group result-card edit failed for %r: %s", query, exc)
+        # Retry with a smaller, callback-free keyboard that stays well below
+        # Telegram's markup limits and avoids pagination state entirely.
+        logger.exception("Full group result-card send failed for %r: %s", query, exc)
         compact_buttons = []
         for index, file_doc in enumerate(page_files, 1):
             compact_label = _variant_label(file_doc, show_title=False)
@@ -323,26 +332,28 @@ async def group_search(client: Client, message: Message):
             "⌂ Open Movie Hub", url=f"https://t.me/{client.me.username}"
         )])
         try:
-            await status_msg.edit_text(
-                text=caption,
-                reply_markup=InlineKeyboardMarkup(compact_buttons),
-                parse_mode=ParseMode.HTML,
+            result_msg = await asyncio.wait_for(
+                message.reply_text(
+                    text=caption,
+                    reply_markup=InlineKeyboardMarkup(compact_buttons),
+                    parse_mode=ParseMode.HTML,
+                ),
+                timeout=20,
             )
         except Exception as fallback_exc:
             logger.exception(
-                "Compact group result-card edit also failed for %r: %s",
+                "Compact group result-card send also failed for %r: %s",
                 query,
                 fallback_exc,
             )
-            await status_msg.edit_text(
-                text=(
+            result_msg = await message.reply_text(
+                (
                     f"🎬 <b>{_html(query.title())}</b>\n"
                     f"<blockquote>{total} matches found.</blockquote>\n"
                     f"Open @{client.me.username} privately to get the files."
                 ),
                 parse_mode=ParseMode.HTML,
             )
-        result_msg = status_msg
 
     await db.schedule_deletion(result_msg.chat.id, result_msg.id, _del_secs)
 

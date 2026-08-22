@@ -145,7 +145,7 @@ async def show_category_menu(client: Client, callback: CallbackQuery):
 async def admin_panel(client: Client, message: Message):
     text, markup = await get_admin_menu_data()
     await message.reply_text(
-        text=text, reply_markup=markup, quote=True, **_no_preview()
+        text=text, reply_markup=markup, reply_parameters=None, **_no_preview()
     )
 
 
@@ -1074,18 +1074,18 @@ async def reset_index_progress_cmd(client: Client, message: Message):
         except ValueError:
             return await message.reply_text(
                 "Invalid channel ID. Use a numeric ID like -1001234567890.",
-                quote=True
+                reply_parameters=None
             )
         await db.clear_index_progress(chat_id)
         await message.reply_text(
             "Index progress cleared for that channel.\n\nIndexing will start from message 1 next time.",
-            quote=True
+            reply_parameters=None
         )
     else:
         await db.clear_index_progress(chat_id=None)
         await message.reply_text(
             "All index progress cleared.\n\nIndexing will start from message 1 for all channels next time.",
-            quote=True
+            reply_parameters=None
         )
 
 
@@ -1096,7 +1096,7 @@ async def reset_db_cmd(client: Client, message: Message):
         "⚠️ **WARNING: NUCLEAR OPTION** ⚠️\n\n"
         "Are you absolutely sure you want to completely wipe ALL files, users, and bans across all 5 clusters?\n\n"
         "To confirm, reply to this message with: `/confirm_reset`",
-        quote=True
+        reply_parameters=None
     )
 
 
@@ -1123,7 +1123,7 @@ async def confirm_reset_cmd(client: Client, message: Message):
 
 @Client.on_message(filters.command("stats") & filters.private & filters.user(ADMIN_ID))
 async def stats_cmd(client: Client, message: Message):
-    msg = await message.reply_text("⏳ Fetching live stats...", quote=True)
+    msg = await message.reply_text("⏳ Fetching live stats...", reply_parameters=None)
     total_users, total_banned, total_files, db_sizes, total_groups = await db.get_bot_stats()
 
     text = (
@@ -1171,7 +1171,7 @@ async def help_cmd(client: Client, message: Message):
         help_text,
         reply_markup=markup,
         parse_mode=ParseMode.HTML,
-        quote=True
+        reply_parameters=None
     )
 
     # Persist group cleanup so it survives a restart without a sleeping task.

@@ -56,7 +56,7 @@ async def send_request_ticket(client, user, movie_name, message_obj, is_callback
         if passed < COOLDOWN_TIME:
             wait_msg = await message_obj.reply_text(
                 f"⏳ Wait `{int(COOLDOWN_TIME - passed) + 1}s` before submitting another request.",
-                quote=not is_callback
+                reply_parameters=None,
             )
             await _delayed_delete(wait_msg)
             return

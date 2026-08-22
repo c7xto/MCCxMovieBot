@@ -522,13 +522,13 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
     user_id = message.from_user.id
 
     if await db.is_banned(user_id):
-        return await message.reply_text("🚫 **You are banned from using this bot.**", quote=True)
+        return await message.reply_text("🚫 **You are banned from using this bot.**", reply_parameters=None)
 
     config = await db.get_config()
     if config.get("maintenance_mode") and user_id not in ADMIN_ID:
         return await message.reply_text(
             config.get("maintenance_message", "🔧 Bot is under maintenance. Back soon!"),
-            quote=True
+            reply_parameters=None
         )
 
     if not await is_subscribed_join_only(client, message):
@@ -542,7 +542,7 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
         if passed < COOLDOWN_TIME:
             warning = await message.reply_text(
                 f"⏳ Wait `{int(COOLDOWN_TIME - passed) + 1}s` before searching again.",
-                quote=True
+                reply_parameters=None
             )
             await asyncio.sleep(2)
             try:
@@ -568,7 +568,7 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
                 reply_markup=InlineKeyboardMarkup(
                     [[InlineKeyboardButton("📝 Request Here", url=main_group)]]
                 ) if main_group else None,
-                quote=True, parse_mode=ParseMode.HTML
+                reply_parameters=None, parse_mode=ParseMode.HTML
             )
 
     if not query:
@@ -640,7 +640,7 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
     await db.save_search(session_id, session_data)
 
     status_msg = await message.reply_text(
-        "🔎 <b>Searching your library…</b>", quote=True, parse_mode=ParseMode.HTML
+        "🔎 <b>Searching your library…</b>", reply_parameters=None, parse_mode=ParseMode.HTML
     )
     await show_results(client, status_msg, session_id, 0)
     await _auto_delete_search(status_msg, message, manual_query)

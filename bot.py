@@ -166,6 +166,9 @@ class AutoFilterBot(Client):
                         raise RuntimeError(f"Primary MongoDB cluster is unavailable: {e}") from e
                     logger.warning(f"  ⚠️ Optional cluster {i+1} unavailable: {e}")
 
+        logger.info("🔄 Migrating legacy control data → operations database...")
+        await db.migrate_legacy_control_data()
+
         logger.info("🔄 Syncing .env config → MongoDB...")
         await db.sync_config()
 

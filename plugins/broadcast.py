@@ -151,7 +151,7 @@ async def broadcast_handler(client: Client, message: Message):
             "`/broadcast -pin -del`\n"
             "`/broadcast -groups`\n"
             "`/broadcast -users -groups -schedule 2h`",
-            quote=True
+            reply_parameters=None
         )
 
     flags = message.text.lower()
@@ -208,7 +208,7 @@ async def broadcast_handler(client: Client, message: Message):
         [InlineKeyboardButton("✅ Confirm & Send", callback_data="bc_confirm"),
          InlineKeyboardButton("❌ Cancel", callback_data="bc_cancel")]
     ])
-    await message.reply_text("\n".join(preview_lines), reply_markup=confirm_markup, quote=True)
+    await message.reply_text("\n".join(preview_lines), reply_markup=confirm_markup, reply_parameters=None)
 
     _pending_broadcasts[message.chat.id] = {
         "message": message,

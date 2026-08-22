@@ -2,8 +2,8 @@
 tools/verify_db_performance.py
 
 Standalone, Pyrogram-isolated verification script for the database changes
-in database/db.py (cache mechanics, the $facet aggregation rewrite, and the
-$natural -> _id search-sort switch).
+in database/db.py (cache mechanics, aggregation, centralized registry, and
+the $natural -> _id search-sort switch).
 
 Why this exists: this host's Python 3.14 install raises
     RuntimeError: There is no current event loop in thread 'MainThread'
@@ -227,33 +227,64 @@ async def test_aggregation_pipeline_health():
         record(section, "get_files_by_language() completes without error", "FAIL", str(e)[:300])
 
 
-# ── 3. Unique Index & Traversal Sanity Check ─────────────────────────────
+# ── 3. Registry & Traversal Sanity Check ────────────────────────────────
 
 async def test_search_traversal():
-    section = "Search Traversal"
+    section = "Registry & Search Traversal"
     _section(section)
 
     if not db.file_cols:
         record(section, "get_search_results()", "SKIP", "no clusters configured")
         return
 
-    # 3a. Confirm the unique index on file_id actually exists per cluster —
-    # this is what makes save_file()'s DuplicateKeyError-based dedup, and
-    # the file_registry backfill, meaningful rather than decorative.
+    # 3a. Shards need an efficient file_id lookup index, while the centralized
+    # registry owns uniqueness across every shard. Legacy shard indexes may be
+    # non-unique and should not be rebuilt during normal startup.
     for i, col in enumerate(db.file_cols):
         try:
             indexes = await col.index_information()
-            has_unique_file_id = any(
-                spec.get("unique") and ("file_id", 1) in spec.get("key", [])
+            has_file_id_index = any(
+                ("file_id", 1) in spec.get("key", [])
                 for spec in indexes.values()
             )
             record(
-                section, f"Cluster {i+1}: unique file_id index present",
-                _pf(has_unique_file_id),
+                section, f"Cluster {i+1}: file_id lookup index present",
+                _pf(has_file_id_index),
                 f"indexes={list(indexes.keys())}"
             )
         except Exception as e:
             record(section, f"Cluster {i+1}: index_information() reachable", "FAIL", str(e)[:200])
+
+    if db.registry_col is not None:
+        try:
+            registry_indexes = await db.registry_col.index_information()
+            has_unique_registry = any(
+                spec.get("unique") and ("file_id", 1) in spec.get("key", [])
+                for spec in registry_indexes.values()
+            )
+            record(
+                section,
+                "central file registry has a unique file_id index",
+                _pf(has_unique_registry),
+                f"indexes={list(registry_indexes.keys())}",
+            )
+
+            registry_count = await db.registry_col.estimated_document_count()
+            shard_count = sum(
+                await asyncio.gather(
+                    *(col.estimated_document_count() for col in db.file_cols)
+                )
+            )
+            record(
+                section,
+                "central registry covers every sharded movie document",
+                _pf(registry_count == shard_count),
+                f"registry={registry_count:,}, shards={shard_count:,}",
+            )
+        except Exception as e:
+            record(section, "central registry verification", "FAIL", str(e)[:300])
+    else:
+        record(section, "central registry configured", "FAIL")
 
     # 3b. Confirm the exact _id-descending query shape get_search_results
     # now uses (replacing $natural) runs cleanly per cluster and returns
@@ -315,7 +346,7 @@ async def main():
 
     for client in db.clients:
         try:
-            client.close()
+            await client.close()
         except Exception:
             pass
 

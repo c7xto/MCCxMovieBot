@@ -233,7 +233,7 @@ async def _handle_request_link(message, raw_query: str):
         f"{ICON_REQUEST} <b>Movie Request</b>\n\n"
         f"Requesting: <code>{_html(movie_name)}</code>\n\n"
         f"Tap below to send this to the admins.",
-        reply_markup=markup, parse_mode=ParseMode.HTML, quote=True
+        reply_markup=markup, parse_mode=ParseMode.HTML, reply_parameters=None
     )
 
 
@@ -247,7 +247,7 @@ async def _handle_search_payload(client, message, config, payload: str):
     query = urllib.parse.unquote(raw_query).replace("_", " ")
     status_msg = await message.reply_text(
         "🔎 <b>Searching your library…</b>\n<i>Matching title, language and quality</i>",
-        parse_mode=ParseMode.HTML, quote=True
+        parse_mode=ParseMode.HTML, reply_parameters=None
     )
     return await _execute_search(
         client, status_msg, query, config,
@@ -310,13 +310,13 @@ async def start_handler(client: Client, message: Message):
     try:
         media_lower = START_MEDIA.lower()
         if media_lower.endswith((".mp4", ".mkv", ".mov")):
-            await message.reply_video(video=START_MEDIA, caption=caption_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML, quote=True)
+            await message.reply_video(video=START_MEDIA, caption=caption_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML, reply_parameters=None)
         elif media_lower.endswith((".gif")):
-            await message.reply_animation(animation=START_MEDIA, caption=caption_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML, quote=True)
+            await message.reply_animation(animation=START_MEDIA, caption=caption_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML, reply_parameters=None)
         else:
-            await message.reply_photo(photo=START_MEDIA, caption=caption_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML, quote=True)
+            await message.reply_photo(photo=START_MEDIA, caption=caption_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML, reply_parameters=None)
     except Exception:
-        await message.reply_text(text=caption_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML, quote=True, **_no_preview())
+        await message.reply_text(text=caption_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML, reply_parameters=None, **_no_preview())
 
 
 @Client.on_callback_query(filters.regex(r"^help_menu$"))

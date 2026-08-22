@@ -218,5 +218,5 @@ async def send_fsub_message(client, message, pending_file_id=None):
         f"<blockquote>Tap join, then tap <b>✅ Done — Let Me In</b></blockquote>"
     )
     await message.reply_text(
-        text, reply_markup=markup, quote=True, parse_mode=ParseMode.HTML
+        text, reply_markup=markup, reply_parameters=None, parse_mode=ParseMode.HTML
     )

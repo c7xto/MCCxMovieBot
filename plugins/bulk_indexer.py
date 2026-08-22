@@ -281,7 +281,7 @@ async def forward_indexer(client: Client, message: Message):
         logger.warning(f"Forward detection error: {detect_err}")
 
     if not chat_id or not last_msg_id:
-        return await message.reply_text("⚠️ Could not detect the channel ID. Please forward directly from a channel.", quote=True)
+        return await message.reply_text("⚠️ Could not detect the channel ID. Please forward directly from a channel.", reply_parameters=None)
 
     # --- PRE-FLIGHT CHECK ---
     try:
@@ -293,7 +293,7 @@ async def forward_indexer(client: Client, message: Message):
             f"I cannot read messages from `{chat_id}`.\n"
             f"**Error:** `{e}`\n\n"
             f"⚠️ **Fix:** Make sure you add me as an **Administrator** to the channel first!",
-            quote=True
+            reply_parameters=None
         )
     # ------------------------
 
@@ -313,7 +313,7 @@ async def forward_indexer(client: Client, message: Message):
         f"{resume_text}\n"
         f"Ready to run in Stealth Mode?",
         reply_markup=markup,
-        quote=True
+        reply_parameters=None
     )
     raise StopPropagation  # prevent forwarded message leaking into auto_filter
 

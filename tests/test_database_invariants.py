@@ -17,6 +17,20 @@ class AsyncListCursor:
         return self.docs[:length]
 
 
+class AsyncIterator:
+    def __init__(self, items):
+        self._items = iter(items)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._items)
+        except StopIteration:
+            raise StopAsyncIteration
+
+
 class PartialInsertCollection:
     def __init__(self):
         self.received = []
@@ -146,3 +160,40 @@ async def test_search_preserves_relevance_tiers():
 
     results = await database.get_search_results("alpha beta", max_results=10)
     assert [doc["file_id"] for doc in results] == ["exact", "loose", "word-a", "word-b"]
+
+
+@pytest.mark.asyncio
+async def test_capacity_uses_whole_cluster_and_ignores_system_databases():
+    database = bare_database()
+    database._db_size_cache = {}
+    one_mb = 1024 * 1024
+    client = SimpleNamespace(list_databases=AsyncMock(return_value=AsyncIterator([
+        {"name": "admin", "sizeOnDisk": 50 * one_mb},
+        {"name": "MCCxBot_Cluster_1", "sizeOnDisk": 200 * one_mb},
+        {"name": "another_app", "sizeOnDisk": 251 * one_mb},
+    ])))
+    cluster_db = SimpleNamespace(client=client)
+
+    assert await database.get_db_size(cluster_db) == 451
+
+
+@pytest.mark.asyncio
+async def test_existing_shard_indexes_are_verified_without_writes():
+    database = bare_database()
+    collection = SimpleNamespace(
+        index_information=AsyncMock(return_value={
+            "_id_": {"key": [("_id", 1)]},
+            "file_name_1": {"key": [("file_name", 1)]},
+            "file_id_1": {"key": [("file_id", 1)]},
+        }),
+        create_index=AsyncMock(),
+    )
+    database.file_cols = [collection]
+    database.main_db = None
+    database.deletion_col = None
+    database.groups_col = None
+    database.registry_col = None
+
+    await database.ensure_indexes()
+
+    collection.create_index.assert_not_awaited()

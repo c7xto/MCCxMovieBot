@@ -211,16 +211,22 @@ class Database:
         self.deletion_col = None
         self.groups_col = None
         self.main_db = None
+        self.legacy_main_db = None
         self._search_cache = _SearchCache(maxsize=2000, default_ttl=600)
         self._db_size_cache = {}  # id(db_instance) -> (fetched_at, size_mb)
         self._file_count_cache = (0.0, 0)
 
         if self.dbs:
-            self.main_db = self.dbs[0]
+            # Keep movie shards in their original numbered databases, but put
+            # the writable control plane on cluster 2 when available.  Atlas
+            # blocks *all* writes on an over-quota cluster, so users, settings,
+            # groups and request bookkeeping must not depend on cluster 1.
+            self.legacy_main_db = self.dbs[0]
+            _ops_db = self.dbs[1] if len(self.dbs) > 1 else self.legacy_main_db
+            self.main_db = _ops_db
             self.users_col = self.main_db["users"]
             self.banned_col = self.main_db["banned_users"]
             self.config_col = self.main_db["bot_config"]
-            _ops_db = self.dbs[1] if len(self.dbs) > 1 else self.main_db
             self.indexer_col = _ops_db["indexer_tasks"]
             # Centralized cross-cluster identity registry — single source of
             # truth for file_id uniqueness across all sharded clusters, since
@@ -234,12 +240,90 @@ class Database:
             self.deletion_col = _ops_db["scheduled_deletions"]
             self.groups_col = _ops_db["connected_groups"]
 
+    async def migrate_legacy_control_data(self):
+        """Copy the small writable control plane off legacy cluster 1 once.
+
+        Movie collections are deliberately excluded. Existing target records
+        win, so a restart can never overwrite newer settings or counters with
+        stale values from the read-only legacy database.
+        """
+        if (
+            self.main_db is None
+            or self.legacy_main_db is None
+            or self.main_db is self.legacy_main_db
+        ):
+            return
+
+        marker_col = self.main_db["_migrations"]
+        marker_id = "control_plane_to_operations_v1"
+        if await marker_col.find_one({"_id": marker_id}, {"_id": 1}):
+            return
+
+        collections = (
+            "bot_config",
+            "users",
+            "banned_users",
+            "connected_groups",
+            "missed_searches",
+            "pending_requests",
+            "settings",
+            "duplicate_scan_results",
+        )
+        copied = 0
+        for name in collections:
+            source = self.legacy_main_db[name]
+            target = self.main_db[name]
+            ops = []
+            async for document in source.find({}):
+                document_id = document.pop("_id")
+                payload = document or {"_legacy_migrated": True}
+                ops.append(UpdateOne(
+                    {"_id": document_id},
+                    {"$setOnInsert": payload},
+                    upsert=True,
+                ))
+                if len(ops) >= 500:
+                    result = await target.bulk_write(ops, ordered=False)
+                    copied += result.upserted_count
+                    ops = []
+            if ops:
+                result = await target.bulk_write(ops, ordered=False)
+                copied += result.upserted_count
+
+        await marker_col.update_one(
+            {"_id": marker_id},
+            {"$set": {"completed_at": time.time(), "copied_documents": copied}},
+            upsert=True,
+        )
+        logger.info("✅ Migrated %s legacy control-plane document(s) to operations DB.", copied)
+
     async def ensure_indexes(self):
         for i, col in enumerate(self.file_cols):
             try:
-                await col.create_index("file_name")
-                await col.create_index("file_id", unique=True)
-                logger.info(f"✅ Index ensured on Cluster {i+1}")
+                indexes = await col.index_information()
+                file_name_indexes = [
+                    spec for spec in indexes.values()
+                    if ("file_name", 1) in spec.get("key", [])
+                ]
+                if not file_name_indexes:
+                    await col.create_index("file_name")
+                file_id_indexes = [
+                    spec for spec in indexes.values()
+                    if ("file_id", 1) in spec.get("key", [])
+                ]
+                if not file_id_indexes:
+                    await col.create_index("file_id", unique=True)
+                elif not any(spec.get("unique") for spec in file_id_indexes):
+                    # Do not attempt an in-place unique-index replacement on
+                    # every startup. The centralized registry already enforces
+                    # cross-cluster uniqueness, and an existing non-unique
+                    # index is still useful for lookups.
+                    logger.info(
+                        "ℹ️ Cluster %s uses a legacy non-unique file_id index; "
+                        "central registry enforces uniqueness.",
+                        i + 1,
+                    )
+                logger.info(f"✅ Indexes verified on Cluster {i+1}")
             except Exception as e:
                 logger.warning(f"⚠️ Could not create index on Cluster {i+1}: {e}")
         if self.main_db is not None:
@@ -440,23 +524,41 @@ class Database:
     _DB_SIZE_TTL = 30  # seconds
 
     async def get_db_size(self, db_instance):
-        """Cached wrapper around the `dbstats` command. save_file() and
-        save_files_bulk() call this once per candidate cluster on every
-        single write — once earlier clusters fill up, that becomes a
-        sequential dbstats round-trip on each of them before ever reaching
-        one with room. A short TTL keeps the "is this cluster full" check
-        fresh enough (worst case a few seconds stale right at the 450MB
-        boundary) while collapsing bursts of saves into one real query."""
+        """Return cached Atlas usage for the whole physical cluster.
+
+        An Atlas M0 quota applies across every database on that cluster, not
+        only this bot's ``MCCxBot_Cluster_N`` database. Using ``dbstats`` for
+        one database made a 514MB cluster look like 249MB and repeatedly sent
+        writes to a server that Atlas had already made read-only.
+        """
         now  = time.time()
         key  = id(db_instance)
         hit  = self._db_size_cache.get(key)
         if hit and (now - hit[0]) < self._DB_SIZE_TTL:
             return hit[1]
         try:
-            stats = await db_instance.command("dbstats")
-            size  = max(stats.get("storageSize", 0), stats.get("dataSize", 0)) / (1024 * 1024)
-        except Exception:
-            size = 0
+            total_bytes = 0
+            async for info in await db_instance.client.list_databases():
+                if info.get("name") not in {"admin", "local", "config"}:
+                    total_bytes += info.get("sizeOnDisk", 0)
+            size = total_bytes / (1024 * 1024)
+        except Exception as cluster_error:
+            try:
+                stats = await db_instance.command("dbstats")
+                size = (
+                    max(stats.get("storageSize", 0), stats.get("dataSize", 0))
+                    + stats.get("indexSize", 0)
+                ) / (1024 * 1024)
+            except Exception as db_error:
+                # Unknown usage must fail closed: skipping a temporarily
+                # unavailable shard is safer than reserving IDs for writes
+                # that cannot possibly be acknowledged.
+                logger.warning(
+                    "Could not determine cluster capacity (%s; fallback: %s)",
+                    cluster_error,
+                    db_error,
+                )
+                size = float("inf")
         self._db_size_cache[key] = (now, size)
         return size
 
@@ -1174,11 +1276,15 @@ class Database:
         prefix = anchor[:5]
 
         async def _search_cluster(col):
-            cursor = col.find(
-                {"file_name": {"$regex": f"(?:^|[\\W_]){re.escape(prefix)}", "$options": "i"}},
-                {"file_name": 1}
-            ).limit(15)
-            return [doc.get("file_name", "") async for doc in cursor]
+            try:
+                cursor = col.find(
+                    {"file_name": {"$regex": f"(?:^|[\\W_]){re.escape(prefix)}", "$options": "i"}},
+                    {"file_name": 1},
+                ).limit(15).max_time_ms(5000)
+                return [doc.get("file_name", "") async for doc in cursor]
+            except Exception as exc:
+                logger.warning("Suggestion lookup skipped an unavailable cluster: %s", exc)
+                return []
 
         cluster_results = await asyncio.gather(*[_search_cluster(col) for col in self.file_cols])
 
