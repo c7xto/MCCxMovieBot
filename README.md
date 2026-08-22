@@ -111,7 +111,7 @@ docker compose logs -f bot
 pip install -r requirements-dev.txt
 python -m compileall -q .
 ruff check .
-pytest -q
+python -m pytest -q
 pip-audit -r requirements.txt --progress-spinner off
 ```
 
