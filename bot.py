@@ -140,8 +140,14 @@ class AutoFilterBot(Client):
             max_concurrent_transmissions=3
         )
 
-    async def start(self):
-        await super().start()
+    async def start(self, *args, **kwargs):
+        """Start through Kurigram while preserving its runtime options.
+
+        ``Client.run()`` forwards keyword arguments such as ``use_qr`` and
+        ``except_ids`` to ``start()``.  Accepting and forwarding them keeps
+        this override compatible with current Kurigram releases.
+        """
+        await super().start(*args, **kwargs)
         me = await self.get_me()
         logger.info(f"🚀 Bot started as @{me.username}")
 
