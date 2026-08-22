@@ -209,6 +209,7 @@ class Database:
         self.indexer_col = None
         self.registry_col = None
         self.deletion_col = None
+        self.groups_col = None
         self.main_db = None
         self._search_cache = _SearchCache(maxsize=2000, default_ttl=600)
         self._db_size_cache = {}  # id(db_instance) -> (fetched_at, size_mb)
@@ -231,6 +232,7 @@ class Database:
             # quota continue to register files and schedule message cleanup.
             self.registry_col = _ops_db["file_registry"]
             self.deletion_col = _ops_db["scheduled_deletions"]
+            self.groups_col = _ops_db["connected_groups"]
 
     async def ensure_indexes(self):
         for i, col in enumerate(self.file_cols):
@@ -244,7 +246,6 @@ class Database:
             try:
                 await self.main_db["missed_searches"].create_index([("count", -1)])
                 await self.main_db["pending_requests"].create_index("movie_name")
-                await self.main_db["connected_groups"].create_index("search_count")
                 # TTL cleanup — additive only, never touches existing
                 # documents. Both fields are populated going forward
                 # (log_missed_search() / save_pending_request());
@@ -265,6 +266,11 @@ class Database:
                 await self.deletion_col.create_index("due_at")
             except Exception as e:
                 logger.warning("Could not ensure scheduled-deletion index: %s", e)
+        if self.groups_col is not None:
+            try:
+                await self.groups_col.create_index("search_count")
+            except Exception as e:
+                logger.warning("Could not ensure connected-groups index: %s", e)
         if self.registry_col is not None:
             try:
                 await self.registry_col.create_index("file_id", unique=True)
@@ -359,12 +365,11 @@ class Database:
         return [doc["_id"] async for doc in cursor]
 
     async def add_group(self, group_id, group_title):
-        if self.main_db is None:
+        if self.groups_col is None:
             return False
-        groups_col = self.main_db["connected_groups"]
-        group = await groups_col.find_one({"_id": group_id})
+        group = await self.groups_col.find_one({"_id": group_id})
         if not group:
-            await groups_col.insert_one({
+            await self.groups_col.insert_one({
                 "_id": group_id,
                 "title": group_title,
                 "added": time.time(),
@@ -377,59 +382,59 @@ class Database:
         return False
 
     async def get_all_groups(self):
-        if self.main_db is None:
+        if self.groups_col is None:
             return []
-        cursor = self.main_db["connected_groups"].find({})
+        cursor = self.groups_col.find({})
         return [doc async for doc in cursor]
 
     async def get_group_count(self):
-        if self.main_db is None:
+        if self.groups_col is None:
             return 0
-        return await self.main_db["connected_groups"].count_documents({})
+        return await self.groups_col.count_documents({})
 
     async def get_group(self, group_id):
-        if self.main_db is None:
+        if self.groups_col is None:
             return None
-        return await self.main_db["connected_groups"].find_one({"_id": group_id})
+        return await self.groups_col.find_one({"_id": group_id})
 
     async def update_group(self, group_id, fields: dict):
-        if self.main_db is None:
+        if self.groups_col is None:
             return
-        await self.main_db["connected_groups"].update_one({"_id": group_id}, {"$set": fields}, upsert=True)
+        await self.groups_col.update_one({"_id": group_id}, {"$set": fields}, upsert=True)
 
     async def ban_group(self, group_id):
-        if self.main_db is None:
+        if self.groups_col is None:
             return
-        await self.main_db["connected_groups"].update_one({"_id": group_id}, {"$set": {"banned": True}}, upsert=True)
+        await self.groups_col.update_one({"_id": group_id}, {"$set": {"banned": True}}, upsert=True)
 
     async def unban_group(self, group_id):
-        if self.main_db is None:
+        if self.groups_col is None:
             return
-        await self.main_db["connected_groups"].update_one({"_id": group_id}, {"$set": {"banned": False}})
+        await self.groups_col.update_one({"_id": group_id}, {"$set": {"banned": False}})
 
     async def is_group_banned(self, group_id):
-        if self.main_db is None:
+        if self.groups_col is None:
             return False
-        doc = await self.main_db["connected_groups"].find_one({"_id": group_id})
+        doc = await self.groups_col.find_one({"_id": group_id})
         return doc.get("banned", False) if doc else False
 
     async def is_group_whitelisted(self, group_id):
-        if self.main_db is None:
+        if self.groups_col is None:
             return True
-        doc = await self.main_db["connected_groups"].find_one({"_id": group_id})
+        doc = await self.groups_col.find_one({"_id": group_id})
         return doc.get("whitelisted", False) if doc else False
 
     async def increment_group_search(self, group_id):
-        if self.main_db is None:
+        if self.groups_col is None:
             return
-        await self.main_db["connected_groups"].update_one(
+        await self.groups_col.update_one(
             {"_id": group_id}, {"$inc": {"search_count": 1}}, upsert=True
         )
 
     async def get_top_groups(self, limit=10):
-        if self.main_db is None:
+        if self.groups_col is None:
             return []
-        cursor = self.main_db["connected_groups"].find({}).sort("search_count", -1).limit(limit)
+        cursor = self.groups_col.find({}).sort("search_count", -1).limit(limit)
         return [doc async for doc in cursor]
 
     _DB_SIZE_TTL = 30  # seconds

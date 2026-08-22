@@ -306,7 +306,42 @@ async def group_search(client: Client, message: Message):
             text=caption, reply_markup=markup, parse_mode=ParseMode.HTML
         )
         result_msg = status_msg
-    except Exception:
+    except Exception as exc:
+        # Never leave a group search stuck on the temporary "Searching"
+        # message.  Log Telegram's actual rejection and retry with a smaller,
+        # callback-free keyboard that stays well below markup limits.
+        logger.exception("Group result-card edit failed for %r: %s", query, exc)
+        compact_buttons = []
+        for index, file_doc in enumerate(page_files, 1):
+            compact_label = _variant_label(file_doc, show_title=False)
+            compact_label = f"{index}. {compact_label}"[:52]
+            compact_buttons.append([InlineKeyboardButton(
+                compact_label,
+                url=f"https://t.me/{client.me.username}?start=file_{file_doc['_id']}",
+            )])
+        compact_buttons.append([InlineKeyboardButton(
+            "⌂ Open Movie Hub", url=f"https://t.me/{client.me.username}"
+        )])
+        try:
+            await status_msg.edit_text(
+                text=caption,
+                reply_markup=InlineKeyboardMarkup(compact_buttons),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as fallback_exc:
+            logger.exception(
+                "Compact group result-card edit also failed for %r: %s",
+                query,
+                fallback_exc,
+            )
+            await status_msg.edit_text(
+                text=(
+                    f"🎬 <b>{_html(query.title())}</b>\n"
+                    f"<blockquote>{total} matches found.</blockquote>\n"
+                    f"Open @{client.me.username} privately to get the files."
+                ),
+                parse_mode=ParseMode.HTML,
+            )
         result_msg = status_msg
 
     await db.schedule_deletion(result_msg.chat.id, result_msg.id, _del_secs)
