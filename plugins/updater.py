@@ -111,6 +111,29 @@ async def _download(session: aiohttp.ClientSession, sha: str, path: str) -> byte
         return await r.read()
 
 
+async def _install_requirements(requirements_path: Path) -> tuple[bool, str]:
+    """Install a staged dependency lock with the bot's current interpreter."""
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+        "-r",
+        str(requirements_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        output, _ = await asyncio.wait_for(process.communicate(), timeout=300)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.communicate()
+        return False, "Dependency installation timed out after 5 minutes."
+    detail = output.decode("utf-8", errors="replace")[-3000:]
+    return process.returncode == 0, detail
+
+
 def _write_file(path: str, content: bytes):
     """Synchronous disk I/O — always call via asyncio.to_thread so it
     doesn't block the event loop for every user while an update runs."""
@@ -124,7 +147,7 @@ async def _do_update(client: Client, status: Message, sha: str):
     # Step 1 — fetch file list for this exact commit
     try:
         await status.edit_text(
-            f"🔄 **Step 1/3** — Fetching file list for `{sha[:12]}`...",
+            f"🔄 **Step 1/4** — Fetching file list for `{sha[:12]}`...",
             parse_mode=ParseMode.MARKDOWN,
         )
     except Exception:
@@ -150,7 +173,7 @@ async def _do_update(client: Client, status: Message, sha: str):
 
     try:
         await status.edit_text(
-            f"🔄 **Step 2/3** — Downloading `{len(to_update)}` files...\n"
+            f"🔄 **Step 2/4** — Downloading `{len(to_update)}` files...\n"
             f"_({protected} runtime secret/state file(s) protected)_",
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -197,6 +220,35 @@ async def _do_update(client: Client, status: Message, sha: str):
                 parse_mode=ParseMode.MARKDOWN,
             )
             return
+
+        staged_requirements = stage_root / "requirements.txt"
+        live_requirements = PROJECT_ROOT / "requirements.txt"
+        requirements_changed = (
+            staged_requirements.is_file()
+            and (
+                not live_requirements.is_file()
+                or staged_requirements.read_bytes() != live_requirements.read_bytes()
+            )
+        )
+        if requirements_changed:
+            await status.edit_text(
+                "🔄 **Step 3/4** — Installing verified dependencies...",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            dependencies_ok, detail = await _install_requirements(staged_requirements)
+            if not dependencies_ok:
+                logger.error("Updater dependency installation failed:\n%s", detail)
+                await status.edit_text(
+                    "❌ **Update aborted safely**\n\nDependency installation failed. "
+                    "The live source tree was not changed; check the server log for details.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
+
+        await status.edit_text(
+            "🔄 **Step 4/4** — Applying the staged release...",
+            parse_mode=ParseMode.MARKDOWN,
+        )
 
         previous_files = set()
         if _DEPLOYED_FILES.exists():
