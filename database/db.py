@@ -9,8 +9,7 @@ from collections import OrderedDict
 from functools import lru_cache
 from bson.objectid import ObjectId
 import certifi
-from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo import InsertOne
+from pymongo import AsyncMongoClient, InsertOne, UpdateOne
 from pymongo.errors import DuplicateKeyError, BulkWriteError
 from dotenv import load_dotenv
 
@@ -71,6 +70,10 @@ def compile_regex(pattern):
 _JUNK_TAG_RE = re.compile(r"http\S+|www\.\S+|@\w+", re.IGNORECASE)
 _SYMBOL_RE = re.compile(r"[_\-\.#+$%^&*()!~`,;:\"'?/<>\[\]{}=|\\]")
 _WS_COLLAPSE_RE = re.compile(r"\s+")
+_SEARCH_FALLBACK_STOP = {
+    "the", "and", "for", "with", "from", "movie", "film", "part",
+    "season", "episode", "full", "official",
+}
 
 
 def normalize_file_name(name: str) -> str:
@@ -84,6 +87,21 @@ def normalize_file_name(name: str) -> str:
     cleaned = _SYMBOL_RE.sub(" ", cleaned)
     cleaned = _WS_COLLAPSE_RE.sub(" ", cleaned).strip()
     return cleaned or name.strip()
+
+
+def deduplicate_file_batch(files_list):
+    """Keep the first document for each valid file_id and count rejects."""
+    unique_files = []
+    seen = set()
+    duplicate_count = 0
+    for file_doc in files_list:
+        fid = file_doc.get("file_id")
+        if not fid or fid in seen:
+            duplicate_count += 1
+            continue
+        seen.add(fid)
+        unique_files.append(file_doc)
+    return unique_files, duplicate_count
 
 
 # Precompiled once at import time — find_duplicate_files()._normalize() runs
@@ -157,16 +175,18 @@ class Database:
         for i, uri in enumerate(self.uris):
             if uri:
                 try:
-                    client = AsyncIOMotorClient(
+                    uri_lower = uri.lower()
+                    tls_options = {}
+                    if uri_lower.startswith("mongodb+srv://") or "tls=true" in uri_lower or "ssl=true" in uri_lower:
+                        tls_options = {"tls": True, "tlsCAFile": certifi.where()}
+                    client = AsyncMongoClient(
                         uri,
-                        tls=True,
-                        tlsCAFile=certifi.where(),
                         serverSelectionTimeoutMS=30000,
                         connectTimeoutMS=30000,
                         socketTimeoutMS=30000,
                         retryWrites=True,
                         retryReads=True,
-                        # Bounded explicitly rather than left at Motor's default
+                        # Bounded explicitly rather than left at the driver default
                         # (100) — up to 5 clusters x asyncio.gather fan-outs on
                         # every search means an unbounded pool could push total
                         # concurrent connections toward Atlas's per-tier ceiling
@@ -174,6 +194,7 @@ class Database:
                         # holding idle connections open on a quiet bot.
                         maxPoolSize=50,
                         minPoolSize=0,
+                        **tls_options,
                     )
                     self.clients.append(client)
                     db_instance = client[f"MCCxBot_Cluster_{i+1}"]
@@ -187,9 +208,11 @@ class Database:
         self.config_col = None
         self.indexer_col = None
         self.registry_col = None
+        self.deletion_col = None
         self.main_db = None
         self._search_cache = _SearchCache(maxsize=2000, default_ttl=600)
         self._db_size_cache = {}  # id(db_instance) -> (fetched_at, size_mb)
+        self._file_count_cache = (0.0, 0)
 
         if self.dbs:
             self.main_db = self.dbs[0]
@@ -203,6 +226,7 @@ class Database:
             # the per-cluster unique index on `movies.file_id` only protects
             # within one cluster's collection.
             self.registry_col = self.main_db["file_registry"]
+            self.deletion_col = self.main_db["scheduled_deletions"]
 
     async def ensure_indexes(self):
         for i, col in enumerate(self.file_cols):
@@ -230,8 +254,9 @@ class Database:
                 await self.main_db["pending_requests"].create_index(
                     "requested_at", expireAfterSeconds=180 * 24 * 3600  # 180 days — generous so a slow-to-fulfill request still gets auto-notified
                 )
-            except Exception:
-                pass
+                await self.main_db["scheduled_deletions"].create_index("due_at")
+            except Exception as e:
+                logger.warning("Could not ensure auxiliary indexes: %s", e)
         if self.registry_col is not None:
             try:
                 await self.registry_col.create_index("file_id", unique=True)
@@ -283,6 +308,20 @@ class Database:
             return []
         cursor = self.users_col.find({})
         return [doc["_id"] async for doc in cursor]
+
+    async def get_user_count(self):
+        """Return a count without materialising the complete user collection."""
+        if self.users_col is None:
+            return 0
+        return await self.users_col.count_documents({})
+
+    async def iter_user_ids(self, batch_size=500):
+        """Stream recipient IDs for broadcasts instead of loading all users."""
+        if self.users_col is None:
+            return
+        cursor = self.users_col.find({}, {"_id": 1}).batch_size(batch_size)
+        async for doc in cursor:
+            yield doc["_id"]
 
     async def delete_user(self, user_id):
         if self.users_col is None:
@@ -409,13 +448,37 @@ class Database:
         return size
 
     async def get_total_files(self):
+        cached_at, cached_count = self._file_count_cache
+        if time.time() - cached_at < 30:
+            return cached_count
+
         async def _count(col):
             try:
                 return await col.count_documents({})
             except Exception:
                 return 0
         counts = await asyncio.gather(*[_count(col) for col in self.file_cols])
-        return sum(counts)
+        total = sum(counts)
+        self._file_count_cache = (time.time(), total)
+        return total
+
+    def _invalidate_file_count(self):
+        self._file_count_cache = (0.0, 0)
+
+    async def registry_needs_migration(self):
+        """Detect the dangerous upgrade case: old files but no registry."""
+        if self.registry_col is None:
+            return False
+        if await self.registry_col.count_documents({}, limit=1):
+            return False
+
+        async def _has_file(col):
+            try:
+                return await col.find_one({}, {"_id": 1}) is not None
+            except Exception:
+                return False
+
+        return any(await asyncio.gather(*[_has_file(col) for col in self.file_cols]))
 
     async def save_file(self, media):
         file_id   = getattr(media, "file_id", "")
@@ -441,10 +504,27 @@ class Database:
             if size >= 450:
                 continue
             try:
-                await col.insert_one(file_doc)
+                result = await col.insert_one(file_doc)
+                if self.registry_col is not None:
+                    await self.registry_col.update_one(
+                        {"file_id": file_id},
+                        {"$set": {"cluster": i + 1, "movie_id": str(result.inserted_id)}},
+                    )
+                self._invalidate_file_count()
                 return True, f"Saved to Cluster {i+1}"
             except DuplicateKeyError:
+                # A physical row already exists. Keep the reservation and
+                # repair its location metadata instead of releasing it.
+                existing = await col.find_one({"file_id": file_id}, {"_id": 1})
+                if existing and self.registry_col is not None:
+                    await self.registry_col.update_one(
+                        {"file_id": file_id},
+                        {"$set": {"cluster": i + 1, "movie_id": str(existing["_id"])}},
+                    )
                 return False, "Duplicate"
+            except Exception as e:
+                logger.warning(f"Cluster {i+1} insert failed for {file_id}: {e}")
+                continue
 
         # Nothing could actually be stored — roll back the registry
         # reservation so this file_id isn't permanently (and incorrectly)
@@ -471,21 +551,72 @@ class Database:
             return file_ids, 0
         except BulkWriteError as bwe:
             write_errors = bwe.details.get("writeErrors", [])
+            concern_errors = bwe.details.get("writeConcernErrors", [])
+            if concern_errors:
+                # The server may have applied some reservations, but did not
+                # acknowledge them reliably. Remove only claims with no
+                # physical file, then force the indexer to retry later.
+                await self._release_registry_ids(file_ids)
+                raise RuntimeError(
+                    f"Registry write concern failed: {concern_errors[:1]}"
+                ) from bwe
             dup_indexes  = {e["index"] for e in write_errors if e.get("code") == 11000}
             other_errors = [e for e in write_errors if e.get("code") != 11000]
             if other_errors:
-                logger.warning(f"{len(other_errors)} non-duplicate-key registry errors: {other_errors[:1]}")
+                # Continuing would store files without a uniqueness claim.
+                # Roll back reservations that did succeed, then fail so the
+                # caller can retry the complete batch safely.
+                failed_indexes = {e.get("index") for e in write_errors}
+                reserved = [
+                    fid for idx, fid in enumerate(file_ids)
+                    if idx not in failed_indexes
+                ]
+                if reserved:
+                    try:
+                        await self.registry_col.delete_many({"file_id": {"$in": reserved}})
+                    except Exception as rollback_error:
+                        logger.error(
+                            "Registry reservation rollback failed for %s IDs: %s",
+                            len(reserved), rollback_error,
+                        )
+                raise RuntimeError(
+                    f"Registry reservation failed for {len(other_errors)} file(s): "
+                    f"{other_errors[:1]}"
+                ) from bwe
             accepted = [fid for idx, fid in enumerate(file_ids) if idx not in dup_indexes]
             return accepted, len(dup_indexes)
+
+    async def _mark_registry_locations(self, docs: list, cluster_index: int):
+        if not docs or self.registry_col is None:
+            return
+        ops = [
+            UpdateOne(
+                {"file_id": doc["file_id"]},
+                {"$set": {"cluster": cluster_index + 1, "movie_id": str(doc["_id"])}},
+            )
+            for doc in docs if doc.get("file_id") and doc.get("_id")
+        ]
+        if ops:
+            try:
+                await self.registry_col.bulk_write(ops, ordered=False)
+            except Exception as e:
+                # Location is repairable metadata; the file_id reservation is
+                # the actual uniqueness invariant and must remain claimed.
+                logger.warning("Could not update registry location metadata: %s", e)
 
     async def save_files_bulk(self, files_list):
         if not files_list:
             return 0, 0
 
-        incoming_ids = [f["file_id"] for f in files_list]
+        # De-duplicate the incoming batch before reserving IDs. Filtering via
+        # an accepted-id set after reservation reintroduced duplicate entries.
+        unique_files, internal_duplicates = deduplicate_file_batch(files_list)
+
+        incoming_ids = [f["file_id"] for f in unique_files]
         accepted_ids, duplicates = await self._registry_bulk_reserve(incoming_ids)
+        duplicates += internal_duplicates
         accepted_set = set(accepted_ids)
-        new_files    = [f for f in files_list if f["file_id"] in accepted_set]
+        new_files    = [f for f in unique_files if f["file_id"] in accepted_set]
 
         if not new_files:
             return 0, duplicates
@@ -499,9 +630,57 @@ class Database:
             if size >= 450:
                 continue
             try:
-                await col.insert_many(remaining, ordered=False)
-                saved_total += len(remaining)
+                result = await col.insert_many(remaining, ordered=False)
+                inserted = []
+                for doc, inserted_id in zip(remaining, result.inserted_ids):
+                    stored = dict(doc)
+                    stored["_id"] = inserted_id
+                    inserted.append(stored)
+                await self._mark_registry_locations(inserted, i)
+                saved_total += len(inserted)
                 remaining    = []
+            except BulkWriteError as bwe:
+                errors = bwe.details.get("writeErrors", [])
+                failed_indexes = {err.get("index") for err in errors}
+                successful = [doc for idx, doc in enumerate(remaining) if idx not in failed_indexes]
+
+                # PyMongo normally adds generated _ids to input documents
+                # before the write. Query only as a fallback (also useful for
+                # alternate/fake collection implementations).
+                if successful:
+                    stored_docs = [doc for doc in successful if doc.get("_id")]
+                    if len(stored_docs) != len(successful):
+                        try:
+                            stored_docs = await col.find(
+                                {"file_id": {"$in": [doc["file_id"] for doc in successful]}},
+                                {"_id": 1, "file_id": 1},
+                            ).to_list(length=len(successful))
+                        except Exception as e:
+                            logger.warning("Could not read inserted IDs for registry metadata: %s", e)
+                            stored_docs = []
+                    await self._mark_registry_locations(stored_docs, i)
+                    saved_total += len(successful)
+
+                retry = []
+                for err in errors:
+                    idx = err.get("index")
+                    if idx is None or idx >= len(remaining):
+                        continue
+                    doc = remaining[idx]
+                    if err.get("code") == 11000:
+                        # The row already exists physically; repair registry
+                        # metadata and treat it as a duplicate, not an unsaved file.
+                        existing = await col.find_one({"file_id": doc["file_id"]}, {"_id": 1, "file_id": 1})
+                        if existing:
+                            await self._mark_registry_locations([existing], i)
+                            duplicates += 1
+                            continue
+                    retry.append(doc)
+                remaining = retry
+                logger.warning(
+                    f"Cluster {i+1} bulk insert: {len(successful)} saved, "
+                    f"{len(retry)} retryable, {len(errors) - len(retry)} duplicate(s)"
+                )
             except Exception as e:
                 if "space quota" in str(e).lower() or "over your space" in str(e).lower():
                     logger.error(f"Cluster {i+1} FULL — add DATABASE_URI_{i+2} to .env")
@@ -526,7 +705,38 @@ class Database:
             # "database full" for "everything was a duplicate".
             raise AllClustersFullError(len(remaining), duplicates)
 
+        if saved_total:
+            self._invalidate_file_count()
         return saved_total, duplicates
+
+    async def _release_registry_ids(self, file_ids, batch_size=500):
+        """Release registry claims only when no physical row remains.
+
+        This keeps deletes, purges, duplicate cleanup and automatic broken-file
+        removal consistent with the cross-cluster uniqueness registry.
+        """
+        if self.registry_col is None:
+            return
+        ids = list(dict.fromkeys(fid for fid in file_ids if fid))
+        for start in range(0, len(ids), batch_size):
+            chunk = ids[start:start + batch_size]
+            present_sets = await asyncio.gather(*[
+                col.distinct("file_id", {"file_id": {"$in": chunk}})
+                for col in self.file_cols
+            ], return_exceptions=True)
+            errors = [value for value in present_sets if isinstance(value, Exception)]
+            if errors:
+                # Never release a uniqueness claim when an unavailable cluster
+                # prevents us from proving that no physical copy remains.
+                logger.warning(
+                    "Registry cleanup deferred for %s file(s): %s cluster check(s) failed",
+                    len(chunk), len(errors),
+                )
+                continue
+            present = {fid for values in present_sets for fid in values}
+            orphaned = [fid for fid in chunk if fid not in present]
+            if orphaned:
+                await self.registry_col.delete_many({"file_id": {"$in": orphaned}})
 
     async def admin_search_files(self, query, limit=20):
         clean = re.sub(r"[^a-zA-Z0-9]", " ", query.strip())
@@ -556,8 +766,21 @@ class Database:
         except Exception:
             return False
         for col in self.file_cols:
-            result = await col.delete_one({"_id": obj_id})
+            try:
+                doc = await col.find_one({"_id": obj_id}, {"file_id": 1})
+            except Exception as e:
+                logger.warning("File lookup failed during delete: %s", e)
+                continue
+            if not doc:
+                continue
+            try:
+                result = await col.delete_one({"_id": obj_id})
+            except Exception as e:
+                logger.warning("File delete failed: %s", e)
+                continue
             if result.deleted_count > 0:
+                await self._release_registry_ids([doc.get("file_id")])
+                self._invalidate_file_count()
                 return True
         return False
 
@@ -585,7 +808,7 @@ class Database:
 
         async def _cluster_counts(col):
             try:
-                cursor = col.aggregate([{"$facet": facet_stage}], allowDiskUse=True)
+                cursor = await col.aggregate([{"$facet": facet_stage}], allowDiskUse=True)
                 docs = await cursor.to_list(length=1)
                 return docs[0] if docs else {}
             except Exception as e:
@@ -624,7 +847,8 @@ class Database:
                     {"$sort": {"count": -1}},
                     {"$limit": 200}
                 ]
-                async for doc in col.aggregate(pipeline, allowDiskUse=True):
+                cursor = await col.aggregate(pipeline, allowDiskUse=True)
+                async for doc in cursor:
                     fid = doc["_id"]
                     if not fid:
                         continue
@@ -692,9 +916,23 @@ class Database:
 
     async def purge_by_pattern(self, pattern):
         deleted_total = 0
+        deleted_ids = []
         for col in self.file_cols:
-            result = await col.delete_many({"file_name": {"$regex": pattern, "$options": "i"}})
-            deleted_total += result.deleted_count
+            try:
+                cursor = col.find(
+                    {"file_name": {"$regex": pattern, "$options": "i"}},
+                    {"file_id": 1},
+                )
+                async for doc in cursor:
+                    if doc.get("file_id"):
+                        deleted_ids.append(doc["file_id"])
+                result = await col.delete_many({"file_name": {"$regex": pattern, "$options": "i"}})
+                deleted_total += result.deleted_count
+            except Exception as e:
+                logger.warning("Pattern purge skipped an unavailable cluster: %s", e)
+        await self._release_registry_ids(deleted_ids)
+        if deleted_total:
+            self._invalidate_file_count()
         return deleted_total
 
     async def count_by_pattern(self, pattern):
@@ -742,6 +980,17 @@ class Database:
                 return
 
             if copied_src_ids:
+                copied_id_set = set(copied_src_ids)
+                copied_file_ids = [
+                    entry["doc"].get("file_id") for entry in batch
+                    if entry["_id"] in copied_id_set and entry["doc"].get("file_id")
+                ]
+                if copied_file_ids:
+                    stored_docs = await self.file_cols[to_idx].find(
+                        {"file_id": {"$in": copied_file_ids}},
+                        {"_id": 1, "file_id": 1},
+                    ).to_list(length=len(copied_file_ids))
+                    await self._mark_registry_locations(stored_docs, to_idx)
                 try:
                     result = await self.file_cols[from_idx].delete_many({"_id": {"$in": copied_src_ids}})
                     migrated += result.deleted_count
@@ -760,6 +1009,8 @@ class Database:
                 batch = []
         await _flush(batch)
 
+        if migrated:
+            self._invalidate_file_count()
         return migrated, skipped
 
     async def _regex_search(self, regex, max_results, offset=0):
@@ -770,8 +1021,20 @@ class Database:
         limit = max_results + 1
 
         async def _search_cluster(col):
-            cursor = col.find(filter_mongo).sort("_id", -1).skip(offset).limit(limit)
-            return [doc async for doc in cursor]
+            try:
+                cursor = (
+                    col.find(filter_mongo)
+                    .sort("_id", -1)
+                    .skip(offset)
+                    .limit(limit)
+                    .max_time_ms(5000)
+                )
+                return [doc async for doc in cursor]
+            except Exception as e:
+                # A secondary cluster outage should degrade result coverage,
+                # not take the entire search feature down.
+                logger.warning(f"Search cluster failed: {e}")
+                return []
 
         cluster_results = await asyncio.gather(*[_search_cluster(col) for col in self.file_cols])
 
@@ -818,7 +1081,7 @@ class Database:
         query = query.strip()
         if not query:
             return []
-        words = [w for w in query.split() if w]
+        words = [w for w in query.split() if w][:8]
         if not words:
             return []
 
@@ -873,11 +1136,18 @@ class Database:
                 return []
             return await self._regex_search(regex_w, max_results)
 
-        per_word = await asyncio.gather(*[_word_hits(w) for w in words])
+        fallback_words = [
+            w for w in words
+            if len(w) >= 3 and w.lower() not in _SEARCH_FALLBACK_STOP
+        ]
+        if not fallback_words:
+            fallback_words = words[:1]
+        per_word = await asyncio.gather(*[_word_hits(w) for w in fallback_words])
         for docs in per_word:
             _add(docs)
 
-        merged.sort(key=lambda d: d["_id"], reverse=True)
+        # Keep level 1 → level 2 → level 3 insertion order. Sorting the final
+        # merged list by ObjectId made fresh but weak matches outrank exact ones.
         return merged[:max_results]
 
     async def get_prefix_suggestions(self, query, limit=3):
@@ -922,11 +1192,17 @@ class Database:
         return None
 
     async def delete_file_by_id(self, file_id):
+        deleted = 0
         for col in self.file_cols:
-            result = await col.delete_one({"file_id": file_id})
-            if result.deleted_count > 0:
-                return True
-        return False
+            try:
+                result = await col.delete_many({"file_id": file_id})
+                deleted += result.deleted_count
+            except Exception as e:
+                logger.warning("File-id delete skipped an unavailable cluster: %s", e)
+        if deleted:
+            await self._release_registry_ids([file_id])
+            self._invalidate_file_count()
+        return deleted > 0
 
     async def log_missed_search(self, query: str):
         if self.main_db is None:
@@ -975,24 +1251,33 @@ class Database:
             size = await self.get_db_size(db_instance)
             return i + 1, files_in_db, size
 
-        total_users, total_banned, total_groups, *cluster_stats = await asyncio.gather(
-            _count(self.users_col),
+        total_users, total_banned, total_groups, total_files, *cluster_stats = await asyncio.gather(
+            self.get_user_count(),
             _count(self.banned_col),
             self.get_group_count(),
+            self.get_total_files(),
             *[_cluster_stats(i, db_instance) for i, db_instance in enumerate(self.dbs)]
         )
 
-        total_files = sum(files_in_db for _, files_in_db, _ in cluster_stats)
         db_sizes    = [(idx, size) for idx, _, size in cluster_stats]
         return total_users, total_banned, total_files, db_sizes, total_groups
 
     async def reset_database(self):
+        # Avoid starting a cross-cluster destructive operation when one of the
+        # targets is already unreachable.
+        await asyncio.gather(*[db_instance.command("ping") for db_instance in self.dbs])
         if self.users_col is not None:
             await self.users_col.drop()
         if self.banned_col is not None:
             await self.banned_col.drop()
         for col in self.file_cols:
             await col.drop()
+        if self.registry_col is not None:
+            await self.registry_col.drop()
+        # Recreate uniqueness indexes immediately so a reset cannot leave a
+        # running bot accepting duplicate file IDs.
+        await self.ensure_indexes()
+        self._invalidate_file_count()
         return True
 
     async def get_config(self):
@@ -1035,15 +1320,42 @@ class Database:
         # Invite links are bearer credentials — export channel IDs only, never
         # the cached link string, so a shared/leaked backup can't be used to
         # join private FSub channels.
-        if "fsub_channels" in safe:
-            safe["fsub_channels"] = [
-                ({"id": e.get("id")} if isinstance(e, dict) else e) for e in safe["fsub_channels"]
-            ]
+        for channel_key in ("fsub_channels", "req_fsub_channels", "two_stage_channels"):
+            if channel_key in safe:
+                safe[channel_key] = [
+                    ({"id": e.get("id")} if isinstance(e, dict) else e)
+                    for e in safe[channel_key]
+                ]
         return safe
 
     async def restore_config(self, data: dict):
-        protected = {"_id", "log_channel", "admin_id", "db_channels", "update_channel_id", "db_channel", "fsub_channels"}
-        safe_data = {k: v for k, v in data.items() if k not in protected}
+        # Backups are admin-supplied but still untrusted input. Restore only
+        # documented presentation/preferences fields with expected types.
+        allowed = {
+            "start_media": str,
+            "welcome_text": str,
+            "auto_delete_time": int,
+            "maintenance_mode": bool,
+            "maintenance_message": str,
+            "file_caption_template": str,
+            "update_channel": str,
+            "main_group": str,
+            "group_whitelist_mode": str,
+            "req_fsub_interval_hours": int,
+        }
+        safe_data = {
+            key: value for key, value in data.items()
+            if key in allowed and type(value) is allowed[key]
+        }
+        if "auto_delete_time" in safe_data:
+            safe_data["auto_delete_time"] = max(60, min(safe_data["auto_delete_time"], 86400))
+        if "req_fsub_interval_hours" in safe_data:
+            safe_data["req_fsub_interval_hours"] = max(1, min(safe_data["req_fsub_interval_hours"], 720))
+        if safe_data.get("group_whitelist_mode") not in (None, "whitelist", "blacklist"):
+            safe_data.pop("group_whitelist_mode", None)
+        for key in ("start_media", "welcome_text", "maintenance_message", "file_caption_template"):
+            if key in safe_data:
+                safe_data[key] = safe_data[key][:4096]
         if not safe_data:
             return False
         for key, value in safe_data.items():
@@ -1372,6 +1684,45 @@ class Database:
 
     async def clear_old_searches(self, expiry_seconds=600):
         self._search_cache.purge(expiry_seconds)
+
+    async def schedule_deletion(self, chat_id: int, message_id: int, delay_seconds: int):
+        """Persist an auto-delete job so it survives bot restarts."""
+        if self.deletion_col is None:
+            return False
+        due_at = datetime.now(timezone.utc).timestamp() + max(0, int(delay_seconds))
+        await self.deletion_col.update_one(
+            {"chat_id": chat_id, "message_id": message_id},
+            {"$set": {"due_at": due_at, "attempts": 0}},
+            upsert=True,
+        )
+        return True
+
+    async def get_due_deletions(self, limit=100):
+        if self.deletion_col is None:
+            return []
+        cursor = self.deletion_col.find(
+            {"due_at": {"$lte": datetime.now(timezone.utc).timestamp()}}
+        ).sort("due_at", 1).limit(limit)
+        return [doc async for doc in cursor]
+
+    async def complete_deletion(self, job_id):
+        if self.deletion_col is not None:
+            await self.deletion_col.delete_one({"_id": job_id})
+
+    async def retry_deletion(self, job_id, delay_seconds=60):
+        if self.deletion_col is not None:
+            await self.deletion_col.update_one(
+                {"_id": job_id},
+                {
+                    "$inc": {"attempts": 1},
+                    "$set": {"due_at": datetime.now(timezone.utc).timestamp() + delay_seconds},
+                },
+            )
+
+    async def close(self):
+        """Close all MongoDB clients during a graceful shutdown."""
+        for client in self.clients:
+            await client.close()
 
 
 db = Database()

@@ -2,3 +2,7 @@
 __pycache__/
 *.pyc
 .deployed_sha
+.deployed_files.json
+.venv/
+.pytest_cache/
+.ruff_cache/

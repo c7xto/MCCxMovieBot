@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 import logging
+import time
 from dotenv import load_dotenv
 from pyrogram import ContinuePropagation, StopPropagation
 from pyrogram import Client, filters
@@ -19,10 +20,11 @@ from utils import ADMIN_ID, _no_preview, HELP_STEPS_EN, HELP_FOOTER_EN
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+_reset_confirmations = {}
 
 # Reusable "Back to Panel" button — avoids repeating it everywhere
 _BACK_BTN = InlineKeyboardMarkup([
-    [InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="back_to_admin")]
+    [InlineKeyboardButton("‹ Control Center", callback_data="back_to_admin")]
 ])
 
 
@@ -48,22 +50,17 @@ async def get_admin_menu_data():
     # truthy check would show "Missing" even after saving a valid channel ID,
     # so explicitly check for None/0/"" instead.
     log_val = config.get('log_channel')
-    log_display = f"`{log_val}`" if log_val not in [None, 0, ""] else "`Not Set`"
     log_status = "✅ Set" if log_val not in [None, 0, ""] else "❌ Missing"
 
-    main_group = config.get('main_group', '')
-    update_ch = config.get('update_channel', '')
-    group_status = "✅ Set" if main_group else "❌ Missing"
-    update_status = "✅ Set" if update_ch else "❌ Missing"
-
-    db_admin = config.get('admin_id')
-    admin_display = f"`{db_admin}`" if db_admin not in [None, 0, ""] else "`From .env`"
-
     text = (
-        f"🛠 **MCCxBot Admin**\n\n"
-        f"👤 `{total_users}` users  •  📁 `{total_files:,}` files  •  🏘 `{total_groups}` groups\n"
-        f"🔐 FSub: {fsub_status}  •  📡 Log: {log_status}\n\n"
-        f"_Tap a category below_"
+        "🛠 **MCCx Control Center**\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"📚 **Library**   `{total_files:,}` files\n"
+        f"👤 **Audience**  `{total_users:,}` users · `{total_groups:,}` groups\n"
+        f"🔐 **Access**    {fsub_status}\n"
+        f"📡 **Logging**   {log_status}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "_Choose an area to manage._"
     )
 
     # Two-tier dashboard: the root panel only shows the 4 category tiles
@@ -71,11 +68,11 @@ async def get_admin_menu_data():
     # Same underlying callbacks as before, just better information
     # architecture instead of one flat 19-button wall.
     markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📁 Content", callback_data="admin_cat_content"),
-         InlineKeyboardButton("👥 Users & Groups", callback_data="admin_cat_users")],
-        [InlineKeyboardButton("⚙️ Settings", callback_data="admin_cat_settings"),
-         InlineKeyboardButton("🩺 Health & System", callback_data="admin_cat_health")],
-        [InlineKeyboardButton("❌ Close Panel", callback_data="close_data")]
+        [InlineKeyboardButton("📚 Library", callback_data="admin_cat_content"),
+         InlineKeyboardButton("👥 Access", callback_data="admin_cat_users")],
+        [InlineKeyboardButton("⚙ Preferences", callback_data="admin_cat_settings"),
+         InlineKeyboardButton("🩺 System", callback_data="admin_cat_health")],
+        [InlineKeyboardButton("✕ Close", callback_data="close_data")]
     ])
     return text, markup
 
@@ -86,38 +83,38 @@ async def get_admin_menu_data():
 # not what they do or how they're handled.
 
 _CATEGORY_MENUS = {
-    "content": ("📁 Content", [
-        ("📚 Manage Database Channels", "db_chan_menu"),
-        ("📁 File Manager",             "file_manager_menu"),
-        ("✏️ Caption Template",         "edit_captiontemplate"),
-        ("🖼 Change Welcome Media",     "edit_media"),
-        ("📝 Edit Welcome Text",        "edit_welcometext"),
+    "content": ("📚 **Library & Presentation**", [
+        ("📥 Source Channels",          "db_chan_menu"),
+        ("🗂 File Manager",             "file_manager_menu"),
+        ("✏ File Captions",             "edit_captiontemplate"),
+        ("🖼 Welcome Media",            "edit_media"),
+        ("💬 Welcome Message",          "edit_welcometext"),
     ]),
-    "users": ("👥 Users & Groups", [
-        ("🔐 Manage FSub Channels",     "fsub_menu"),
-        ("🔐🔐 Verification Gates",     "verification_gates_menu"),
+    "users": ("👥 **Users, Groups & Access**", [
+        ("🔐 Required Channels",        "fsub_menu"),
+        ("🛡 Access Gates",             "verification_gates_menu"),
         ("🏘 Group Manager",            "group_manager_menu"),
-        ("🔧 Maintenance Mode",         "admin_toggle_maintenance"),
     ]),
-    "settings": ("⚙️ Settings", [
-        ("⚙️ Change Main Group Link",  "edit_maingroup"),
-        ("⚙️ Change Update Link",      "edit_update"),
-        ("📡 Set Log Channel ID",      "edit_logchannel"),
-        ("📢 Set Update Channel ID",   "edit_updatechid"),
-        ("⏱ Set Auto-Delete Time",    "edit_autodeletetime"),
-        ("📥 Export Config",           "admin_export_config"),
-        ("📤 Restore Config",          "admin_restore_config"),
-        ("🔄 Update Bot",              "upd_start"),
+    "settings": ("⚙ **Preferences & Backup**", [
+        ("💬 Request Group",            "edit_maingroup"),
+        ("📢 Public Updates",           "edit_update"),
+        ("📡 Log Channel",              "edit_logchannel"),
+        ("📣 Announcement Channel",     "edit_updatechid"),
+        ("⏱ Auto-Delete",              "edit_autodeletetime"),
+        ("⬇ Export Backup",            "admin_export_config"),
+        ("⬆ Restore Backup",           "admin_restore_config"),
+        ("🔄 Safe Update",              "upd_start"),
     ]),
-    "health": ("🩺 Health & System", [
-        ("📊 Analytics (Stats + Languages + Groups)", "admin_stats"),
-        ("🔍 Channel Health Check",                   "channel_health_check"),
-        ("⚠️ Known Issues",                           "known_issues_check"),
+    "health": ("🩺 **Health & System**", [
+        ("📊 Analytics",                "admin_stats"),
+        ("🔎 Channel Check",            "channel_health_check"),
+        ("🧪 Diagnostics",              "known_issues_check"),
+        ("🛠 Maintenance",              "admin_toggle_maintenance"),
     ]),
 }
 
 _CATEGORY_BACK_BTN = InlineKeyboardMarkup([
-    [InlineKeyboardButton("🔙 Back to Dashboard", callback_data="back_to_admin")]
+    [InlineKeyboardButton("‹ Control Center", callback_data="back_to_admin")]
 ])
 
 
@@ -126,9 +123,14 @@ async def show_category_menu(client: Client, callback: CallbackQuery):
     key = callback.data.split("_", 2)[2]
     title, items = _CATEGORY_MENUS[key]
 
-    text = f"{title}\n\n_Tap an item below_"
-    buttons = [[InlineKeyboardButton(label, callback_data=cb)] for label, cb in items]
-    buttons.append([InlineKeyboardButton("🔙 Back to Dashboard", callback_data="back_to_admin")])
+    text = f"{title}\n\n_Select an action._"
+    buttons = []
+    for index in range(0, len(items), 2):
+        buttons.append([
+            InlineKeyboardButton(label, callback_data=cb)
+            for label, cb in items[index:index + 2]
+        ])
+    buttons.append([InlineKeyboardButton("‹ Control Center", callback_data="back_to_admin")])
 
     try:
         await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
@@ -1089,6 +1091,7 @@ async def reset_index_progress_cmd(client: Client, message: Message):
 
 @Client.on_message(filters.command("reset_db") & filters.private & filters.user(ADMIN_ID))
 async def reset_db_cmd(client: Client, message: Message):
+    _reset_confirmations[message.from_user.id] = time.monotonic() + 60
     await message.reply_text(
         "⚠️ **WARNING: NUCLEAR OPTION** ⚠️\n\n"
         "Are you absolutely sure you want to completely wipe ALL files, users, and bans across all 5 clusters?\n\n"
@@ -1099,8 +1102,17 @@ async def reset_db_cmd(client: Client, message: Message):
 
 @Client.on_message(filters.command("confirm_reset") & filters.private & filters.user(ADMIN_ID))
 async def confirm_reset_cmd(client: Client, message: Message):
+    expires_at = _reset_confirmations.pop(message.from_user.id, 0)
+    if time.monotonic() > expires_at:
+        return await message.reply_text(
+            "Reset confirmation is missing or expired. Run /reset_db first."
+        )
     status = await message.reply_text("☢️ **Nuking the database...**")
-    await db.reset_database()
+    try:
+        await db.reset_database()
+    except Exception as e:
+        logger.exception("Database reset failed")
+        return await status.edit_text(f"❌ **Reset aborted or incomplete:** `{e}`")
     await status.edit_text("✅ **Database has been completely wiped.** You now have a clean slate.")
 
 
@@ -1162,17 +1174,10 @@ async def help_cmd(client: Client, message: Message):
         quote=True
     )
 
-    # Auto-delete in groups after 30 seconds — fire-and-forget so the
-    # handler returns immediately instead of blocking for 30 seconds
+    # Persist group cleanup so it survives a restart without a sleeping task.
     if is_group:
-        async def _delete_help(hm, om):
-            await asyncio.sleep(30)
-            try:
-                await hm.delete()
-                await om.delete()
-            except Exception:
-                pass
-        asyncio.create_task(_delete_help(help_msg, message))
+        await db.schedule_deletion(help_msg.chat.id, help_msg.id, 30)
+        await db.schedule_deletion(message.chat.id, message.id, 30)
 # ── FSub REFRESH JOIN LINKS ──────────────────────────────────────────────────
 # Forces regeneration of join channel invite links.
 # Use this if a join channel's link has expired or been manually revoked.

@@ -1,14 +1,17 @@
 import os
 import re
 import time
-import random
-import string
+import secrets
 import asyncio
 import logging
 from collections import OrderedDict
 from urllib.parse import quote
 from dotenv import load_dotenv
-from pyrogram.errors import MessageNotModified, FloodWait, UserNotParticipant
+from pyrogram.errors import (
+    MessageNotModified, FloodWait, UserNotParticipant,
+    FileIdInvalid, FileReferenceEmpty, FileReferenceExpired,
+    FileReferenceInvalid, MediaEmpty, MediaInvalid,
+)
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode, ChatAction
 from pyrogram.types import (
@@ -18,7 +21,7 @@ from database.db import db
 from plugins.req_fsub import check_verification_gates
 from utils import (
     is_subscribed, is_subscribed_join_only, send_fsub_message, _parse_fsub_entry,
-    ADMIN_ID, _no_preview, _html,
+    ADMIN_ID, _no_preview, _html, callback_data,
 )
 
 load_dotenv()
@@ -251,11 +254,11 @@ def _build_movie_result_buttons(results: list, session_id: str, page: int, per_p
 
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"page#{session_id}#{page-1}"))
+        nav.append(InlineKeyboardButton("‹ Previous", callback_data=f"page#{session_id}#{page-1}"))
     if total_pages > 1:
-        nav.append(InlineKeyboardButton(f"🟢 {page+1}/{total_pages} 🟢", callback_data="ignore"))
+        nav.append(InlineKeyboardButton(f"{page+1} / {total_pages}", callback_data="ignore"))
     if page < total_pages - 1:
-        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"page#{session_id}#{page+1}"))
+        nav.append(InlineKeyboardButton("Next ›", callback_data=f"page#{session_id}#{page+1}"))
     if nav:
         buttons.append(nav)
 
@@ -263,24 +266,14 @@ def _build_movie_result_buttons(results: list, session_id: str, page: int, per_p
 
 
 async def _auto_delete_search(status_msg, original_msg, manual_query):
-    await asyncio.sleep(300)
-    try:
-        await status_msg.delete()
-    except Exception:
-        pass
+    await db.schedule_deletion(status_msg.chat.id, status_msg.id, 300)
     if not manual_query:
-        try:
-            await original_msg.delete()
-        except Exception:
-            pass
+        await db.schedule_deletion(original_msg.chat.id, original_msg.id, 300)
 
 
 async def _auto_delete_file(sent_msg, file_name, bot_username, delete_seconds=300):
-    await asyncio.sleep(delete_seconds)
-    try:
-        await sent_msg.delete()
-    except Exception:
-        pass
+    """Compatibility wrapper that now schedules a durable deletion job."""
+    await db.schedule_deletion(sent_msg.chat.id, sent_msg.id, delete_seconds)
 
 
 def _fmt_size(file_doc):
@@ -362,9 +355,9 @@ def _build_caption(config, file_data, delete_minutes, bot_username):
     title_line = f"🎬 <b>{_html(title)}{f' ({year})' if year else ''}</b>"
 
     return (
-        f"{title_line}\n\n"
-        f"{meta_line}\n\n"
-        f"⏳ Auto-deletes in {delete_minutes} min — forward to Saved Messages to keep it"
+        f"{title_line}\n"
+        f"<blockquote>{meta_line}</blockquote>\n"
+        f"<i>⏳ Available for {delete_minutes} min · Forward it to keep it</i>"
     )
 
 
@@ -406,11 +399,11 @@ def _build_result_buttons(results: list, session_id: str, page: int, per_page: i
 
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"page#{session_id}#{page-1}"))
+        nav.append(InlineKeyboardButton("‹ Previous", callback_data=f"page#{session_id}#{page-1}"))
     if total_pages > 1:
-        nav.append(InlineKeyboardButton(f"🟢 {page+1}/{total_pages} 🟢", callback_data="ignore"))
+        nav.append(InlineKeyboardButton(f"{page+1} / {total_pages}", callback_data="ignore"))
     if page < total_pages - 1:
-        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"page#{session_id}#{page+1}"))
+        nav.append(InlineKeyboardButton("Next ›", callback_data=f"page#{session_id}#{page+1}"))
     if nav:
         buttons.append(nav)
 
@@ -443,12 +436,12 @@ async def _render_results_view(client, message, session_id: str, page: int, data
         meta = _variant_label(f, show_title=False)
         caption = (
             f"🎬 <b>{_html(title)}{f' ({year})' if year else ''}</b>\n"
-            f"{meta}\n\n"
-            f"Auto-deletes in {_del_mins} min"
+            f"<blockquote>{meta}</blockquote>\n"
+            f"<i>⏳ Available for {_del_mins} min</i>"
         )
         buttons = [
-            [InlineKeyboardButton("⬇️ Download Now", callback_data=f"sendfile#{f['_id']}")],
-            [InlineKeyboardButton("🏠 Home", callback_data="start_home")],
+            [InlineKeyboardButton("⬇ Get This File", callback_data=f"sendfile#{f['_id']}")],
+            [InlineKeyboardButton("⌂ Home", callback_data="start_home")],
         ]
         markup = InlineKeyboardMarkup(buttons)
     else:
@@ -464,20 +457,20 @@ async def _render_results_view(client, message, session_id: str, page: int, data
             buttons.extend(file_buttons)
 
         caption = (
-            f"🎬 Results for \"{_html(query)}\"\n"
-            f"{total} found · auto-deletes in {_del_mins} min\n\n"
+            f"<b>🎬 {_html(query.title())}</b>\n"
+            f"<blockquote>{total} matches  •  Results expire in {_del_mins} min</blockquote>\n"
         )
 
         if has_series and not series_expanded:
-            caption += "Grouped as a series — tap to see every episode:"
+            caption += "Episodes are grouped to keep this list tidy."
             buttons.append([InlineKeyboardButton(
-                f"📺 View All Episodes ({total} found)",
+                f"📺 Browse All {total} Episodes",
                 callback_data=f"expandseries#{session_id}"
             )])
         else:
-            caption += "Tap a file to receive it in your PM"
+            caption += "<i>Choose a file by size, language and quality.</i>"
 
-        buttons.append([InlineKeyboardButton("🏠 Home", callback_data="start_home")])
+        buttons.append([InlineKeyboardButton("⌂ Back to Home", callback_data="start_home")])
         markup = InlineKeyboardMarkup(buttons)
 
     # Results render as plain text only now — there's no TMDB poster to
@@ -612,9 +605,9 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
 
         sug_buttons = [sug_row] if sug_row else []
         sug_buttons += [
-            [InlineKeyboardButton("📝 Request This Movie", callback_data=f"reqmovie#{safe_query}"),
+            [InlineKeyboardButton("📝 Request This Movie", callback_data=callback_data("reqmovie#", safe_query)),
              InlineKeyboardButton("🔎 Google", url=google_url)],
-            [InlineKeyboardButton("🏠 Home", callback_data="start_home")]
+            [InlineKeyboardButton("⌂ Back to Home", callback_data="start_home")]
         ]
 
         no_results_msg = await message.reply_text(
@@ -627,13 +620,13 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
         # Previously left in chat forever — no cleanup path existed for a
         # PM no-results screen. Reuses the same auto-delete/ manual_query
         # convention as a successful search so the two behave consistently.
-        asyncio.create_task(_auto_delete_search(no_results_msg, message, manual_query))
+        await _auto_delete_search(no_results_msg, message, manual_query)
         return
 
     time_taken = time.time() - start_time
     await db.clear_old_searches()
 
-    session_id = "".join(random.choices(string.ascii_letters + string.digits, k=6))
+    session_id = secrets.token_urlsafe(9)
 
     session_data = {
         "results":          _sort_results(results),
@@ -646,9 +639,11 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
     }
     await db.save_search(session_id, session_data)
 
-    status_msg = await message.reply_text("🔍 Searching…", quote=True)
+    status_msg = await message.reply_text(
+        "🔎 <b>Searching your library…</b>", quote=True, parse_mode=ParseMode.HTML
+    )
     await show_results(client, status_msg, session_id, 0)
-    asyncio.create_task(_auto_delete_search(status_msg, message, manual_query))
+    await _auto_delete_search(status_msg, message, manual_query)
 
 
 @Client.on_callback_query(filters.regex(r"^page#"))
@@ -660,6 +655,9 @@ async def handle_pagination(client: Client, callback: CallbackQuery):
     data = await db.get_search(session_id)
     if not data:
         await callback.answer("⚠️ Session expired.", show_alert=True)
+        return
+    if data.get("user_id") not in (None, callback.from_user.id):
+        await callback.answer("This search belongs to another user.", show_alert=True)
         return
 
     await _render_results_view(client, callback.message, session_id, page, data, user_id=callback.from_user.id)
@@ -673,6 +671,8 @@ async def handle_expand_series(client: Client, callback: CallbackQuery):
     data = await db.get_search(session_id)
     if not data:
         return await callback.answer("⚠️ Session expired.", show_alert=True)
+    if data.get("user_id") not in (None, callback.from_user.id):
+        return await callback.answer("This search belongs to another user.", show_alert=True)
 
     data["series_expanded"] = True
     await db.save_search(session_id, data)
@@ -710,19 +710,19 @@ async def send_movie_file(client: Client, callback: CallbackQuery):
             caption=_build_caption(config, file_data, delete_minutes, client.me.username),
             parse_mode=ParseMode.HTML
         )
-        asyncio.create_task(_auto_delete_file(sent, file_data["file_name"], client.me.username, delete_seconds))
+        await _auto_delete_file(sent, file_data["file_name"], client.me.username, delete_seconds)
+    except (FileIdInvalid, FileReferenceEmpty, FileReferenceExpired,
+            FileReferenceInvalid, MediaEmpty, MediaInvalid) as e:
+        await db.delete_file_by_id(file_data["file_id"])
+        await callback.message.reply_text(
+            f"❌ <b>File unavailable</b>\n\n"
+            f"{_html(file_data['file_name'])} is no longer valid. "
+            f"It was removed from the index; please search again.",
+            parse_mode=ParseMode.HTML
+        )
+        logger.warning("Removed invalid cached file %s: %s", file_data["file_id"], e)
     except Exception as e:
-        err = str(e).lower()
-        if any(k in err for k in ["file_reference", "invalid", "not found", "media"]):
-            await db.delete_file_by_id(file_data["file_id"])
-            await callback.message.reply_text(
-                f"❌ **File Unavailable**\n\n"
-                f"{_html(file_data['file_name'])} has expired.\n"
-                f"Removed from DB. Please search again.",
-                parse_mode=ParseMode.HTML
-            )
-        else:
-            await callback.message.reply_text("❌ Could not send file. Try again.")
+        await callback.message.reply_text("❌ Could not send this file right now. Please try again.")
         logger.error(f"send_cached_media failed: {e}")
 
 
@@ -844,14 +844,15 @@ async def check_fsub_callback(client: Client, callback: CallbackQuery):
                 caption=_build_caption(cfg, file_data, delete_minutes, client.me.username),
                 parse_mode=ParseMode.HTML
             )
-            asyncio.create_task(_auto_delete_file(sent, file_data["file_name"], client.me.username, delete_seconds))
+            await _auto_delete_file(sent, file_data["file_name"], client.me.username, delete_seconds)
+        except (FileIdInvalid, FileReferenceEmpty, FileReferenceExpired,
+                FileReferenceInvalid, MediaEmpty, MediaInvalid) as e:
+            await db.delete_file_by_id(file_data["file_id"])
+            await client.send_message(chat_id, "❌ File unavailable. Please search again.")
+            logger.warning("Removed invalid cached file %s: %s", file_data["file_id"], e)
         except Exception as e:
-            err = str(e).lower()
-            if any(k in err for k in ["file_reference", "invalid", "not found", "media"]):
-                await db.delete_file_by_id(file_data["file_id"])
-                await client.send_message(chat_id, "❌ File unavailable. Please search again.")
-            else:
-                await client.send_message(chat_id, "❌ Could not send file. Try again.")
+            await client.send_message(chat_id, "❌ Could not send file right now. Try again.")
+            logger.error("FSub delivery failed: %s", e)
     else:
         await client.send_message(
             chat_id,

@@ -15,7 +15,7 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 _BACK_BTN = InlineKeyboardMarkup([
-    [InlineKeyboardButton("🔙 Back to File Manager", callback_data="file_manager_menu")]
+    [InlineKeyboardButton("‹ File Manager", callback_data="file_manager_menu")]
 ])
 
 # In-memory cache for duplicate scan results, keyed by admin user_id so
@@ -27,17 +27,19 @@ _cached_dupes = {}
 
 @Client.on_callback_query(filters.regex(r"^file_manager_menu$") & filters.user(ADMIN_ID))
 async def file_manager_menu(client: Client, callback: CallbackQuery):
+    total_files = await db.get_total_files()
     markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔍 Search & Delete Files",   callback_data="fm_search")],
-        [InlineKeyboardButton("🔄 Find Duplicates",         callback_data="fm_duplicates")],
-        [InlineKeyboardButton("🗑 Bulk Delete by Pattern",  callback_data="fm_bulkdelete")],
-        [InlineKeyboardButton("⚡ Quick Purge CAMs/PreDVD",  callback_data="fm_quickpurgecam")],
-        [InlineKeyboardButton("📋 Top Missing Files",       callback_data="fm_missing")],
-        [InlineKeyboardButton("🔙 Back to Admin Panel",     callback_data="back_to_admin")]
+        [InlineKeyboardButton("🔎 Find Files", callback_data="fm_search"),
+         InlineKeyboardButton("🧬 Duplicates", callback_data="fm_duplicates")],
+        [InlineKeyboardButton("🧹 Pattern Cleanup", callback_data="fm_bulkdelete"),
+         InlineKeyboardButton("⚡ CAM Cleanup", callback_data="fm_quickpurgecam")],
+        [InlineKeyboardButton("📋 Missing Requests", callback_data="fm_missing")],
+        [InlineKeyboardButton("‹ Control Center", callback_data="back_to_admin")]
     ])
     text = (
-        "📁 **File Manager**\n\n"
-        "Select an operation below."
+        "🗂 **File Manager**\n"
+        f"━━━━━━━━━━━━━━━━━━\n📚 `{total_files:,}` indexed files\n"
+        "Search, repair and clean your library safely."
     )
     try:
         await callback.message.edit_text(text, reply_markup=markup)
@@ -86,8 +88,8 @@ async def _do_file_search(client, message_obj, query):
         obj_id = str(file_doc["_id"])
 
         markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🗑 Delete This File", callback_data=f"fm_del#{obj_id}"),
-             InlineKeyboardButton("✏️ Rename", callback_data=f"fm_rename#{obj_id}")]
+            [InlineKeyboardButton("🗑 Delete", callback_data=f"fm_del#{obj_id}"),
+             InlineKeyboardButton("✏ Rename", callback_data=f"fm_rename#{obj_id}")]
         ])
 
         await message_obj.reply_text(

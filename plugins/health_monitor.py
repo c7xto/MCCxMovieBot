@@ -260,3 +260,31 @@ async def run_cache_reaper():
             logger.warning(f"Cache reaper error: {e}")
 
 
+async def run_deletion_worker(client):
+    """Process durable Telegram message deletions in bounded batches."""
+    while True:
+        try:
+            jobs = await db.get_due_deletions(limit=100)
+            if not jobs:
+                await asyncio.sleep(5)
+                continue
+            for job in jobs:
+                try:
+                    await client.delete_messages(job["chat_id"], job["message_id"])
+                    await db.complete_deletion(job["_id"])
+                except FloodWait as e:
+                    await db.retry_deletion(job["_id"], max(5, e.value))
+                except Exception as e:
+                    if job.get("attempts", 0) >= 2:
+                        logger.warning(
+                            "Dropping deletion job %s after repeated failure: %s",
+                            job.get("_id"), e,
+                        )
+                        await db.complete_deletion(job["_id"])
+                    else:
+                        await db.retry_deletion(job["_id"], 60)
+        except Exception as e:
+            logger.error("Deletion worker iteration failed: %s", e)
+            await asyncio.sleep(10)
+
+

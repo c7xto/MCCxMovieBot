@@ -14,7 +14,7 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 _BACK_BTN = InlineKeyboardMarkup([
-    [InlineKeyboardButton("🔙 Back to Group Manager", callback_data="group_manager_menu")]
+    [InlineKeyboardButton("‹ Group Manager", callback_data="group_manager_menu")]
 ])
 
 
@@ -31,21 +31,21 @@ async def group_manager_menu(client: Client, callback: CallbackQuery):
         else "Switch to Whitelist Mode"
 
     markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋 List All Groups",        callback_data="gm_list")],
-        [InlineKeyboardButton("📊 Top Groups by Activity", callback_data="admin_stats")],  # now in unified Analytics
-        [InlineKeyboardButton("🔍 Find Group",             callback_data="gm_find")],
-        [InlineKeyboardButton("🚫 Ban a Group",            callback_data="gm_ban_prompt")],
-        [InlineKeyboardButton("✅ Unban a Group",           callback_data="gm_unban_prompt")],
-        [InlineKeyboardButton("⚙️ Group Settings",         callback_data="gm_settings_prompt")],
-        [InlineKeyboardButton("📢 Broadcast to Groups",    callback_data="gm_broadcast_prompt")],
-        [InlineKeyboardButton(f"🔄 {toggle_label}",        callback_data="gm_toggle_mode")],
-        [InlineKeyboardButton("🔙 Back to Admin Panel",    callback_data="back_to_admin")]
+        [InlineKeyboardButton("📋 All Groups", callback_data="gm_list"),
+         InlineKeyboardButton("🔎 Find", callback_data="gm_find")],
+        [InlineKeyboardButton("🚫 Ban", callback_data="gm_ban_prompt"),
+         InlineKeyboardButton("✅ Unban", callback_data="gm_unban_prompt")],
+        [InlineKeyboardButton("⚙ Group Settings", callback_data="gm_settings_prompt"),
+         InlineKeyboardButton("📢 Broadcast", callback_data="gm_broadcast_prompt")],
+        [InlineKeyboardButton(f"🔄 {toggle_label}", callback_data="gm_toggle_mode")],
+        [InlineKeyboardButton("‹ Control Center", callback_data="back_to_admin")]
     ])
 
     text = (
-        f"🏘 **Group Manager**\n\n"
-        f"**Current Mode:** {mode_label}\n\n"
-        f"Total connected groups: `{await db.get_group_count()}`"
+        f"🏘 **Group Manager**\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"{mode_label}\n"
+        f"Connected groups: `{await db.get_group_count():,}`"
     )
     try:
         await callback.message.edit_text(text, reply_markup=markup)

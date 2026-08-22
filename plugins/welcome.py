@@ -1,4 +1,3 @@
-import asyncio
 import logging
 from dotenv import load_dotenv
 from pyrogram import Client, filters
@@ -14,12 +13,8 @@ logger = logging.getLogger(__name__)
 
 
 async def _auto_delete_welcome(msg, delay=300):
-    """Fire-and-forget background delete so handler never blocks."""
-    await asyncio.sleep(delay)
-    try:
-        await msg.delete()
-    except Exception:
-        pass
+    """Persist cleanup so it still occurs if the bot restarts."""
+    await db.schedule_deletion(msg.chat.id, msg.id, delay)
 
 
 @Client.on_message(filters.new_chat_members | filters.left_chat_member, group=1)
@@ -75,7 +70,6 @@ async def welcome_new_member(client: Client, update: ChatMemberUpdated):
             parse_mode=ParseMode.HTML,
             **_no_preview()
         )
-        # Fire-and-forget — never blocks the handler
-        asyncio.create_task(_auto_delete_welcome(welcome_msg, auto_delete_secs))
+        await _auto_delete_welcome(welcome_msg, auto_delete_secs)
     except Exception as e:
         logger.error(f"Welcome message error: {e}")

@@ -25,6 +25,15 @@ def _html(text) -> str:
     imports this instead of redefining it locally."""
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
+
+def callback_data(prefix: str, value, max_bytes: int = 64) -> str:
+    """Build callback data without splitting UTF-8 or exceeding Telegram's limit."""
+    prefix_bytes = prefix.encode("utf-8")
+    if len(prefix_bytes) >= max_bytes:
+        raise ValueError("Callback prefix leaves no room for a value")
+    value_bytes = str(value).encode("utf-8")[:max_bytes - len(prefix_bytes)]
+    return prefix + value_bytes.decode("utf-8", errors="ignore")
+
 # Single shared source of truth for admin IDs — parsed as a comma-separated
 # list so multi-admin setups (ADMIN_ID=123,456) work everywhere, not just
 # in broadcast.py. Import this everywhere instead of re-parsing os.getenv.

@@ -1,7 +1,6 @@
 import re
 import time
-import random
-import string
+import secrets
 import asyncio
 import logging
 from collections import OrderedDict
@@ -53,16 +52,16 @@ def _build_group_buttons(page_files, client_username, session_id, page,
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton(
-            "⬅️ Prev",
+            "‹ Previous",
             callback_data=f"grppage#{session_id}#{page - 1}"
         ))
     if total_pages > 1:
         nav.append(InlineKeyboardButton(
-            f"📄 {page + 1}/{total_pages}", callback_data="ignore"
+            f"{page + 1} / {total_pages}", callback_data="ignore"
         ))
     if page < total_pages - 1:
         nav.append(InlineKeyboardButton(
-            "Next ➡️",
+            "Next ›",
             callback_data=f"grppage#{session_id}#{page + 1}"
         ))
     if nav:
@@ -75,9 +74,9 @@ def _build_caption(query, total, speed, del_mins):
     """Search-results caption for the group chat — same minimal style as
     filter.py's _render_results_view, adapted for the single-page group view."""
     return (
-        f"🎬 Results for \"{_html(query)}\"\n"
-        f"{total} found · auto-deletes in {del_mins} min\n\n"
-        f"Tap a file to receive it in your PM"
+        f"<b>🎬 {_html(query.title())}</b>\n"
+        f"<blockquote>{total} matches  •  Closes in {del_mins} min</blockquote>\n"
+        f"<i>Choose a file to receive it privately.</i>"
     )
 
 
@@ -244,7 +243,7 @@ async def group_search(client: Client, message: Message):
     time_taken = time.time() - start_time
     await db.clear_old_searches()
 
-    session_id   = "".join(random.choices(string.ascii_letters + string.digits, k=6))
+    session_id   = secrets.token_urlsafe(9)
     sorted_files = _sort_results(results)
 
     # Per-group override takes priority over the global default — set via
@@ -262,6 +261,7 @@ async def group_search(client: Client, message: Message):
         "auto_delete_time": _del_secs,
         "is_group":         True,
         "group_chat_id":    message.chat.id,
+        "user_id":          message.from_user.id,
     }
     await db.save_search(session_id, session_data)
 
@@ -280,13 +280,13 @@ async def group_search(client: Client, message: Message):
         meta = _variant_label(f, show_title=False)
         caption = (
             f"🎬 <b>{_html(title)}{f' ({year})' if year else ''}</b>\n"
-            f"{meta}\n\n"
-            f"Auto-deletes in {_del_mins} min"
+            f"<blockquote>{meta}</blockquote>\n"
+            f"<i>Open privately · Available for {_del_mins} min</i>"
         )
         bot_url = f"https://t.me/{client.me.username}?start=file_{f['_id']}"
         buttons = [
-            [InlineKeyboardButton("⬇️ Get It Now", url=bot_url)],
-            [InlineKeyboardButton("🤖 Open Bot", url=f"https://t.me/{client.me.username}")],
+            [InlineKeyboardButton("⬇ Get File Privately", url=bot_url)],
+            [InlineKeyboardButton("⌂ Open Movie Hub", url=f"https://t.me/{client.me.username}")],
         ]
     else:
         caption = _build_caption(query, total, speed, _del_mins)
@@ -294,11 +294,13 @@ async def group_search(client: Client, message: Message):
             page_files, client.me.username, session_id, 0, total, total_pages
         )
         buttons.append([InlineKeyboardButton(
-            "🤖 Open Bot", url=f"https://t.me/{client.me.username}"
+            "⌂ Open Movie Hub", url=f"https://t.me/{client.me.username}"
         )])
     markup = InlineKeyboardMarkup(buttons)
 
-    status_msg = await message.reply_text("🔍 Searching…", quote=True)
+    status_msg = await message.reply_text(
+        "🔎 <b>Searching the movie library…</b>", quote=True, parse_mode=ParseMode.HTML
+    )
     try:
         await status_msg.edit_text(
             text=caption, reply_markup=markup, parse_mode=ParseMode.HTML
@@ -307,15 +309,7 @@ async def group_search(client: Client, message: Message):
     except Exception:
         result_msg = status_msg
 
-    # Auto-delete the result message after auto_delete_time
-    async def _auto_delete(msg):
-        await asyncio.sleep(_del_secs)
-        try:
-            await msg.delete()
-        except Exception:
-            pass
-
-    asyncio.create_task(_auto_delete(result_msg))
+    await db.schedule_deletion(result_msg.chat.id, result_msg.id, _del_secs)
 
 
 # ─── Group pagination callback ────────────────────────────────────────────────
@@ -329,6 +323,9 @@ async def handle_group_pagination(client: Client, callback: CallbackQuery):
     data = await db.get_search(session_id)
     if not data:
         await callback.answer("⚠️ Session expired. Search again.", show_alert=True)
+        return
+    if data.get("user_id") != callback.from_user.id:
+        await callback.answer("Only the person who searched can change this page.", show_alert=True)
         return
 
     results     = data["results"]

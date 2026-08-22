@@ -1,5 +1,9 @@
 # MCCxBot — Full Architecture, Code Quality & Product Audit
 
+> Historical snapshot: this report predates the August 2026 stability and UI
+> rebuild. Several findings described below are now resolved; use the current
+> README, test suite, and Git history as the source of truth.
+
 Every `.py` file (bot.py, utils.py, tmdb.py, database/db.py, all 15 files in
 plugins/, both tools/ scripts) plus README.md, BOT_FEATURES.md and
 BOT_BLUEPRINT.md were read in full before writing this. Line numbers below

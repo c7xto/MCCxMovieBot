@@ -19,11 +19,7 @@ _pending_broadcasts = {}
 
 
 async def _auto_delete_broadcast(msg, delay=86400):
-    await asyncio.sleep(delay)
-    try:
-        await msg.delete()
-    except Exception:
-        pass
+    await db.schedule_deletion(msg.chat.id, msg.id, delay)
 
 
 async def _run_broadcast(client, message, do_pin, do_del, status_msg, target="users"):
@@ -31,9 +27,9 @@ async def _run_broadcast(client, message, do_pin, do_del, status_msg, target="us
     sent_groups = failed_groups = 0
 
     if target in ("users", "both"):
-        users = await db.get_all_users()
-        for user_id in users:
-            if await db.is_banned(user_id):
+        banned_users = set(await db.get_banned_users())
+        async for user_id in db.iter_user_ids():
+            if user_id in banned_users:
                 skipped_banned += 1
                 continue
             try:
@@ -45,14 +41,14 @@ async def _run_broadcast(client, message, do_pin, do_del, status_msg, target="us
                     except Exception:
                         pass
                 if do_del:
-                    asyncio.create_task(_auto_delete_broadcast(b_msg, 86400))
+                    await _auto_delete_broadcast(b_msg, 86400)
             except FloodWait as e:
                 await asyncio.sleep(e.value)
                 try:
                     b_msg = await message.reply_to_message.copy(chat_id=user_id)
                     sent_users += 1
                     if do_del:
-                        asyncio.create_task(_auto_delete_broadcast(b_msg, 86400))
+                        await _auto_delete_broadcast(b_msg, 86400)
                 except Exception:
                     failed_users += 1
             except (InputUserDeactivated, UserIsBlocked):
@@ -178,7 +174,7 @@ async def broadcast_handler(client: Client, message: Message):
     else:
         target = "users"
 
-    user_count = len(await db.get_all_users()) if target in ("users", "both") else 0
+    user_count = await db.get_user_count() if target in ("users", "both") else 0
     group_count = await db.get_group_count() if target in ("groups", "both") else 0
     total = user_count + group_count
 

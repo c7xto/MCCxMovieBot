@@ -29,6 +29,10 @@ import logging
 import asyncio
 from pyrogram import Client, filters
 from pyrogram.errors import UserNotParticipant
+from pyrogram.errors import (
+    FileIdInvalid, FileReferenceEmpty, FileReferenceExpired,
+    FileReferenceInvalid, MediaEmpty, MediaInvalid,
+)
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message
 from pyrogram.enums import ParseMode, ChatMemberStatus
 from database.db import db
@@ -132,16 +136,14 @@ async def _deliver_file(client, chat_id, file_obj_id: str):
             caption=_build_caption(cfg, file_data, delete_minutes, client.me.username),
             parse_mode=ParseMode.HTML
         )
-        asyncio.create_task(
-            _auto_delete_file(sent, file_data["file_name"], client.me.username, delete_seconds)
-        )
+        await _auto_delete_file(sent, file_data["file_name"], client.me.username, delete_seconds)
+    except (FileIdInvalid, FileReferenceEmpty, FileReferenceExpired,
+            FileReferenceInvalid, MediaEmpty, MediaInvalid) as e:
+        await db.delete_file_by_id(file_data["file_id"])
+        await client.send_message(chat_id, "❌ File has expired. Search again.")
+        logger.warning("Removed invalid cached file %s: %s", file_data["file_id"], e)
     except Exception as e:
-        err = str(e).lower()
-        if any(k in err for k in ["file_reference", "invalid", "not found", "media"]):
-            await db.delete_file_by_id(file_data["file_id"])
-            await client.send_message(chat_id, "❌ File has expired. Search again.")
-        else:
-            await client.send_message(chat_id, "❌ Could not send file. Try again.")
+        await client.send_message(chat_id, "❌ Could not send file right now. Try again.")
         logger.error(f"req_fsub/_deliver_file send failed: {e}")
 
 

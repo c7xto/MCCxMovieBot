@@ -2,6 +2,10 @@ import os
 import sys
 import asyncio
 import logging
+import tempfile
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ── Logging setup — configured before anything else runs so the startup
 # verification block below has somewhere to log to.
@@ -26,10 +30,10 @@ def _verify_environment():
          empirically confirmed against this host's Python 3.14 install, not
          assumed.
       2. Cryptographic / CA bundle sanity — certifi.where() must resolve to
-         a real, non-empty CA bundle file, since database/db.py passes it as
-         tlsCAFile for every mongodb+srv:// cluster connection. A missing or
+         a real, non-empty CA bundle file, since database/db.py uses it as
+         tlsCAFile for secured MongoDB cluster connections. A missing or
          empty bundle would surface later as an opaque TLS handshake failure
-         deep inside the first Motor connection attempt instead of here.
+         deep inside the first MongoDB connection attempt instead of here.
 
     Any failure logs a diagnostic and exits immediately (sys.exit(1)) rather
     than letting the bot partially boot into an unstable state.
@@ -63,25 +67,50 @@ def _verify_environment():
         )
         sys.exit(1)
 
+    required = {
+        "API_ID": os.getenv("API_ID"),
+        "API_HASH": os.getenv("API_HASH"),
+        "BOT_TOKEN": os.getenv("BOT_TOKEN"),
+        "DATABASE_URI": os.getenv("DATABASE_URI"),
+        "ADMIN_ID": os.getenv("ADMIN_ID"),
+    }
+    missing = [name for name, value in required.items() if not value]
+    if missing:
+        logger.critical("Missing required environment variables: %s", ", ".join(missing))
+        sys.exit(1)
+    try:
+        int(required["API_ID"])
+        [int(value.strip()) for value in required["ADMIN_ID"].split(",") if value.strip()]
+    except ValueError:
+        logger.critical("API_ID and every ADMIN_ID value must be numeric.")
+        sys.exit(1)
     logger.info("✅ Startup environment verified.")
 
 
 _verify_environment()
 
-import fcntl
 from pyrogram import Client
-from dotenv import load_dotenv
 from database.db import db
-from plugins.health_monitor import run_health_monitor, run_cache_reaper, _log_task_crash
+from plugins.health_monitor import (
+    run_health_monitor, run_cache_reaper, run_deletion_worker, _log_task_crash,
+)
 
-load_dotenv()
-
-# ── Single instance lock — kills the startup if another copy is already running
-_lock_file = open("/tmp/mccxbot.lock", "w")
+# ── Cross-platform single-instance lock ──────────────────────────────────────
+_lock_path = os.path.join(tempfile.gettempdir(), "mccxbot.lock")
+_lock_file = open(_lock_path, "a+")
+_lock_file.seek(0)
+_lock_file.write("0")
+_lock_file.flush()
 try:
-    fcntl.flock(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-except IOError:
-    print("❌ Another instance of MCCxBot is already running. Exiting.")
+    if os.name == "nt":
+        import msvcrt
+        _lock_file.seek(0)
+        msvcrt.locking(_lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    logger.critical("Another MCCxBot instance is already running.")
     sys.exit(1)
 
 # Suppress noisy third-party logs
@@ -89,7 +118,6 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 logging.getLogger("pyrogram.session.session").setLevel(logging.ERROR)
 logging.getLogger("pyrogram.connection.connection").setLevel(logging.ERROR)
 logging.getLogger("pyrogram.session.auth").setLevel(logging.ERROR)
-logging.getLogger("motor").setLevel(logging.ERROR)
 logging.getLogger("pymongo").setLevel(logging.ERROR)
 logging.getLogger("asyncio").setLevel(logging.WARNING)
 logging.getLogger("aiohttp").setLevel(logging.WARNING)
@@ -101,6 +129,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 class AutoFilterBot(Client):
     def __init__(self):
+        self.background_tasks = []
         super().__init__(
             name="MCCxBot",
             api_id=API_ID,
@@ -118,14 +147,18 @@ class AutoFilterBot(Client):
 
         logger.info("🔌 Validating MongoDB connections...")
         if not db.dbs:
-            logger.critical("💥 No MongoDB clusters connected! Check DATABASE_URI in .env")
+            await super().stop()
+            raise RuntimeError("No MongoDB clusters configured. Check DATABASE_URI.")
         else:
             for i, db_instance in enumerate(db.dbs):
                 try:
                     await db_instance.command("ping")
                     logger.info(f"  ✅ Cluster {i+1} — OK")
                 except Exception as e:
-                    logger.error(f"  ❌ Cluster {i+1} — FAILED: {e}")
+                    if i == 0:
+                        await super().stop()
+                        raise RuntimeError(f"Primary MongoDB cluster is unavailable: {e}") from e
+                    logger.warning(f"  ⚠️ Optional cluster {i+1} unavailable: {e}")
 
         logger.info("🔄 Syncing .env config → MongoDB...")
         await db.sync_config()
@@ -139,18 +172,38 @@ class AutoFilterBot(Client):
         logger.info("📑 Ensuring database indexes...")
         await db.ensure_indexes()
 
+        if await db.registry_needs_migration():
+            await super().stop()
+            raise RuntimeError(
+                "Existing movie files were found but file_registry is empty. "
+                "Run `python tools/migrate_registry.py` once before starting the bot."
+            )
+
         logger.info("✅ Bot fully ready.")
 
         health_task = asyncio.create_task(run_health_monitor(self))
         health_task.add_done_callback(lambda t: _log_task_crash(t, self, "run_health_monitor"))
+        self.background_tasks.append(health_task)
         logger.info("✅ Health monitor started.")
 
         reaper_task = asyncio.create_task(run_cache_reaper())
         reaper_task.add_done_callback(lambda t: _log_task_crash(t, self, "run_cache_reaper"))
+        self.background_tasks.append(reaper_task)
         logger.info("✅ Search-cache reaper started.")
 
+        deletion_task = asyncio.create_task(run_deletion_worker(self))
+        deletion_task.add_done_callback(lambda t: _log_task_crash(t, self, "run_deletion_worker"))
+        self.background_tasks.append(deletion_task)
+        logger.info("✅ Durable deletion worker started.")
+
     async def stop(self, *args):
+        for task in self.background_tasks:
+            task.cancel()
+        if self.background_tasks:
+            await asyncio.gather(*self.background_tasks, return_exceptions=True)
+            self.background_tasks.clear()
         await super().stop()
+        await db.close()
         logger.info("🛑 Bot stopped.")
 
 

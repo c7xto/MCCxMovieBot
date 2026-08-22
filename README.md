@@ -1,255 +1,128 @@
 <div align="center">
 
-<img src="https://files.catbox.moe/4efq8t.jpg" alt="MCCxBot Banner" width="600"/>
+# 🎬 MCCx Movie Hub
 
-# 🎬 MCCxBot
-### Malayalam Cinema Club — Auto Filter & File Delivery Bot
+Fast Telegram movie and series search for the Malayalam Cinema Club.
 
-[![Python](https://img.shields.io/badge/Python-3.9%2B-blue?style=flat-square&logo=python)](https://python.org)
-[![Pyrogram](https://img.shields.io/badge/Pyrogram-2.0%2B-green?style=flat-square)](https://pyrogram.org)
-[![MongoDB](https://img.shields.io/badge/MongoDB-Atlas-brightgreen?style=flat-square&logo=mongodb)](https://mongodb.com)
-[![License](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](LICENSE)
-[![Telegram](https://img.shields.io/badge/Telegram-MCCxBot-blue?style=flat-square&logo=telegram)](https://t.me/MCCxUpdates)
-
-*A production-grade Telegram bot serving the Malayalam Cinema Community — 1.5M+ files, multi-cluster MongoDB, TMDB integration, and a full admin suite.*
+**Kurigram · PyMongo Async · MongoDB · TMDB · Docker**
 
 </div>
 
----
+## What it does
 
-## ✨ Features
+- Searches movie and series files across as many as five MongoDB clusters.
+- Understands title, language and quality terms such as `Leo Malayalam 1080p`.
+- Delivers cached Telegram files privately with durable auto-deletion.
+- Supports group-to-private search handoff, spell suggestions and series grouping.
+- Indexes storage channels in real time or through the resumable bulk indexer.
+- Provides a Telegram-native control center for files, groups, channels, access gates, analytics and health.
+- Tracks missing requests and automatically notifies users when matching files arrive.
 
-### 🔍 Search & Delivery
-- **Smart auto-filter** — searches across 5 MongoDB clusters instantly
-- **Language + Quality preset** — type `Malayalam 1080p Leo` to skip all selection steps
-- **Spell correction** — suggests similar titles when no results found
-- **Paginated results** — language → quality → file list with back navigation
-- **Group search** — users search in connected groups, files delivered in PM
-- **FSub gate** — force subscribe before access, with inline join buttons
-- **Auto-delete** — files auto-delete after configurable time with 1-min warning
+Premium plans and web streaming are deliberately outside this project's current scope.
 
-### 🎛 Admin Panel (`/admin`)
-- **Analytics** — users, files, groups, cluster storage bars, language breakdown, top active groups — all in one screen
-- **File Manager** — search, delete, rename, find duplicates, bulk delete by pattern, quick CAM purge, cluster migration, top missing files
-- **Group Manager** — list all groups, ban/unban, per-group settings, whitelist/blacklist mode, top groups by activity
-- **FSub Manager** — add/remove join channels, refresh invite links, channel health check
-- **Maintenance Mode** — toggle with custom message, admin exempt
-- **Caption Template** — custom file captions with `{filename}`, `{quality}`, `{lang}`, `{size}`, `{username}`, `{delete_minutes}` variables
-- **Config Backup/Restore** — export settings as JSON, restore with protected fields
-- **Channel Health Check** — verifies bot admin status in all configured channels
-- **Request Channel FSub** — separate, rotating "join to unlock" prompt (independent of the main FSub gate) shown before file delivery, on a configurable per-user interval
-- **Self-Update** — `/update` or the panel's **Update Bot** button pulls the latest code straight from GitHub and restarts, without touching `.env`
+## Reliability design
 
-### 📢 Broadcast
-- **Preview before send** — shows recipient count, time estimate, message preview
-- **Target flags** — `-users`, `-groups`, or both
-- **Schedule** — `-schedule 2h` or `-schedule 30m`
-- **Auto-delete** — `-del` removes broadcast after 24 hours
-- **Pin** — `-pin` silently pins for each user
+- `file_registry` provides cross-cluster `file_id` uniqueness and is kept in sync by every delete, purge and reset path.
+- Bulk writes distinguish complete success, partial success, duplicates and genuine retryable failures.
+- The primary MongoDB cluster is required at startup; optional clusters degrade independently.
+- Search sessions are bounded and expire automatically.
+- Message deletions use a persistent MongoDB queue, so restarts do not cancel them.
+- Background task crashes and cluster failures are reported to the configured log channel.
+- The self-updater stages and compiles the complete target commit before applying it, with rollback on an apply failure.
 
-### 📚 Indexing
-- **Super-Indexer** — bulk index entire channels with pause/resume
-- **Real-time indexer** — auto-indexes new uploads from configured DB channels
-- **Post queue** — drains at 1 post/3s to prevent FloodWait
-- **Smart log notifications** — completion and stop summaries to log channel
+## Requirements
 
-### 🔔 Background Tasks
-- **Health monitor** — pings all clusters every 10 minutes, alerts the log channel on failure and again on recovery, checks for indexer tasks stuck for 2+ hours
-- **Cache reaper** — sweeps expired search-pagination sessions from the in-process cache every 5 minutes
-- **Auto request fulfillment** — notifies users when a requested movie is indexed
-- **Crash visibility** — every background task is wrapped so an unhandled exception is reported to the log channel instead of failing silently
+- Python 3.13 recommended
+- Telegram `API_ID`, `API_HASH` and bot token
+- MongoDB connection URI
+- A numeric Telegram administrator ID
 
-### 🎬 Movie Requests
-- **Ticket system** — users request movies, tickets sent to admin log channel
-- **Auto-fulfillment** — when a requested title gets indexed, user is notified automatically
+Runtime versions are pinned in `requirements.txt`. The project uses Kurigram as the maintained Pyrogram-compatible Telegram client and PyMongo's native async API instead of deprecated Motor.
 
----
-
-## 🗂 Project Structure
-
-```
-MCCxBot/
-│
-├── bot.py                    # Entry point — startup environment check, then Client boot
-├── utils.py                  # Shared ADMIN_ID parsing + FSub helpers
-├── tmdb.py                   # TMDB API integration
-├── requirements.txt
-├── .env                      # ← Never commit this
-│
-├── database/
-│   ├── __init__.py
-│   └── db.py                 # Multi-cluster MongoDB layer, file_registry, config cache
-│
-├── tools/
-│   ├── migrate_registry.py       # One-time backfill for the file_registry collection
-│   └── verify_db_performance.py  # Offline DB layer test suite (Pyrogram-isolated)
-│
-└── plugins/
-    ├── admin.py              # Admin panel, commands
-    ├── filter.py             # PM search, file delivery
-    ├── start.py              # /start handler, deep links
-    ├── welcome.py            # Group welcome messages
-    ├── group_connect.py      # Group search handler
-    ├── req_fsub.py           # Request Channel FSub (rotating join prompt)
-    ├── index.py              # Super-Indexer (bulk)
-    ├── indexer.py            # Real-time indexer + post queue
-    ├── request.py            # Movie request system
-    ├── broadcast.py          # Broadcast command
-    ├── file_manager.py       # File Manager panel
-    ├── group_manager.py      # Group Manager panel
-    ├── health_monitor.py     # Background health monitor + cache reaper
-    ├── updater.py            # GitHub self-update
-    └── state.py              # Shared admin input state
-```
-
----
-
-## ⚙️ Configuration
-
-Copy `.env.example` to `.env` and fill in your values:
-
-```env
-# ── Telegram Credentials (Required) ──────────────────────────────
-API_ID=                        # From https://my.telegram.org
-API_HASH=                      # From https://my.telegram.org
-BOT_TOKEN=                     # From @BotFather
-
-# ── Admin ────────────────────────────────────────────────────────
-ADMIN_ID=                      # Your Telegram user ID
-
-# ── Channels ─────────────────────────────────────────────────────
-LOG_CHANNEL_ID=                # Channel where logs are sent (bot must be admin)
-DATABASE_CHANNEL_ID=           # Primary file storage channel
-UPDATE_CHANNEL=                # Update channel ID (numeric)
-UPDATE_CHANNEL_LINK=           # e.g. https://t.me/YourChannel
-MAIN_GROUP_LINK=               # e.g. https://t.me/YourGroup
-
-# ── APIs ─────────────────────────────────────────────────────────
-TMDB_API_KEY=                  # From https://themoviedb.org/settings/api
-
-# ── MongoDB (Required — up to 5 clusters) ────────────────────────
-DATABASE_URI=                  # Primary cluster (mandatory)
-DATABASE_URI_2=                # Additional clusters (optional)
-DATABASE_URI_3=
-DATABASE_URI_4=
-DATABASE_URI_5=
-```
-
-> **Note:** All other settings (welcome text, FSub channels, auto-delete time, caption template, etc.) are managed live via `/admin` and stored in MongoDB. You do not need to restart the bot to change them.
-
----
-
-## 🚀 Deployment
-
-### Local / VPS
+## Local setup
 
 ```bash
-# 1. Clone the repo
-git clone https://github.com/yourusername/MCCxBot.git
-cd MCCxBot
+git clone https://github.com/c7xto/MCCxMovieBot.git
+cd MCCxMovieBot
+python -m venv .venv
+```
 
-# 2. Install dependencies
+Activate the environment and install dependencies:
+
+```bash
+# Linux/macOS
+source .venv/bin/activate
+
+# Windows PowerShell
+.venv\Scripts\Activate.ps1
+
 pip install -r requirements.txt
-
-# 3. Set up environment
-cp .env.example .env
-# Edit .env with your values
-
-# 4. Run
-python bot.py
 ```
 
-### Docker
+Copy `.env.example` to `.env`, fill the required values, then run `python bot.py`.
+The bot stops immediately with an actionable error when a required setting or the primary database is unavailable.
+
+## Docker
 
 ```bash
-docker build -t mccxbot .
-docker run --env-file .env mccxbot
+cp .env.example .env
+# Edit .env
+docker compose up -d --build
+docker compose logs -f bot
 ```
 
-### Cloud (Render / Railway / Heroku / Mango)
+## Required environment variables
 
-1. Connect your GitHub repository
-2. Set all environment variables in the platform's dashboard (do **not** upload `.env`)
-3. Set the start command to `python bot.py`
-4. Deploy
+| Variable | Purpose |
+|---|---|
+| `API_ID` | Telegram application ID |
+| `API_HASH` | Telegram application hash |
+| `BOT_TOKEN` | BotFather token |
+| `ADMIN_ID` | One or more comma-separated numeric admin IDs |
+| `DATABASE_URI` | Required primary MongoDB cluster |
 
----
+`DATABASE_URI_2` through `DATABASE_URI_5` are optional. Channel IDs, community links and the TMDB key are documented in `.env.example`; most presentation and access settings can then be managed live through `/admin`.
 
-## 📋 Requirements
+## Main commands
 
+| Command | Who | Purpose |
+|---|---|---|
+| `/start` | Everyone | Open the Movie Hub |
+| `/help` | Everyone | Search guide |
+| `/request <title>` | Everyone | Request a missing title |
+| `/admin` | Admin | Open the control center |
+| `/stats` | Admin | View operational statistics |
+| `/broadcast` | Admin | Preview and send a broadcast |
+| `/filesearch <query>` | Admin | Find and manage indexed files |
+| `/update <commit-sha>` | Admin | Review and apply a pinned update |
+| `/cancel` | Admin | Cancel the current admin input flow |
+
+## First deployment checklist
+
+1. Add the bot as an administrator in the log and database channels.
+2. Open `/admin` → **System** → **Channel Check**.
+3. Configure source and required-subscription channels.
+4. Forward a storage-channel message to the bot to begin bulk indexing.
+5. Run `python tools/migrate_registry.py` once if upgrading an older database.
+
+## Development and verification
+
+```bash
+pip install -r requirements-dev.txt
+python -m compileall -q .
+ruff check .
+pytest -q
+pip-audit -r requirements.txt --progress-spinner off
 ```
-pyrogram>=2.0.106
-TgCrypto
-motor
-pymongo
-dnspython
-certifi
-python-dotenv
-aiohttp
-```
 
-`dnspython` resolves the SRV/TXT records `mongodb+srv://` URIs depend on; `certifi` supplies the CA bundle used for the TLS handshake to MongoDB Atlas. Both are required, not optional — the bot fails fast at startup if either is missing.
+The GitHub Actions workflow runs these checks on every push and pull request.
 
----
+## Important operational notes
 
-## 🤖 Bot Setup Checklist
+- Search still uses MongoDB regex traversal. For very large libraries, the next major performance project should be Atlas Search or an equivalent text index with measured relevance and latency.
+- Scheduled broadcasts are kept in process and are cancelled by a restart; ordinary delivered-file deletion is durable.
+- Use only media you are legally authorized to distribute and follow Telegram and hosting-provider rules.
 
-After deploying, do these steps once:
+## License
 
-- [ ] Add bot as **Admin** in your Log Channel (with post messages permission)
-- [ ] Add bot as **Admin** in your Database Channel (with post messages permission)
-- [ ] Add bot as **Admin** in any FSub channels
-- [ ] Run `/admin` → **Channel Health Check** to verify all channels
-- [ ] Run `/admin` → **Manage FSub** → add your channels
-- [ ] Set your welcome text and media via `/admin`
-- [ ] Forward a message from your DB channel to the bot → tap **Start Indexing** to index existing files
-
----
-
-## 🛠 Maintenance Scripts (`tools/`)
-
-- **`tools/migrate_registry.py`** — one-time backfill for the centralized `file_registry` collection (the single source of truth for cross-cluster `file_id` uniqueness). Builds and verifies the unique index before touching any documents, then streams and dedupes every existing file across all configured clusters concurrently. Idempotent and safe to run against a live bot — run it once after upgrading to a version with `file_registry`:
-  ```bash
-  python tools/migrate_registry.py
-  ```
-- **`tools/verify_db_performance.py`** — standalone test suite for the database layer (search-cache TTL/LRU behavior, the `$facet` language-aggregation pipeline, and indexed search traversal) that runs without needing a live Pyrogram/Telegram session:
-  ```bash
-  python tools/verify_db_performance.py
-  ```
-
----
-
-## 📸 Screenshots
-
-| Start Screen | Search Results | Admin Panel |
-|:---:|:---:|:---:|
-| *(add screenshot)* | *(add screenshot)* | *(add screenshot)* |
-
----
-
-## 🙏 Credits
-
-**Built by:** [joe7](https://t.me/meencurry) — Malayalam Cinema Club
-
-**Powered by:**
-- [Pyrogram](https://pyrogram.org) — Telegram MTProto framework
-- [Motor](https://motor.readthedocs.io) — Async MongoDB driver
-- [TMDB API](https://themoviedb.org) — Movie metadata
-
-**Community:** [MCCxUpdates](https://t.me/MCCxUpdates) | [MCCxRequest](https://t.me/MCCxRequest)
-
----
-
-## ⚠️ Disclaimer
-
-This bot is built for the Malayalam Cinema Community for **personal and community use**. The developer is not responsible for how others use this software. Do not use this bot to distribute copyrighted content without proper authorization.
-
----
-
-<div align="center">
-
-Made with ❤️ for the Malayalam Cinema Community
-
-⭐ Star this repo if it helped you!
-
-</div>
+[MIT](LICENSE)

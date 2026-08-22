@@ -221,4 +221,10 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    async def _run():
+        try:
+            await main()
+        finally:
+            await db.close()
+
+    asyncio.run(_run())

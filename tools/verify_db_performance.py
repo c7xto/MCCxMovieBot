@@ -200,7 +200,8 @@ async def test_aggregation_pipeline_health():
     for i, col in enumerate(db.file_cols):
         try:
             probe = [{"$facet": {"n": [{"$count": "n"}]}}]
-            await col.aggregate(probe, allowDiskUse=True).to_list(length=1)
+            cursor = await col.aggregate(probe, allowDiskUse=True)
+            await cursor.to_list(length=1)
             record(section, f"Cluster {i+1}: accepts $facet + allowDiskUse", "PASS")
         except Exception as e:
             record(section, f"Cluster {i+1}: accepts $facet + allowDiskUse", "FAIL", str(e)[:200])

@@ -1,12 +1,12 @@
 import os
 import re
 import time
-import asyncio
 from collections import OrderedDict
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.errors import InputUserDeactivated, UserIsBlocked
 from database.db import db
+from utils import ADMIN_ID, callback_data
 
 # Per-user request cooldown — same bounded-LRU pattern and naming style as
 # filter.py's USER_SEARCH_COOLDOWN/_COOLDOWN_MAX/COOLDOWN_TIME, applied to
@@ -21,15 +21,8 @@ COOLDOWN_TIME = 30  # seconds — long enough to stop rapid-fire spam, short
 
 
 async def _delayed_delete(msg, delay=2):
-    """Background auto-delete for the transient cooldown warning — fire-
-    and-forget via create_task (see call site), matching every other
-    auto-delete in this codebase, instead of an inline blocking sleep that
-    would hold the handler open for 2 extra seconds doing nothing useful."""
-    await asyncio.sleep(delay)
-    try:
-        await msg.delete()
-    except Exception:
-        pass
+    """Queue transient-message cleanup without retaining a sleeping task."""
+    await db.schedule_deletion(msg.chat.id, msg.id, delay)
 
 # ── /request command ──────────────────────────────────────────────────────────
 @Client.on_message(filters.command("request") & filters.private)
@@ -49,6 +42,13 @@ async def handle_movie_request(client: Client, callback: CallbackQuery):
 
 # ── Ticket generator ────────────────────────────────────────────────────────────
 async def send_request_ticket(client, user, movie_name, message_obj, is_callback=False):
+    # Store the same bounded title carried by the admin callback. Telegram's
+    # 64-byte callback limit is easy to exceed with multibyte titles.
+    request_prefix = f"reqdone#{user.id}#"
+    movie_name = callback_data(request_prefix, movie_name)[len(request_prefix):].strip()
+    if not movie_name:
+        return await message_obj.reply_text("Please include a valid movie title.")
+
     current_time = time.time()
     if user.id in USER_REQUEST_COOLDOWN:
         passed = current_time - USER_REQUEST_COOLDOWN[user.id]
@@ -58,7 +58,7 @@ async def send_request_ticket(client, user, movie_name, message_obj, is_callback
                 f"⏳ Wait `{int(COOLDOWN_TIME - passed) + 1}s` before submitting another request.",
                 quote=not is_callback
             )
-            asyncio.create_task(_delayed_delete(wait_msg))
+            await _delayed_delete(wait_msg)
             return
 
     if len(USER_REQUEST_COOLDOWN) >= _COOLDOWN_MAX:
@@ -80,7 +80,10 @@ async def send_request_ticket(client, user, movie_name, message_obj, is_callback
 
     # The button the admin will click when they upload it
     markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Mark Uploaded & Notify User", callback_data=f"reqdone#{user.id}#{movie_name}")]
+        [InlineKeyboardButton(
+            "✅ Mark Uploaded & Notify User",
+            callback_data=callback_data(request_prefix, movie_name),
+        )]
     ])
 
     try:
@@ -100,7 +103,7 @@ async def send_request_ticket(client, user, movie_name, message_obj, is_callback
         await message_obj.reply_text(f"Failed to send request: {e}")
 
 # ── Admin taps "Mark Uploaded & Notify User" ───────────────────────────────────
-@Client.on_callback_query(filters.regex(r"^reqdone#"))
+@Client.on_callback_query(filters.regex(r"^reqdone#") & filters.user(ADMIN_ID))
 async def mark_request_done(client: Client, callback: CallbackQuery):
     try:
         parts = callback.data.split("#", 2)

@@ -1,18 +1,22 @@
 import os
-import asyncio
+import logging
 import urllib.parse
 import time
-import random
-import string
+import secrets
 from dotenv import load_dotenv
 from plugins.filter import route_menu
-from utils import _no_preview, _html, HELP_STEPS_EN, HELP_FOOTER_EN
+from utils import _no_preview, _html, callback_data, HELP_STEPS_EN, HELP_FOOTER_EN
 from pyrogram import Client, filters
+from pyrogram.errors import (
+    FileIdInvalid, FileReferenceEmpty, FileReferenceExpired,
+    FileReferenceInvalid, MediaEmpty, MediaInvalid,
+)
 from pyrogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, Message
 from pyrogram.enums import ParseMode, ChatAction
 from database.db import db
 
 load_dotenv()
+logger = logging.getLogger(__name__)
 
 # ── Brand kit ─────────────────────────────────────────────────────────────
 # Shared icon set for this file — keep in sync with plugins/filter.py's
@@ -42,12 +46,12 @@ LANG_NAMES = {"en": "English", "ml": "മലയാളം"}
 LANG_STRINGS = {
     "en": {
         "welcome_body": (
-            f"{ICON_MOVIE} I'm MCCxMovieBot — a movie &amp; series finder.\n"
-            f"{ICON_SEARCH} Send a title to search."
+            "Your fast, private movie &amp; series library.\n"
+            "Send a title below and choose the version you want."
         ),
-        "welcome_greeting": "Welcome, {first_name}",
-        "files_counting": "{total_files:,} files and counting.",
-        "onboarding_title": "New here? It's simple:",
+        "welcome_greeting": "Hello, {first_name} 👋",
+        "files_counting": "{total_files:,} files ready to discover",
+        "onboarding_title": "Find a file in three steps",
         "onboarding_steps": [
             "Type any movie or series name",
             "Tap the file you want",
@@ -59,8 +63,8 @@ LANG_STRINGS = {
     },
     "ml": {
         "welcome_body": (
-            f"{ICON_MOVIE} ഞാൻ MCCxMovieBot — സിനിമകളും സീരീസുകളും കണ്ടെത്താൻ സഹായിക്കുന്ന ബോട്ട്.\n"
-            f"{ICON_SEARCH} സെർച്ച് ചെയ്യാൻ ഒരു പേര് അയക്കൂ."
+            "സിനിമകളും സീരീസുകളും വേഗത്തിൽ കണ്ടെത്താനുള്ള നിങ്ങളുടെ ലൈബ്രറി.\n"
+            "താഴെ പേര് അയച്ച് വേണ്ട പതിപ്പ് തിരഞ്ഞെടുക്കൂ."
         ),
         "welcome_greeting": "സ്വാഗതം, {first_name}",
         "files_counting": "{total_files:,} ഫയലുകൾ ഇപ്പോൾ ലഭ്യമാണ്.",
@@ -91,10 +95,12 @@ def _build_start_ui(config, mention, total_files, bot_username, update_link, gro
                      is_new=False, first_name="", lang="en"):
     """Shared welcome UI builder — used by /start and start_home callback."""
     strings = LANG_STRINGS.get(lang, LANG_STRINGS["en"])
+    safe_name = _html(first_name or mention)
     default_welcome = (
-        "<b>" + strings["welcome_greeting"] + "</b>\n\n"
-        + strings["welcome_body"] + "\n\n"
-        "<i>" + strings["files_counting"] + "</i>"
+        "<b>🎬 MCCx Movie Hub</b>\n"
+        "<blockquote>" + strings["welcome_greeting"] + "\n"
+        + strings["welcome_body"] + "</blockquote>\n"
+        "<b>📚 Library</b>  •  " + strings["files_counting"]
     )
     # An admin-customized welcome_text is a single free-text field with no
     # per-language variant — the language toggle only swaps the *default*.
@@ -103,7 +109,7 @@ def _build_start_ui(config, mention, total_files, bot_username, update_link, gro
         # Both {mention} and {first_name} are accepted — admin-set welcome
         # text written before this update still uses {mention} and keeps
         # working exactly as before.
-        text = raw.format(mention=mention, first_name=first_name or mention, total_files=total_files)
+        text = raw.format(mention=safe_name, first_name=safe_name, total_files=total_files)
     except Exception:
         text = raw
 
@@ -114,19 +120,22 @@ def _build_start_ui(config, mention, total_files, bot_username, update_link, gro
         steps = "\n".join(f"{i}. {s}" for i, s in enumerate(strings["onboarding_steps"], 1))
         text += f"\n\n<blockquote><b>{strings['onboarding_title']}</b>\n{steps}</blockquote>"
 
-    text += f"\n\n@{bot_username}"
+    text += "\n\n<i>🔎 Type a movie or series name to begin.</i>"
 
     buttons = []
 
-    row1 = [InlineKeyboardButton("👥 Add To Group", url=f"https://t.me/{bot_username}?startgroup=true")]
-    if update_link:
-        row1.append(InlineKeyboardButton(f"{ICON_UPDATES} Join Our Channel", url=update_link))
-    buttons.append(row1)
-
+    buttons.append([
+        InlineKeyboardButton("🔎 Search Guide", callback_data="help_menu"),
+        _lang_button(lang),
+    ])
+    community_row = [
+        InlineKeyboardButton("➕ Add to Group", url=f"https://t.me/{bot_username}?startgroup=true")
+    ]
     if group_link:
-        buttons.append([InlineKeyboardButton("⚡ Movie Request Group", url=group_link)])
-
-    buttons.append([InlineKeyboardButton("ℹ️ Help", callback_data="help_menu"), _lang_button(lang)])
+        community_row.append(InlineKeyboardButton("💬 Request", url=group_link))
+    buttons.append(community_row)
+    if update_link:
+        buttons.append([InlineKeyboardButton("📢 Updates & New Releases", url=update_link)])
     return text, InlineKeyboardMarkup(buttons)
 
 
@@ -146,7 +155,10 @@ async def _execute_search(client, status_msg, query: str, config: dict, user_id=
         lang = await db.get_user_language(user_id) if user_id is not None else "en"
         strings = LANG_STRINGS.get(lang, LANG_STRINGS["en"])
         markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"{ICON_REQUEST} Request This Movie", callback_data=f"reqmovie#{query[:40]}")]
+            [InlineKeyboardButton(
+                f"{ICON_REQUEST} Request This Movie",
+                callback_data=callback_data("reqmovie#", query),
+            )]
         ])
         return await status_msg.edit_text(
             f"{ICON_SEARCH} " + strings["no_results"].format(query=_html(query)),
@@ -154,7 +166,7 @@ async def _execute_search(client, status_msg, query: str, config: dict, user_id=
         )
 
     await db.clear_old_searches()
-    session_id = ''.join(random.choices(string.ascii_letters + string.digits, k=6))
+    session_id = secrets.token_urlsafe(9)
     session_data = {
         "results":          results,
         "query":            query,
@@ -188,20 +200,34 @@ async def _handle_file_link(client, message, file_obj_id: str):
     delete_minutes = delete_seconds // 60
 
     from plugins.filter import _auto_delete_file, _build_caption
-    sent = await client.send_cached_media(
-        chat_id=message.chat.id,
-        file_id=file_data["file_id"],
-        caption=_build_caption(config, file_data, delete_minutes, client.me.username),
-        parse_mode=ParseMode.HTML
-    )
-    asyncio.create_task(_auto_delete_file(sent, file_data['file_name'], client.me.username, delete_seconds))
+    try:
+        sent = await client.send_cached_media(
+            chat_id=message.chat.id,
+            file_id=file_data["file_id"],
+            caption=_build_caption(config, file_data, delete_minutes, client.me.username),
+            parse_mode=ParseMode.HTML
+        )
+        await _auto_delete_file(sent, file_data['file_name'], client.me.username, delete_seconds)
+    except (FileIdInvalid, FileReferenceEmpty, FileReferenceExpired,
+            FileReferenceInvalid, MediaEmpty, MediaInvalid) as exc:
+        await db.delete_file_by_id(file_data["file_id"])
+        logger.warning("Removed invalid deep-linked file %s: %s", file_data["file_id"], exc)
+        await message.reply_text(
+            f"{ICON_FAIL} This cached file expired and has been removed. Please search again."
+        )
+    except Exception as exc:
+        logger.error("Deep-linked file delivery failed for %s: %s", file_data["file_id"], exc)
+        await message.reply_text(f"{ICON_FAIL} Could not send this file right now. Please try again.")
 
 
 async def _handle_request_link(message, raw_query: str):
     """Deep-link payload: req_<query> — pre-fills a request confirmation."""
     movie_name = urllib.parse.unquote(raw_query).replace("_", " ")
     markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"{ICON_SUCCESS} Confirm Request", callback_data=f"reqmovie#{movie_name[:40]}")]
+        [InlineKeyboardButton(
+            f"{ICON_SUCCESS} Confirm Request",
+            callback_data=callback_data("reqmovie#", movie_name),
+        )]
     ])
     return await message.reply_text(
         f"{ICON_REQUEST} <b>Movie Request</b>\n\n"
@@ -220,7 +246,8 @@ async def _handle_search_payload(client, message, config, payload: str):
         raw_query = payload
     query = urllib.parse.unquote(raw_query).replace("_", " ")
     status_msg = await message.reply_text(
-        f"{ICON_SEARCH} <b>Searching databases...</b>", parse_mode=ParseMode.HTML, quote=True
+        "🔎 <b>Searching your library…</b>\n<i>Matching title, language and quality</i>",
+        parse_mode=ParseMode.HTML, quote=True
     )
     return await _execute_search(
         client, status_msg, query, config,
@@ -245,13 +272,13 @@ async def start_handler(client: Client, message: Message):
 
     if is_new and LOG_CHANNEL_ID:
         try:
-            users = await db.get_all_users()
+            user_count = await db.get_user_count()
             await client.send_message(
                 LOG_CHANNEL_ID,
                 f"🆕 **New User Alert**\n\n"
                 f"👤 **User:** {message.from_user.mention}\n"
                 f"🆔 **ID:** `{message.from_user.id}`\n"
-                f"📊 **Total Users:** `{len(users)}`"
+                f"📊 **Total Users:** `{user_count:,}`"
             )
         except Exception:
             pass
@@ -297,9 +324,15 @@ async def help_menu_callback(client: Client, callback: CallbackQuery):
     lang = await db.get_user_language(callback.from_user.id)
     strings = LANG_STRINGS.get(lang, LANG_STRINGS["en"])
     steps = "\n".join(f"{i}. {s}" for i, s in enumerate(strings["help_steps"], 1))
-    help_text = f"<blockquote>{steps}</blockquote>\n\n<i>{strings['help_footer']}</i>"
+    help_text = (
+        "<b>🔎 How to find your movie</b>\n"
+        f"<blockquote>{steps}</blockquote>\n"
+        "<b>Power search</b>\n"
+        "Try <code>Leo Malayalam 1080p</code> to narrow results instantly.\n\n"
+        f"<i>{strings['help_footer']}</i>"
+    )
     markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("◀️ Back", callback_data="start_home")]
+        [InlineKeyboardButton("⌂ Back to Home", callback_data="start_home")]
     ])
 
     try:

@@ -1,5 +1,9 @@
 # MCCxBot — Long-Term Architecture Proposal
 
+> Historical snapshot: this proposal predates the August 2026 stability and
+> UI rebuild. It remains useful for future scaling choices, but does not
+> describe the current implementation.
+
 Status: proposal, not implemented. Written after Sections 1-4 of the audit
 fix-up (data-loss bugs, group whitelist/auto-delete enforcement, dead-code
 cleanup, TMDB removed from search results, verification gates unified) were
