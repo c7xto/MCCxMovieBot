@@ -172,41 +172,54 @@ async def test_empty_registry_with_existing_files_requires_migration():
 
 
 @pytest.mark.asyncio
-async def test_multiword_search_uses_one_anchor_scan_and_filters_all_tokens():
+async def test_multiword_search_uses_reference_ordered_pattern():
     database = bare_database()
     database._regex_search = AsyncMock(return_value=[
-        {"file_id": "old", "file_name": "Jack Reacher 2012"},
         {"file_id": "exact", "file_name": "Reacher S01E03 2022 1080p"},
     ])
 
     results = await database.get_search_results("reacher 2022", max_results=10)
     assert [doc["file_id"] for doc in results] == ["exact"]
     database._regex_search.assert_awaited_once()
+    regex = database._regex_search.await_args.args[0]
+    assert regex.search("Reacher S01E03 2022 1080p")
+    assert not regex.search("2022 Reacher S01E03 1080p")
+    assert not regex.search("The Preacher 2022 720p")
 
 
 @pytest.mark.asyncio
-async def test_multiword_search_falls_back_to_anchor_candidates():
+async def test_multiword_search_does_not_relax_title_words():
     database = bare_database()
-    database._regex_search = AsyncMock(return_value=[
-        {"file_id": "related", "file_name": "Reacher 2012"},
-    ])
+    database._regex_search = AsyncMock(return_value=[])
 
-    results = await database.get_search_results("reacher 2099", max_results=10)
-    assert [doc["file_id"] for doc in results] == ["related"]
+    results = await database.get_search_results("reacher nonsense", max_results=10)
+    assert results == []
     database._regex_search.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_multiword_search_ranks_before_applying_result_cap():
+async def test_missing_metadata_retries_with_reference_title_search():
     database = bare_database()
-    database._regex_search = AsyncMock(return_value=[
-        {"file_id": "related", "file_name": "Reacher 2012"},
-        {"file_id": "exact", "file_name": "Reacher S01E03 2022 1080p"},
+    database._regex_search = AsyncMock(side_effect=[
+        [],
+        [{"file_id": "series", "file_name": "Reacher S01E01 720p"}],
     ])
 
-    results = await database.get_search_results("reacher 2022", max_results=1)
-    assert [doc["file_id"] for doc in results] == ["exact"]
-    assert database._regex_search.await_args.kwargs["retain_candidates"] is True
+    results = await database.get_search_results("reacher 2022", max_results=10)
+    assert [doc["file_id"] for doc in results] == ["series"]
+    assert database._regex_search.await_count == 2
+    fallback_regex = database._regex_search.await_args_list[1].args[0]
+    assert fallback_regex.search("Reacher S01E01 720p")
+    assert not fallback_regex.search("The Preacher 2022")
+
+
+@pytest.mark.asyncio
+async def test_reference_search_passes_result_limit_and_offset_to_database():
+    database = bare_database()
+    database._regex_search = AsyncMock(return_value=[])
+
+    await database.get_search_results("reacher 2022", max_results=10, offset=20)
+    assert database._regex_search.await_args.args[1:] == (10, 20)
 
 
 @pytest.mark.asyncio
@@ -214,11 +227,11 @@ async def test_strict_search_does_not_match_inside_another_word():
     database = bare_database()
     database._regex_search = AsyncMock(return_value=[{"file_id": "exact"}])
 
-    await database.get_search_results("reacher 2022", max_results=1)
+    await database.get_search_results("reacher", max_results=1)
 
     regex = database._regex_search.await_args.args[0]
-    assert regex.search("Reacher 2022 1080p")
-    assert not regex.search("The Preacher 2022 720p")
+    assert regex.search("Reacher 1080p")
+    assert not regex.search("The Preacher 720p")
 
 
 @pytest.mark.asyncio

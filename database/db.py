@@ -71,11 +71,11 @@ _JUNK_TAG_RE = re.compile(r"http\S+|www\.\S+|@\w+", re.IGNORECASE)
 _SYMBOL_RE = re.compile(r"[_\-\.#+$%^&*()!~`,;:\"'?/<>\[\]{}=|\\]")
 _WS_COLLAPSE_RE = re.compile(r"\s+")
 _SEARCH_EXTENSION_TOKENS = {"mkv", "mp4", "avi", "mov", "zip", "srt"}
-_SEARCH_FALLBACK_STOP = {
-    "the", "and", "for", "with", "from", "movie", "film", "part",
-    "season", "episode", "chapter", "full", "official", "malayalam",
-    "tamil", "telugu", "hindi", "english", "kannada", "dual", "audio",
-    "1080p", "720p", "480p", "2160p", "4k", "hdrip", "webrip", "webdl",
+_OPTIONAL_SEARCH_TOKENS = {
+    "malayalam", "tamil", "telugu", "hindi", "english", "kannada",
+    "dual", "multi", "audio", "dubbed", "sub", "subs", "esub", "esubs",
+    "2160p", "1080p", "720p", "480p", "4k", "uhd", "hdrip", "webrip",
+    "webdl", "bluray", "predvd", "cam", "hevc", "x265", "x264",
 }
 
 
@@ -124,6 +124,28 @@ def deduplicate_search_results(files: list) -> list:
             seen_content.add(signature)
         unique.append(file_doc)
     return unique
+
+
+def _reference_search_pattern(words: list[str]) -> str:
+    """DreamXBotz ordered-word pattern with safe outer boundaries."""
+    separator = r"[\s\.\+\-_]"
+    if len(words) > 1:
+        return (
+            r"(?:^|" + separator + r")"
+            + (r".*" + separator).join(re.escape(word) for word in words)
+            + r"(?:$|" + separator + r")"
+        )
+    return (
+        r"(\b|[\.\+\-_])"
+        + re.escape(words[0])
+        + r"(\b|[\.\+\-_])"
+    )
+
+
+def _is_optional_search_token(token: str) -> bool:
+    return bool(re.fullmatch(r"(?:19|20)\d{2}", token)) or (
+        token.casefold() in _OPTIONAL_SEARCH_TOKENS
+    )
 
 
 def deduplicate_file_batch(files_list):
@@ -1188,7 +1210,7 @@ class Database:
             self._invalidate_file_count()
         return migrated, skipped
 
-    async def _regex_search(self, regex, max_results, offset=0, retain_candidates=False):
+    async def _regex_search(self, regex, max_results, offset=0):
         """Run a single compiled regex against file_name across every
         cluster, dedup by file_id, sorted newest-first. Shared by every
         tier of get_search_results()."""
@@ -1200,17 +1222,21 @@ class Database:
                 # A cold/unindexed Atlas shard must not make every healthy
                 # shard wait five or thirty seconds. Mongo gets its own time
                 # budget and asyncio provides a hard client-side ceiling.
-                async with asyncio.timeout(3.0):
+                # The reference implementation does not impose a MongoDB
+                # deadline. Keep a bounded budget for fault isolation, but
+                # allow enough time for the largest Atlas shard to complete
+                # an ordered multi-word scan (measured at roughly 4 seconds).
+                async with asyncio.timeout(9.0):
                     cursor = (
                         col.find(filter_mongo)
-                        .sort("_id", -1)
+                        .sort("$natural", -1)
                         .skip(offset)
                         .limit(limit)
-                        .max_time_ms(2500)
+                        .max_time_ms(8000)
                     )
                     return [doc async for doc in cursor]
             except TimeoutError:
-                logger.warning("Search cluster skipped after the 3s latency budget")
+                logger.warning("Search cluster skipped after the 9s latency budget")
                 return []
             except Exception as e:
                 # A secondary cluster outage should degrade result coverage,
@@ -1223,21 +1249,16 @@ class Database:
         files = deduplicate_search_results([
             doc for docs in cluster_results for doc in docs
         ])
-        return files if retain_candidates else files[:max_results]
+        return files[:max_results]
 
     async def _get_search_results_uncached(self, query, max_results=40, offset=0):
-        """Search three relevance levels, stopping at the first useful one:
+        """Use DreamXBotz-style ordered filename matching.
 
-        Level 1: words in order, separated by [\\s.+-_] (best match).
-        Level 2: same words present anywhere, any order.
-        Level 3: EVERY single word, searched independently — "balan the
-        boy" always checks "balan" and "the" and "boy" on their own, and
-        any file matching even one of them is included.
-
-        Avoiding lower-quality scans after a strict match makes common
-        searches substantially faster and prevents loose results from
-        crowding out the requested title. Results are deduped by file_id
-        and capped at max_results.
+        Every word in a multi-word query must occur in the typed order and
+        be separated by a normal filename delimiter. A one-word query uses
+        the reference bot's boundary expression. No anchor-only or any-order
+        fallback is used; only optional release metadata may be removed after
+        a strict miss, so unrelated titles cannot fill a result page.
         """
         if isinstance(query, list):
             raw_pattern = "|".join(re.escape(q.strip()) for q in query if q and q.strip())
@@ -1252,134 +1273,32 @@ class Database:
         query = query.strip()
         if not query:
             return []
-        words = [w for w in query.split() if w][:8]
+        words = [word for word in query.split() if word][:12]
         if not words:
             return []
 
-        # One bounded anchor scan is faster and more predictable than three
-        # sequential full-collection regex passes. Fetch candidates using the
-        # first meaningful title word, then enforce every requested token in
-        # memory. This also prevents ``reacher`` from matching ``preacher``.
-        if len(words) > 1 and not offset:
-            anchor_candidates = [
-                word for word in words
-                if len(word) >= 3
-                and not word.isdigit()
-                and word.lower() not in _SEARCH_FALLBACK_STOP
-            ]
-            anchor = anchor_candidates[0] if anchor_candidates else words[0]
-            try:
-                anchor_regex = compile_regex(
-                    r"(?:^|[\s\.\+\-_])" + re.escape(anchor) + r"(?:$|[\s\.\+\-_])"
-                )
-                candidates = await self._regex_search(
-                    anchor_regex, max_results, retain_candidates=True
-                )
-            except re.error:
-                return []
-
-            requested = {word.casefold() for word in words}
-            ordered_query = [word.casefold() for word in words]
-
-            def _relevance(file_doc):
-                identity = normalized_search_identity(file_doc.get("file_name", ""))
-                tokens = identity.split()
-                token_set = set(tokens)
-                matched = sum(word in token_set for word in requested)
-                exact = requested.issubset(token_set)
-                phrase = " ".join(ordered_query) in identity
-                try:
-                    anchor_position = tokens.index(anchor.casefold())
-                except ValueError:
-                    anchor_position = len(tokens) + 1
-                return (not exact, not phrase, -matched, anchor_position)
-
-            # Rank the complete cross-cluster candidate set before applying
-            # the public result cap; previously cluster order could crowd out
-            # a stronger exact match from a later shard. If any candidate has
-            # every requested token, exclude loose anchor-only matches so the
-            # presentation layer's size sorting cannot put a smaller but
-            # irrelevant title/year above the requested movie.
-            ranked = sorted(candidates, key=_relevance)
-            exact_matches = [
-                file_doc for file_doc in ranked
-                if requested.issubset(
-                    set(normalized_search_identity(
-                        file_doc.get("file_name", "")
-                    ).split())
-                )
-            ]
-            return (exact_matches or ranked)[:max_results]
-
-        seen_ids = set()
-        merged = []
-
-        def _add(docs):
-            for doc in docs:
-                fid = doc.get("file_id")
-                if fid in seen_ids:
-                    continue
-                seen_ids.add(fid)
-                merged.append(doc)
-
-        # Level 1: strict, in-order match (original behavior).
-        if len(words) > 1:
-            separator = r"[\s\.\+\-_]+"
-            pattern1 = (
-                r"(?:^|[\s\.\+\-_])"
-                + separator.join(re.escape(w) for w in words)
-                + r"(?:$|[\s\.\+\-_])"
-            )
-        else:
-            pattern1 = r"(\b|[\.\+\-_])" + re.escape(words[0]) + r"(\b|[\.\+\-_])"
         try:
-            regex1 = compile_regex(pattern1)
-            level1 = await self._regex_search(regex1, max_results, offset)
+            regex = compile_regex(_reference_search_pattern(words))
         except re.error:
-            level1 = []
-        _add(level1)
+            return []
+        results = await self._regex_search(regex, max_results, offset)
+        if results or offset or len(words) == 1:
+            return results
 
-        if offset:
-            # Paginating an existing search — stick to level 1 only.
-            return merged[:max_results]
-
-        if len(words) == 1 or merged:
-            return merged[:max_results]
-
-        # Level 2: all words present, any order, anywhere in the name.
-        try:
-            pattern2 = "".join(f"(?=.*{re.escape(w)})" for w in words)
-            regex2 = compile_regex(pattern2)
-            level2 = await self._regex_search(regex2, max_results)
-        except re.error:
-            level2 = []
-        _add(level2)
-
-        if merged:
-            return merged[:max_results]
-
-        # Level 3: individual significant words, only when the two stronger
-        # title-matching strategies found nothing.
-        async def _word_hits(word):
-            try:
-                regex_w = compile_regex(r"(\b|[\.\+\-_])" + re.escape(word) + r"(\b|[\.\+\-_])")
-            except re.error:
-                return []
-            return await self._regex_search(regex_w, max_results)
-
-        fallback_words = [
-            w for w in words
-            if len(w) >= 3 and w.lower() not in _SEARCH_FALLBACK_STOP
+        # Real libraries are inconsistent about release metadata. The
+        # reference query is always attempted first; if it misses, retry the
+        # same ordered search after removing only optional year/language/
+        # quality tokens. Title, season and episode words are never relaxed.
+        title_words = [
+            word for word in words if not _is_optional_search_token(word)
         ]
-        if not fallback_words:
-            fallback_words = words[:1]
-        per_word = await asyncio.gather(*[_word_hits(w) for w in fallback_words])
-        for docs in per_word:
-            _add(docs)
-
-        # Keep level 1 → level 2 → level 3 insertion order. Sorting the final
-        # merged list by ObjectId made fresh but weak matches outrank exact ones.
-        return merged[:max_results]
+        if not title_words or title_words == words:
+            return []
+        try:
+            fallback_regex = compile_regex(_reference_search_pattern(title_words))
+        except re.error:
+            return []
+        return await self._regex_search(fallback_regex, max_results, offset)
 
     async def get_search_results(self, query, max_results=40, offset=0):
         """Return a short-lived cached search result when available."""
