@@ -58,16 +58,42 @@ def test_result_filters_can_combine_language_and_quality():
     assert _apply_result_filters(results, data) == results[:1]
 
 
-def test_flat_label_keeps_useful_details_and_moves_episode_after_size():
+def test_series_label_keeps_only_series_identity_and_structured_metadata():
     file_doc = {
         "_id": "a",
-        "file_name": "Reacher_S01E03_2022_1080p-H265_DDP5.1_@spam.mkv",
+        "file_name": "Reacher_S01E03_Spoonful_2022_1080p-H265_DDP5.1_@spam.mkv",
         "file_size": 2 * 1024 * 1024 * 1024,
     }
     label = _flat_file_label(file_doc)
-    assert label == "[2.00 GB] [S01E03] Reacher 2022 1080p H265 DDP5 1"
+    assert label == "[2.00 GB] [S01E03] Reacher • 1080p • HEVC"
+    assert "Spoonful" not in label
     assert not any(char in label for char in "_-@")
     assert "mkv" not in label.lower()
+
+
+def test_movie_label_uses_clean_title_year_and_fixed_metadata_order():
+    file_doc = {
+        "file_name": "Aavesham_2024_Malayalam_1080p_WEB-DL_x265.mkv",
+        "file_size": 500 * 1024 * 1024,
+    }
+    assert _flat_file_label(file_doc) == (
+        "[500.00 MB] Aavesham (2024) • Malayalam • 1080p • HEVC"
+    )
+
+
+def test_long_series_title_is_trimmed_without_hiding_quality_fields():
+    file_doc = {
+        "file_name": (
+            "A Very Long Series Name That Must Be Shortened S02E04 "
+            "An Even Longer Episode Name English 1080p x265.mkv"
+        ),
+        "file_size": 700 * 1024 * 1024,
+    }
+    label = _flat_file_label(file_doc)
+    assert len(label) <= 64
+    assert label.startswith("[700.00 MB] [S02E04]")
+    assert "An Even Longer Episode Name" not in label
+    assert label.endswith("English • 1080p • HEVC")
 
 
 def test_listing_name_removes_brackets_extension_and_promotional_url():

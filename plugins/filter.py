@@ -349,14 +349,75 @@ def _listing_name(filename: str) -> tuple[str, str]:
     return name or "Unnamed file", episode
 
 
-def _flat_file_label(file_doc: dict, max_length: int = 64) -> str:
-    """Format one flat result button as ``[size] [episode] filename``."""
-    name, episode = _listing_name(file_doc.get("file_name", ""))
-    prefix = f"[{_fmt_size(file_doc)}]"
+def _smart_metadata(filename: str) -> list[str]:
+    """Return stable, non-duplicated metadata fields for a button label."""
+    language, quality = extract_attributes(filename)
+    codec = _extract_codec(filename)
+    fields = []
+    for value in (language, quality, codec):
+        if value in ("", "Other") or value in fields:
+            continue
+        fields.append(value)
+    return fields
+
+
+def _series_identity(filename: str) -> tuple[str, str]:
+    """Extract only the series name and SxxExx marker.
+
+    Text between the episode marker and technical metadata is normally the
+    episode title. Excluding it prevents labels such as ``Reacher Welcome to
+    Margrave`` from looking like two unrelated titles.
+    """
+    marker = _SERIES_RE.search(filename)
+    prefix = filename[:marker.start()] if marker else filename
+    title, year = _display_title(prefix)
+    if not title:
+        title = "Series"
+    identity = f"{title} ({year})" if year else title
+
+    season_match = _SEASON_NUM_RE.search(filename)
+    episode_match = _EPISODE_NUM_RE.search(filename)
+    season = int(season_match.group(1)) if season_match else (1 if episode_match else 0)
+    episode = int(episode_match.group(1)) if episode_match else 0
     if episode:
+        marker_text = f"S{season:02d}E{episode:02d}"
+    elif season:
+        marker_text = f"S{season:02d}"
+    else:
+        marker_text = "EP"
+    return identity, marker_text
+
+
+def _compose_aligned_label(prefix: str, identity: str, metadata: list[str],
+                           max_length: int) -> str:
+    """Keep the fixed fields visible and trim only the variable title."""
+    suffix = "" if not metadata else " • " + " • ".join(metadata)
+    available = max_length - len(prefix) - len(suffix) - 1
+    if available < 8 and metadata:
+        # Prefer the identity over the least important trailing metadata when
+        # Telegram's 64-character button limit is especially tight.
+        metadata = metadata[:-1]
+        return _compose_aligned_label(prefix, identity, metadata, max_length)
+    if available < 2:
+        return f"{prefix} {identity}"[:max_length]
+    if len(identity) > available:
+        identity = identity[:available - 1].rstrip() + "…"
+    return f"{prefix} {identity}{suffix}"
+
+
+def _flat_file_label(file_doc: dict, max_length: int = 64) -> str:
+    """Build a consistent smart label for movie and episodic files."""
+    filename = file_doc.get("file_name", "")
+    prefix = f"[{_fmt_size(file_doc)}]"
+    if _is_series(filename):
+        identity, episode = _series_identity(filename)
         prefix += f" [{episode}]"
-    label = f"{prefix} {name}"
-    return label if len(label) <= max_length else label[:max_length - 1].rstrip() + "…"
+    else:
+        title, year = _display_title(filename)
+        identity = f"{title} ({year})" if year else title
+    return _compose_aligned_label(
+        prefix, identity or "Unnamed file", _smart_metadata(filename), max_length
+    )
 
 
 def _build_results_caption(query: str, total: int, page: int, total_pages: int,
