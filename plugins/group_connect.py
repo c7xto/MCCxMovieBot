@@ -4,7 +4,6 @@ import secrets
 import asyncio
 import logging
 from collections import OrderedDict
-from urllib.parse import quote
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode, ChatAction
 from pyrogram.errors import MessageNotModified, FloodWait
@@ -13,7 +12,7 @@ from pyrogram.types import (
 )
 from database.db import db
 from plugins.filter import (
-    send_smart_log, _sort_results, clean_query, LANG_EMOJI,
+    send_smart_log, _sort_results, clean_query,
     _display_title, _variant_label
 )
 from plugins.health_monitor import _log_task_crash
@@ -34,17 +33,26 @@ def _build_group_buttons(page_files, client_username, session_id, page,
     independently tappable and self-labeled — no non-clickable header row.
     """
     groups = OrderedDict()
+    display_titles = set()
+    display_years = set()
     for f in page_files:
         title, year = _display_title(f["file_name"])
         key = title.lower()
+        display_titles.add(key)
+        if year:
+            display_years.add(year)
         if key not in groups:
-            groups[key] = {"title": title, "year": year, "files": []}
+            groups[key] = {"files": []}
         groups[key]["files"].append(f)
 
     buttons = []
+    repeat_title = len(display_titles) > 1 or len(display_years) > 1
     for group in groups.values():
         for f in group["files"]:
-            label = _variant_label(f, show_title=True, title=group["title"], year=group["year"])
+            label = _variant_label(
+                f,
+                show_title=repeat_title,
+            )
             bot_url = f"https://t.me/{client_username}?start=file_{f['_id']}"
             buttons.append([InlineKeyboardButton(label, url=bot_url)])
 
@@ -75,8 +83,8 @@ def _build_caption(query, total, speed, del_mins):
     filter.py's _render_results_view, adapted for the single-page group view."""
     return (
         f"<b>🎬 {_html(query.title())}</b>\n"
-        f"<blockquote>{total} matches  •  Closes in {del_mins} min</blockquote>\n"
-        f"<i>Choose a file to receive it privately.</i>"
+        f"<blockquote>{total} files  •  Available for {del_mins} min</blockquote>\n"
+        f"<i>Choose quality, language and size. Delivery opens privately.</i>"
     )
 
 
@@ -138,8 +146,8 @@ async def auto_connect_group(client: Client, message: Message):
             [InlineKeyboardButton("🤖 Search Movies", url=f"https://t.me/{client.me.username}")]
         ])
         await message.reply_text(
-            f"🎬 <b>MCCxBot connected to {message.chat.title}!</b>\n\n"
-            f"Type any movie or series name to search.",
+            f"🎬 <b>MCCx Movie Bot is ready</b>\n\n"
+            f"Send a movie or series title in this group to search the library.",
             reply_markup=keyboard, parse_mode=ParseMode.HTML
         )
         break
@@ -225,15 +233,16 @@ async def group_search(client: Client, message: Message):
             ))
 
         safe_query = re.sub(r'[^a-zA-Z0-9]', '_', query)[:40]
-        google_url = f"https://www.google.com/search?q={quote(query)}"
         markup = InlineKeyboardMarkup([
             [InlineKeyboardButton("📝 Request This Movie",
              url=f"https://t.me/{client.me.username}?start=req_{safe_query}"),
-             InlineKeyboardButton("🔎 Google", url=google_url)]
+             InlineKeyboardButton("🔍 Search Guide", url=f"https://t.me/{client.me.username}?start=help")]
         ])
         not_found_msg = await message.reply_text(
-            f"🔍 Nothing found for <code>{query}</code>\n\n"
-            f"It's probably not uploaded yet — tap Request below and we'll notify you.",
+            f"🔎 <b>No files found</b>\n\n"
+            f"We couldn't find <code>{_html(query)}</code>.\n"
+            f"<blockquote>Try only the title, remove the year or language, "
+            f"or check the spelling.</blockquote>",
             reply_markup=markup, parse_mode=ParseMode.HTML,
             **_no_preview()
         )

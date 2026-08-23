@@ -46,11 +46,11 @@ LANG_NAMES = {"en": "English", "ml": "മലയാളം"}
 LANG_STRINGS = {
     "en": {
         "welcome_body": (
-            "Your fast, private movie &amp; series library.\n"
-            "Send a title below and choose the version you want."
+            "Search movies and series by title, year, language or quality.\n"
+            "Choose the version you want and receive it here."
         ),
         "welcome_greeting": "Hello, {first_name} 👋",
-        "files_counting": "{total_files:,} files ready to discover",
+        "files_counting": "{total_files:,} files available",
         "onboarding_title": "Find a file in three steps",
         "onboarding_steps": [
             "Type any movie or series name",
@@ -59,7 +59,11 @@ LANG_STRINGS = {
         ],
         "help_steps": HELP_STEPS_EN,
         "help_footer": HELP_FOOTER_EN,
-        "no_results": "No matches for <code>{query}</code>\n\nIt may not be uploaded yet, or there's a typo in the name.",
+        "no_results": (
+            "<b>No files found</b>\n\nWe couldn't find <code>{query}</code>.\n"
+            "<blockquote>Try only the title, remove the year or language, "
+            "or check the spelling.</blockquote>"
+        ),
     },
     "ml": {
         "welcome_body": (
@@ -97,14 +101,27 @@ def _build_start_ui(config, mention, total_files, bot_username, update_link, gro
     strings = LANG_STRINGS.get(lang, LANG_STRINGS["en"])
     safe_name = _html(first_name or mention)
     default_welcome = (
-        "<b>🎬 MCCx Movie Hub</b>\n"
+        "<b>🎬 MCCx Movie Bot</b>\n"
         "<blockquote>" + strings["welcome_greeting"] + "\n"
         + strings["welcome_body"] + "</blockquote>\n"
-        "<b>📚 Library</b>  •  " + strings["files_counting"]
+        "<b>📚 Library</b>  •  " + strings["files_counting"] + "\n"
+        "<b>💡 Try</b>  <code>Aavesham 2024 Malayalam 1080p</code>"
     )
     # An admin-customized welcome_text is a single free-text field with no
     # per-language variant — the language toggle only swaps the *default*.
-    raw = config.get("welcome_text") or default_welcome
+    configured_welcome = config.get("welcome_text") or ""
+    legacy_markers = (
+        "Your ultimate movie search bot is here",
+        "900,000+ files available",
+        "Just type the movie name and enjoy instant results",
+    )
+    # Automatically retire the old bundled welcome copy while preserving
+    # genuinely customized admin text.
+    raw = (
+        default_welcome
+        if not configured_welcome or any(m in configured_welcome for m in legacy_markers)
+        else configured_welcome
+    )
     try:
         # Both {mention} and {first_name} are accepted — admin-set welcome
         # text written before this update still uses {mention} and keeps
@@ -120,7 +137,7 @@ def _build_start_ui(config, mention, total_files, bot_username, update_link, gro
         steps = "\n".join(f"{i}. {s}" for i, s in enumerate(strings["onboarding_steps"], 1))
         text += f"\n\n<blockquote><b>{strings['onboarding_title']}</b>\n{steps}</blockquote>"
 
-    text += "\n\n<i>🔎 Type a movie or series name to begin.</i>"
+    text += "\n\n<i>🔍 Send a title below to begin.</i>"
 
     buttons = []
 
@@ -158,10 +175,11 @@ async def _execute_search(client, status_msg, query: str, config: dict, user_id=
             [InlineKeyboardButton(
                 f"{ICON_REQUEST} Request This Movie",
                 callback_data=callback_data("reqmovie#", query),
-            )]
+            )],
+            [InlineKeyboardButton("⌂ Back to Home", callback_data="start_home")],
         ])
         return await status_msg.edit_text(
-            f"{ICON_SEARCH} " + strings["no_results"].format(query=_html(query)),
+            f"🔎 " + strings["no_results"].format(query=_html(query)),
             reply_markup=markup, parse_mode=ParseMode.HTML
         )
 

@@ -67,41 +67,83 @@ _WS_RE = re.compile(r'\s+')
 
 
 def clean_query(query):
-    q = query.lower()
+    # Treat filename-style separators as spaces. Users often paste indexed
+    # names such as ``aavesham_2024-malayalam``; those should search exactly
+    # like normal words, without carrying visual noise into result headings.
+    q = re.sub(r"[_.\-–—]+", " ", query.lower())
     for pattern in _STOP_WORD_RES:
         q = pattern.sub('', q)
     return _WS_RE.sub(' ', q).strip()
 
 
-_LANG_RES = [(l, re.compile(r'\b' + l + r'\b', re.IGNORECASE)) for l in LANGUAGES]
-_QUAL_RES = [(q, re.compile(r'\b' + q.replace(' ', r'\s*') + r'\b', re.IGNORECASE)) for q in QUALITIES]
+def _attribute_regex(value: str):
+    parts = [re.escape(part) for part in re.split(r'[\s._\-–—]+', value) if part]
+    return re.compile(r'\b' + r'\s*'.join(parts) + r'\b', re.IGNORECASE)
+
+
+_LANG_RES = [(language, _attribute_regex(language)) for language in LANGUAGES]
+_QUAL_RES = [(quality, _attribute_regex(quality)) for quality in QUALITIES]
 
 
 def extract_attributes(filename):
-    lang = next((l for l, pat in _LANG_RES if pat.search(filename)), "Other")
-    qual = next((q for q, pat in _QUAL_RES if pat.search(filename)), "Other")
+    normalized = re.sub(r'[._\-–—]+', ' ', filename)
+    lang = next((l for l, pat in _LANG_RES if pat.search(normalized)), "Other")
+    qual = next((q for q, pat in _QUAL_RES if pat.search(normalized)), "Other")
     if qual.lower() == "hdrip":
         qual = "HD Rip"
     return lang, qual
 
 
+def _extract_codec(filename: str) -> str:
+    normalized = re.sub(r'[._\-–—]+', ' ', filename)
+    if re.search(r'\b(?:hevc|x265|h\s*265)\b', normalized, re.IGNORECASE):
+        return "HEVC"
+    if re.search(r'\b(?:avc|x264|h\s*264)\b', normalized, re.IGNORECASE):
+        return "H.264"
+    if re.search(r'\bav1\b', normalized, re.IGNORECASE):
+        return "AV1"
+    return ""
+
+
 # ── Display-only title cleanup ───────────────────────────────────────────────
 # Never touches the stored file_name — purely how a filename is *rendered*
 # in a button label or delivered-file caption.
-_EXT_RE = re.compile(r'\.(mkv|mp4|avi|mov|zip|srt)$', re.IGNORECASE)
+_EXT_RE = re.compile(r'(?:\.|\b)(mkv|mp4|avi|mov|zip|srt)\s*$', re.IGNORECASE)
 _YEAR_RE = re.compile(r'^(19\d{2}|20\d{2})$')
 _PAREN_YEAR_RE = re.compile(r'[\(\[](\d{4})[\)\]]')
 _BRACKET_GROUP_RE = re.compile(r'[\[\(].*?[\]\)]')
-_TITLE_SEP_RE = re.compile(r'[._]')
+_TITLE_SEP_RE = re.compile(r'[._\-–—]+')
 _TITLE_WS_RE = re.compile(r'\s+')
+_STRAY_BRACKET_RE = re.compile(r'[\[\]\(\)\{\}]+')
+_PROMO_RE = re.compile(
+    r'(?:https?://\S+|www\.\S+|(?:t|telegram)\.me/\S+|@[A-Za-z0-9_]+)',
+    re.IGNORECASE,
+)
 
 # Codec/subtitle/release-group tags that aren't in LANGUAGES/QUALITIES but
 # still need to be recognized as "metadata, not title" when walking backward
 # through a filename's tokens (see _display_title below).
-_JUNK_WORDS = {"x264", "x265", "hevc", "aac", "esub", "hsub", "10bit",
-               "hdcam", "tsrip", "dvdrip", "hq", "nf", "amzn", "brrip", "bdrip"}
-_QUALITY_LOWER = {q.lower() for q in QUALITIES}
-_LANGUAGE_LOWER = {l.lower() for l in LANGUAGES}
+_JUNK_WORDS = {
+    "x264", "x265", "h264", "h265", "hevc", "avc", "aac", "aac2", "ac3",
+    "eac3", "ddp", "ddp5", "dd5", "esub", "esubs", "hsub", "hsubs", "10bit",
+    "hdcam", "tsrip", "dvdrip", "hq", "nf", "amzn", "brrip", "bdrip", "webrip",
+    "webdl", "bluray", "proper", "repack", "telly", "collective", "etrg", "yts",
+    "true", "vbr", "bigil", "ddh", "dd", "mkv", "mp4", "avi", "mov", "zip", "srt",
+}
+
+
+def _metadata_key(value: str) -> str:
+    return re.sub(r'[\s._\-–—]+', ' ', value.lower()).strip()
+
+
+_QUALITY_LOWER = {_metadata_key(q) for q in QUALITIES}
+_LANGUAGE_LOWER = {_metadata_key(l) for l in LANGUAGES}
+_TECH_TOKEN_RE = re.compile(
+    r'^(?:2160p|1080p|720p|480p|360p|\d+(?:\.\d+)?(?:mb|gb)|'
+    r'\d{3,4}k(?:bps)?|\d(?:\.\d)?ch|'
+    r'dd\+?\d*|ddp?\d(?:\.\d)?|aac\d?|ac3|eac3|h26[45]|x26[45]|hevc|avc|10bit)$',
+    re.IGNORECASE,
+)
 
 
 def _is_year_token(tok: str) -> bool:
@@ -114,14 +156,10 @@ def _is_metadata_word(tok: str) -> bool:
     legitimately contain two 4-digit-looking tokens — a numeric title like
     "1917"/"2012" AND its real release year — and only one of them should
     ever be consumed as metadata)."""
-    low = tok.lower()
+    low = _metadata_key(tok)
     if low in _QUALITY_LOWER or low in _LANGUAGE_LOWER or low in _JUNK_WORDS:
         return True
-    if '-' in low:
-        parts = [p for p in low.split('-') if p]
-        if parts and all(p in _JUNK_WORDS or p in _QUALITY_LOWER for p in parts):
-            return True
-    return False
+    return bool(_TECH_TOKEN_RE.fullmatch(low))
 
 
 def _display_title(filename: str) -> tuple:
@@ -143,7 +181,11 @@ def _display_title(filename: str) -> tuple:
     title for series files — otherwise every episode of a show would
     render an identical caption/label with no way to tell them apart.
     """
-    name = _EXT_RE.sub('', filename)
+    # Promotional handles and URLs are never useful to a user choosing a
+    # file. Remove them before the extension so ``movie.mkv @channel`` also
+    # loses its extension correctly.
+    name = _PROMO_RE.sub(' ', filename).strip()
+    name = _EXT_RE.sub('', name)
 
     # A parenthesized/bracketed 4-digit year is unambiguous regardless of
     # what the rest of the title looks like (a numeric title like "300" or
@@ -155,6 +197,7 @@ def _display_title(filename: str) -> tuple:
     # year annotation just captured above, etc.) — replace with a space,
     # not empty, so two words butting up against a bracket don't fuse.
     name = _BRACKET_GROUP_RE.sub(' ', name)
+    name = _STRAY_BRACKET_RE.sub(' ', name)
     # Normalize remaining separators to spaces before tokenizing —
     # underscore is a \w character, so naive \b-based regex matching would
     # silently fail against underscore-separated filenames otherwise.
@@ -163,11 +206,24 @@ def _display_title(filename: str) -> tuple:
 
     i = len(tokens)
     year_consumed = False
+    metadata_consumed = False
     while i > 0:
         if i >= 2:
-            phrase = f"{tokens[i-2]} {tokens[i-1]}".lower()
+            phrase = _metadata_key(f"{tokens[i-2]} {tokens[i-1]}")
             if phrase in _QUALITY_LOWER or phrase in _LANGUAGE_LOWER:
                 i -= 2
+                metadata_consumed = True
+                continue
+            if re.fullmatch(r'h 26[45]', phrase):
+                i -= 2
+                metadata_consumed = True
+                continue
+            # Audio layouts are frequently written as ``DDP5.1`` and become
+            # two tokens after separator cleanup. Consume the pair together
+            # so the trailing ``1`` never leaks into the movie title.
+            if re.fullmatch(r'(?:ddp?|aac)\d+ \d+', phrase):
+                i -= 2
+                metadata_consumed = True
                 continue
         tok = tokens[i-1]
         if _is_year_token(tok):
@@ -175,13 +231,38 @@ def _display_title(filename: str) -> tuple:
                 break  # a 2nd year-shaped token further back is the title, not metadata
             year_consumed = True
             i -= 1
+            metadata_consumed = True
             continue
         if _is_metadata_word(tok):
+            i -= 1
+            metadata_consumed = True
+            continue
+        # Some indexes repeat a short title acronym immediately before the
+        # language metadata (for example ``K G F Chapter 1 2018 KGF Tamil``).
+        # Remove only an all-uppercase duplicate after genuine metadata was
+        # already consumed, keeping normal title words untouched.
+        compact = re.sub(r'[^A-Za-z0-9]', '', tok)
+        previous_tokens = tokens[:i - 1]
+        joined_head = ''.join(previous_tokens[:4]).lower()
+        if (
+            metadata_consumed
+            and 2 <= len(compact) <= 8
+            and compact.isupper()
+            and (
+                compact.lower() in {p.lower() for p in previous_tokens}
+                or joined_head.startswith(compact.lower())
+            )
+        ):
             i -= 1
             continue
         break
 
-    title = " ".join(tokens[:i]).strip()
+    title = " ".join(tokens[:i]).strip(" |")
+    title = re.sub(
+        r'\b(?:[A-Z]\s+){1,}[A-Z]\b',
+        lambda match: match.group(0).replace(' ', ''),
+        title,
+    )
     tail_tokens = tokens[i:]
 
     if not title:
@@ -192,7 +273,8 @@ def _display_title(filename: str) -> tuple:
     else:
         year = next((t for t in tail_tokens if _is_year_token(t)), "")
 
-    return (title or filename.strip(), year)
+    clean_fallback = _TITLE_WS_RE.sub(" ", _TITLE_SEP_RE.sub(" ", name)).strip(" |")
+    return (title or clean_fallback or filename.strip(), year)
 
 
 def _variant_label(f, show_title: bool, title=None, year=None) -> str:
@@ -203,18 +285,21 @@ def _variant_label(f, show_title: bool, title=None, year=None) -> str:
     if title is None:
         title, year = _display_title(f["file_name"])
     f_lang, f_qual = extract_attributes(f["file_name"])
+    codec = _extract_codec(f["file_name"])
     size_str = _fmt_size(f)
 
     parts = []
     if show_title:
         parts.append(f"{title} ({year})" if year else title)
-    if f_lang not in ("Other", ""):
-        parts.append(f_lang)
     if f_qual not in ("Other", ""):
         parts.append(f_qual)
+    if codec:
+        parts.append(codec)
+    if f_lang not in ("Other", ""):
+        parts.append(f_lang)
     parts.append(size_str)
 
-    label = " · ".join(parts)
+    label = " • ".join(parts)
     return label if len(label) <= 52 else label[:51] + "…"
 
 
@@ -239,17 +324,29 @@ def _build_movie_result_buttons(results: list, session_id: str, page: int, per_p
     page_files = results[start_idx: start_idx + per_page]
 
     groups = OrderedDict()
+    display_titles = set()
+    display_years = set()
     for f in page_files:
         title, year = _display_title(f["file_name"])
         key = title.lower()
+        display_titles.add(key)
+        if year:
+            display_years.add(year)
         if key not in groups:
-            groups[key] = {"title": title, "year": year, "files": []}
+            groups[key] = {"files": []}
         groups[key]["files"].append(f)
 
     buttons = []
+    repeat_title = len(display_titles) > 1 or len(display_years) > 1
     for group in groups.values():
         for f in group["files"]:
-            label = _variant_label(f, show_title=True, title=group["title"], year=group["year"])
+            # When every result is the same title, repeating that title on
+            # eight buttons hides the useful differences. Show only quality,
+            # language and size; retain the title when results are mixed.
+            label = _variant_label(
+                f,
+                show_title=repeat_title,
+            )
             buttons.append([InlineKeyboardButton(label, callback_data=f"sendfile#{f['_id']}")])
 
     nav = []
@@ -316,17 +413,65 @@ def _sort_results(results: list) -> list:
     return sorted(results, key=lambda f: f.get("file_size", 0), reverse=True)
 
 
+def _apply_result_filters(results: list, data: dict) -> list:
+    """Apply the active presentation filters without changing stored files."""
+    active_lang = data.get("filter_language")
+    active_quality = data.get("filter_quality")
+    if not active_lang and not active_quality:
+        return results
+
+    filtered = []
+    for file_doc in results:
+        language, quality = extract_attributes(file_doc.get("file_name", ""))
+        if active_lang and language != active_lang:
+            continue
+        if active_quality and quality != active_quality:
+            continue
+        filtered.append(file_doc)
+    return filtered
+
+
+def _result_filter_row(session_id: str, data: dict):
+    language = data.get("filter_language") or "Language"
+    quality = data.get("filter_quality") or "Quality"
+    return [
+        InlineKeyboardButton(
+            f"🌐 {language}", callback_data=f"filtermenu#{session_id}#language"
+        ),
+        InlineKeyboardButton(
+            f"🎞 {quality}", callback_data=f"filtermenu#{session_id}#quality"
+        ),
+    ]
+
+
+def _available_filter_values(results: list, kind: str) -> list:
+    found = set()
+    for file_doc in results:
+        language, quality = extract_attributes(file_doc.get("file_name", ""))
+        value = language if kind == "language" else quality
+        if value not in ("", "Other"):
+            found.add(value)
+    ordered = LANGUAGES if kind == "language" else QUALITIES
+    return [value for value in ordered if value in found]
+
+
 def _build_caption(config, file_data, delete_minutes, bot_username):
+    raw_filename = file_data.get("file_name", "")
+    title, year = _display_title(raw_filename)
+    clean_filename = f"{title} ({year})" if year else title
     template = config.get("file_caption_template", "")
     if template:
-        f_lang, f_qual = extract_attributes(file_data.get("file_name", ""))
+        f_lang, f_qual = extract_attributes(raw_filename)
+        codec = _extract_codec(raw_filename)
         size_mb  = file_data.get("file_size", 0) / (1024 * 1024)
         size_str = f"{size_mb / 1024:.2f}GB" if size_mb > 1024 else f"{size_mb:.0f}MB"
         try:
             return template.format(
-                filename=file_data.get("file_name", ""),
+                filename=_html(clean_filename),
+                raw_filename=_html(raw_filename),
                 size=size_str,
                 quality=f_qual or "Unknown",
+                codec=codec or "Unknown",
                 lang=f_lang or "Unknown",
                 username=bot_username,
                 delete_minutes=delete_minutes
@@ -334,8 +479,8 @@ def _build_caption(config, file_data, delete_minutes, bot_username):
         except (KeyError, ValueError):
             pass
 
-    title, year = _display_title(file_data.get("file_name", ""))
-    f_lang, f_qual = extract_attributes(file_data.get("file_name", ""))
+    f_lang, f_qual = extract_attributes(raw_filename)
+    codec = _extract_codec(raw_filename)
     size_mb  = file_data.get("file_size", 0) / (1024 * 1024)
     size_str = f"{size_mb / 1024:.2f} GB" if size_mb >= 1024 else f"{size_mb:.0f} MB"
 
@@ -349,15 +494,17 @@ def _build_caption(config, file_data, delete_minutes, bot_username):
         meta_parts.append(f"{lang_emojis.get(f_lang, '🎬')} {f_lang}")
     if f_qual not in ["Other", ""]:
         meta_parts.append(f"🎞 {f_qual}")
+    if codec:
+        meta_parts.append(f"🧬 {codec}")
     meta_parts.append(f"📦 {size_str}")
-    meta_line = "  ·  ".join(meta_parts)
+    meta_line = "  •  ".join(meta_parts)
 
     title_line = f"🎬 <b>{_html(title)}{f' ({year})' if year else ''}</b>"
 
     return (
         f"{title_line}\n"
         f"<blockquote>{meta_line}</blockquote>\n"
-        f"<i>⏳ Available for {delete_minutes} min · Forward it to keep it</i>"
+        f"<i>⏳ Available for {delete_minutes} min  •  Forward it to keep it</i>"
     )
 
 
@@ -373,28 +520,8 @@ def _build_result_buttons(results: list, session_id: str, page: int, per_page: i
 
     buttons = []
     for f in page_files:
-        f_lang, f_qual = extract_attributes(f["file_name"])
-        size_str = _fmt_size(f)
-        name = re.sub(r'\s+', ' ', f["file_name"]).strip()
-
-        meta_parts = []
-        if f_qual not in ["Other", ""]:
-            meta_parts.append(f_qual)
-        if f_lang not in ["Other", ""]:
-            meta_parts.append(f_lang)
-
-        meta     = " | ".join(meta_parts)
-        size_tag = f"[{size_str}]"
-
-        if meta:
-            available = 48 - len(size_tag) - len(meta) - 4
-            truncated = name[:max(10, available)] + ("…" if len(name) > max(10, available) else "")
-            btn_text  = f"{size_tag} {truncated} | {meta}"
-        else:
-            available = 52 - len(size_tag) - 1
-            truncated = name[:available] + ("…" if len(name) > available else "")
-            btn_text  = f"{size_tag} {truncated}"
-
+        title, year = _display_title(f["file_name"])
+        btn_text = _variant_label(f, show_title=True, title=title, year=year)
         buttons.append([InlineKeyboardButton(btn_text, callback_data=f"sendfile#{f['_id']}")])
 
     nav = []
@@ -417,20 +544,34 @@ async def _render_results_view(client, message, session_id: str, page: int, data
     with each other (the old code duplicated this whole block between
     show_results and handle_pagination).
     """
-    results = data["results"]
+    source_results = data["results"]
+    results = _apply_result_filters(source_results, data)
     query   = data["query"]
     series_expanded = data.get("series_expanded", False)
 
     total     = len(results)
+    source_total = len(source_results)
     _del_secs = int(data.get("auto_delete_time", 300))
     _del_mins = max(1, _del_secs // 60)
 
     has_series = _has_series_content(results)
 
+    if not results:
+        caption = (
+            f"🔎 <b>No files match these filters</b>\n\n"
+            f"Try another language or quality for <code>{_html(query)}</code>."
+        )
+        buttons = [
+            _result_filter_row(session_id, data),
+            [InlineKeyboardButton("↺ Clear Filters", callback_data=f"clearfilters#{session_id}")],
+            [InlineKeyboardButton("⌂ Back to Home", callback_data="start_home")],
+        ]
+        markup = InlineKeyboardMarkup(buttons)
     # A single, unambiguous match gets a direct "hero" card instead of the
-    # list view — still exactly one tap to the file, same sendfile#
-    # callback and verification-gate path as every other result.
-    if total == 1 and not has_series:
+    # list view — still exactly one tap to the file, same sendfile# callback
+    # and verification-gate path as every other result.
+    elif total == 1 and not has_series:
+
         f = results[0]
         title, year = _display_title(f["file_name"])
         meta = _variant_label(f, show_title=False)
@@ -441,11 +582,13 @@ async def _render_results_view(client, message, session_id: str, page: int, data
         )
         buttons = [
             [InlineKeyboardButton("⬇ Get This File", callback_data=f"sendfile#{f['_id']}")],
+            _result_filter_row(session_id, data) if source_total > 1 else [],
             [InlineKeyboardButton("⌂ Home", callback_data="start_home")],
         ]
+        buttons = [row for row in buttons if row]
         markup = InlineKeyboardMarkup(buttons)
     else:
-        buttons = []
+        buttons = [_result_filter_row(session_id, data)]
 
         if has_series and not series_expanded:
             page, total_pages = 0, 1
@@ -456,9 +599,13 @@ async def _render_results_view(client, message, session_id: str, page: int, data
             file_buttons, page, total_pages = _build_movie_result_buttons(results, session_id, page)
             buttons.extend(file_buttons)
 
+        count_text = (
+            f"{total} of {source_total} files"
+            if total != source_total else f"{total} files"
+        )
         caption = (
             f"<b>🎬 {_html(query.title())}</b>\n"
-            f"<blockquote>{total} matches  •  Results expire in {_del_mins} min</blockquote>\n"
+            f"<blockquote>{count_text}  •  Available for {_del_mins} min</blockquote>\n"
         )
 
         if has_series and not series_expanded:
@@ -598,8 +745,9 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
         sug_row = []
         for sug in suggestions:
             safe_sug = re.sub(r"[^a-zA-Z0-9]", "_", sug)[:40]
+            suggestion_title, _ = _display_title(sug)
             sug_row.append(InlineKeyboardButton(
-                f"💡 {sug[:20]}",
+                f"💡 {suggestion_title[:20]}",
                 url=f"https://t.me/{client.me.username}?start=search_{safe_sug}"
             ))
 
@@ -611,9 +759,11 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
         ]
 
         no_results_msg = await message.reply_text(
-            f"🔍 Nothing found for <code>{_html(query)}</code>\n\n"
-            f"It's probably not uploaded yet — try a suggestion below, or "
-            f"request it and we'll notify you the moment it's added.",
+            f"🔎 <b>No files found</b>\n\n"
+            f"We couldn't find <code>{_html(query)}</code>.\n"
+            f"<blockquote>Try searching only the title, removing the year or "
+            f"language, or checking the spelling.</blockquote>\n"
+            f"You can also request it and receive an update when it is added.",
             reply_markup=InlineKeyboardMarkup(sug_buttons),
             parse_mode=ParseMode.HTML, **_no_preview()
         )
@@ -681,6 +831,85 @@ async def handle_expand_series(client: Client, callback: CallbackQuery):
     await _render_results_view(client, callback.message, session_id, 0, data, user_id=callback.from_user.id)
 
 
+@Client.on_callback_query(filters.regex(r"^filtermenu#"))
+async def show_filter_menu(client: Client, callback: CallbackQuery):
+    _, session_id, kind = callback.data.split("#", 2)
+    if kind not in {"language", "quality"}:
+        return await callback.answer("Invalid filter.", show_alert=True)
+
+    data = await db.get_search(session_id)
+    if not data:
+        return await callback.answer("⚠️ Session expired.", show_alert=True)
+    if data.get("user_id") not in (None, callback.from_user.id):
+        return await callback.answer("This search belongs to another user.", show_alert=True)
+
+    values = _available_filter_values(data["results"], kind)
+    field = f"filter_{kind}"
+    active = data.get(field)
+    plural = "Languages" if kind == "language" else "Qualities"
+    buttons = [[InlineKeyboardButton(
+        f"{'✓ ' if not active else ''}All {plural}",
+        callback_data=f"applyfilter#{session_id}#{kind}#all",
+    )]]
+    for index in range(0, len(values), 2):
+        row = []
+        for value in values[index:index + 2]:
+            row.append(InlineKeyboardButton(
+                f"{'✓ ' if active == value else ''}{value}",
+                callback_data=f"applyfilter#{session_id}#{kind}#{value}",
+            ))
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton(
+        "‹ Back to Results", callback_data=f"page#{session_id}#0"
+    )])
+
+    icon = "🌐" if kind == "language" else "🎞"
+    await callback.message.edit_text(
+        f"{icon} <b>Choose {kind}</b>\n\nOnly options available in this search are shown.",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode=ParseMode.HTML,
+    )
+    await callback.answer()
+
+
+@Client.on_callback_query(filters.regex(r"^applyfilter#"))
+async def apply_result_filter(client: Client, callback: CallbackQuery):
+    _, session_id, kind, value = callback.data.split("#", 3)
+    if kind not in {"language", "quality"}:
+        return await callback.answer("Invalid filter.", show_alert=True)
+
+    data = await db.get_search(session_id)
+    if not data:
+        return await callback.answer("⚠️ Session expired.", show_alert=True)
+    if data.get("user_id") not in (None, callback.from_user.id):
+        return await callback.answer("This search belongs to another user.", show_alert=True)
+
+    data[f"filter_{kind}"] = None if value == "all" else value
+    await db.save_search(session_id, data)
+    await _render_results_view(
+        client, callback.message, session_id, 0, data, user_id=callback.from_user.id
+    )
+    await callback.answer("Filter updated")
+
+
+@Client.on_callback_query(filters.regex(r"^clearfilters#"))
+async def clear_result_filters(client: Client, callback: CallbackQuery):
+    session_id = callback.data.split("#", 1)[1]
+    data = await db.get_search(session_id)
+    if not data:
+        return await callback.answer("⚠️ Session expired.", show_alert=True)
+    if data.get("user_id") not in (None, callback.from_user.id):
+        return await callback.answer("This search belongs to another user.", show_alert=True)
+
+    data["filter_language"] = None
+    data["filter_quality"] = None
+    await db.save_search(session_id, data)
+    await _render_results_view(
+        client, callback.message, session_id, 0, data, user_id=callback.from_user.id
+    )
+    await callback.answer("Filters cleared")
+
+
 @Client.on_callback_query(filters.regex(r"^ignore$"))
 async def handle_ignore(client: Client, callback: CallbackQuery):
     await callback.answer()
@@ -714,9 +943,14 @@ async def send_movie_file(client: Client, callback: CallbackQuery):
     except (FileIdInvalid, FileReferenceEmpty, FileReferenceExpired,
             FileReferenceInvalid, MediaEmpty, MediaInvalid) as e:
         await db.delete_file_by_id(file_data["file_id"])
+        unavailable_title, unavailable_year = _display_title(file_data["file_name"])
+        unavailable_name = (
+            f"{unavailable_title} ({unavailable_year})"
+            if unavailable_year else unavailable_title
+        )
         await callback.message.reply_text(
             f"❌ <b>File unavailable</b>\n\n"
-            f"{_html(file_data['file_name'])} is no longer valid. "
+            f"{_html(unavailable_name)} is no longer valid. "
             f"It was removed from the index; please search again.",
             parse_mode=ParseMode.HTML
         )

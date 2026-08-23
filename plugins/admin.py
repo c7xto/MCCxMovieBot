@@ -44,7 +44,7 @@ async def get_admin_menu_data():
     total_users, _, total_files, _, total_groups = await db.get_bot_stats()
 
     fsub_count = len(config.get('fsub_channels', []))
-    fsub_status = f"✅ Active ({fsub_count} ch)" if fsub_count > 0 else "⚫ Disabled"
+    fsub_status = f"✅ {fsub_count} channel{'s' if fsub_count != 1 else ''}" if fsub_count > 0 else "⚫ Disabled"
 
     # config.get('log_channel') returns 0 when unset, and 0 is falsy — a naive
     # truthy check would show "Missing" even after saving a valid channel ID,
@@ -53,13 +53,12 @@ async def get_admin_menu_data():
     log_status = "✅ Set" if log_val not in [None, 0, ""] else "❌ Missing"
 
     text = (
-        "🛠 **MCCx Control Center**\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"📚 **Library**   `{total_files:,}` files\n"
-        f"👤 **Audience**  `{total_users:,}` users · `{total_groups:,}` groups\n"
-        f"🔐 **Access**    {fsub_status}\n"
-        f"📡 **Logging**   {log_status}\n"
-        "━━━━━━━━━━━━━━━━━━\n"
+        "🛠 **MCCx Control Center**\n\n"
+        "🟢 **Status**  Online\n"
+        f"📚 **Library**  `{total_files:,}` files\n"
+        f"👥 **Audience**  `{total_users:,}` users  •  `{total_groups:,}` groups\n"
+        f"🔐 **Access**  {fsub_status}\n"
+        f"📡 **Logging**  {log_status}\n\n"
         "_Choose an area to manage._"
     )
 
@@ -68,9 +67,11 @@ async def get_admin_menu_data():
     # Same underlying callbacks as before, just better information
     # architecture instead of one flat 19-button wall.
     markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📚 Library", callback_data="admin_cat_content"),
-         InlineKeyboardButton("👥 Access", callback_data="admin_cat_users")],
-        [InlineKeyboardButton("⚙ Preferences", callback_data="admin_cat_settings"),
+        [InlineKeyboardButton("📚 Library", callback_data="admin_cat_library"),
+         InlineKeyboardButton("🎨 Appearance", callback_data="admin_cat_appearance")],
+        [InlineKeyboardButton("👥 Access", callback_data="admin_cat_users"),
+         InlineKeyboardButton("⚙ Preferences", callback_data="admin_cat_settings")],
+        [InlineKeyboardButton("📊 Analytics", callback_data="admin_stats"),
          InlineKeyboardButton("🩺 System", callback_data="admin_cat_health")],
         [InlineKeyboardButton("✕ Close", callback_data="close_data")]
     ])
@@ -83,9 +84,11 @@ async def get_admin_menu_data():
 # not what they do or how they're handled.
 
 _CATEGORY_MENUS = {
-    "content": ("📚 **Library & Presentation**", [
+    "library": ("📚 **Library**", [
         ("📥 Source Channels",          "db_chan_menu"),
         ("🗂 File Manager",             "file_manager_menu"),
+    ]),
+    "appearance": ("🎨 **Appearance**", [
         ("✏ File Captions",             "edit_captiontemplate"),
         ("🖼 Welcome Media",            "edit_media"),
         ("💬 Welcome Message",          "edit_welcometext"),
@@ -118,7 +121,7 @@ _CATEGORY_BACK_BTN = InlineKeyboardMarkup([
 ])
 
 
-@Client.on_callback_query(filters.regex(r"^admin_cat_(content|users|settings|health)$") & filters.user(ADMIN_ID))
+@Client.on_callback_query(filters.regex(r"^admin_cat_(library|appearance|users|settings|health)$") & filters.user(ADMIN_ID))
 async def show_category_menu(client: Client, callback: CallbackQuery):
     key = callback.data.split("_", 2)[2]
     title, items = _CATEGORY_MENUS[key]
@@ -323,9 +326,11 @@ async def handle_edit_buttons(client: Client, callback: CallbackQuery):
         "captiontemplate": (
             "✏️ **Send me the new File Caption Template.**\n\n"
             "Available variables:\n"
-            "`{filename}` — Full file name\n"
+            "`{filename}` — Clean display name\n"
+            "`{raw_filename}` — Original indexed name\n"
             "`{size}` — File size (e.g. 1.2GB)\n"
             "`{quality}` — Quality (e.g. 1080p)\n"
+            "`{codec}` — Codec (e.g. HEVC)\n"
             "`{lang}` — Language (e.g. Malayalam)\n"
             "`{username}` — Bot username\n"
             "`{delete_minutes}` — Auto-delete minutes\n\n"
