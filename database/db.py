@@ -72,7 +72,9 @@ _SYMBOL_RE = re.compile(r"[_\-\.#+$%^&*()!~`,;:\"'?/<>\[\]{}=|\\]")
 _WS_COLLAPSE_RE = re.compile(r"\s+")
 _SEARCH_FALLBACK_STOP = {
     "the", "and", "for", "with", "from", "movie", "film", "part",
-    "season", "episode", "full", "official",
+    "season", "episode", "chapter", "full", "official", "malayalam",
+    "tamil", "telugu", "hindi", "english", "kannada", "dual", "audio",
+    "1080p", "720p", "480p", "2160p", "4k", "hdrip", "webrip", "webdl",
 }
 
 
@@ -157,6 +159,9 @@ class _SearchCache:
         for k in expired:
             del self._data[k]
 
+    def clear(self):
+        self._data.clear()
+
 
 class Database:
     def __init__(self):
@@ -213,6 +218,10 @@ class Database:
         self.main_db = None
         self.legacy_main_db = None
         self._search_cache = _SearchCache(maxsize=2000, default_ttl=600)
+        # Popular movie searches are highly repetitive. Keep their already
+        # merged results briefly so groups and DMs do not rescan three Atlas
+        # shards for the same title every time.
+        self._query_cache = _SearchCache(maxsize=512, default_ttl=120)
         self._db_size_cache = {}  # id(db_instance) -> (fetched_at, size_mb)
         self._file_count_cache = (0.0, 0)
 
@@ -579,6 +588,9 @@ class Database:
 
     def _invalidate_file_count(self):
         self._file_count_cache = (0.0, 0)
+        query_cache = getattr(self, "_query_cache", None)
+        if query_cache is not None:
+            query_cache.clear()
 
     async def registry_needs_migration(self):
         """Detect the dangerous upgrade case: old files but no registry."""
@@ -1137,14 +1149,21 @@ class Database:
 
         async def _search_cluster(col):
             try:
-                cursor = (
-                    col.find(filter_mongo)
-                    .sort("_id", -1)
-                    .skip(offset)
-                    .limit(limit)
-                    .max_time_ms(5000)
-                )
-                return [doc async for doc in cursor]
+                # A cold/unindexed Atlas shard must not make every healthy
+                # shard wait five or thirty seconds. Mongo gets its own time
+                # budget and asyncio provides a hard client-side ceiling.
+                async with asyncio.timeout(3.0):
+                    cursor = (
+                        col.find(filter_mongo)
+                        .sort("_id", -1)
+                        .skip(offset)
+                        .limit(limit)
+                        .max_time_ms(2500)
+                    )
+                    return [doc async for doc in cursor]
+            except TimeoutError:
+                logger.warning("Search cluster skipped after the 3s latency budget")
+                return []
             except Exception as e:
                 # A secondary cluster outage should degrade result coverage,
                 # not take the entire search feature down.
@@ -1165,11 +1184,8 @@ class Database:
 
         return files[:max_results]
 
-    async def get_search_results(self, query, max_results=40, offset=0):
-        """Every search now always checks three match levels and merges
-        them by relevance — nothing is gated behind an earlier level
-        coming back completely empty, so a single-word hit is never
-        silently dropped just because another level found *something*:
+    async def _get_search_results_uncached(self, query, max_results=40, offset=0):
+        """Search three relevance levels, stopping at the first useful one:
 
         Level 1: words in order, separated by [\\s.+-_] (best match).
         Level 2: same words present anywhere, any order.
@@ -1177,11 +1193,10 @@ class Database:
         boy" always checks "balan" and "the" and "boy" on their own, and
         any file matching even one of them is included.
 
-        Results are merged in that priority order (level-1 hits first,
-        then new level-2 hits, then new level-3 hits), deduped by
-        file_id, capped at max_results. Pagination (offset) only walks
-        level 1 — it's the exact-match set, so "page 2" of a search means
-        page 2 of the best matches, not the loose fallback ones.
+        Avoiding lower-quality scans after a strict match makes common
+        searches substantially faster and prevents loose results from
+        crowding out the requested title. Results are deduped by file_id
+        and capped at max_results.
         """
         if isinstance(query, list):
             raw_pattern = "|".join(re.escape(q.strip()) for q in query if q and q.strip())
@@ -1200,6 +1215,42 @@ class Database:
         if not words:
             return []
 
+        # One bounded anchor scan is faster and more predictable than three
+        # sequential full-collection regex passes. Fetch candidates using the
+        # first meaningful title word, then enforce every requested token in
+        # memory. This also prevents ``reacher`` from matching ``preacher``.
+        if len(words) > 1 and not offset:
+            anchor_candidates = [
+                word for word in words
+                if len(word) >= 3
+                and not word.isdigit()
+                and word.lower() not in _SEARCH_FALLBACK_STOP
+            ]
+            anchor = anchor_candidates[0] if anchor_candidates else words[0]
+            try:
+                anchor_regex = compile_regex(
+                    r"(?:^|[\s\.\+\-_])" + re.escape(anchor) + r"(?:$|[\s\.\+\-_])"
+                )
+                candidates = await self._regex_search(anchor_regex, max_results)
+            except re.error:
+                return []
+
+            requested = {word.casefold() for word in words}
+            exact = []
+            exact_ids = set()
+            for doc in candidates:
+                normalized = normalize_file_name(doc.get("file_name", "")).casefold()
+                file_tokens = set(normalized.split())
+                if requested.issubset(file_tokens):
+                    exact.append(doc)
+                    exact_ids.add(doc.get("file_id"))
+            # Exact-token matches lead, followed by the remaining title-word
+            # candidates. The year/language part of a user's query is often
+            # absent from otherwise correct indexed filenames, so dropping
+            # those candidates entirely would hide valid releases.
+            related = [doc for doc in candidates if doc.get("file_id") not in exact_ids]
+            return (exact + related)[:max_results]
+
         seen_ids = set()
         merged = []
 
@@ -1213,7 +1264,12 @@ class Database:
 
         # Level 1: strict, in-order match (original behavior).
         if len(words) > 1:
-            pattern1 = r".*[\s\.\+\-_]".join(re.escape(w) for w in words)
+            separator = r"[\s\.\+\-_]+"
+            pattern1 = (
+                r"(?:^|[\s\.\+\-_])"
+                + separator.join(re.escape(w) for w in words)
+                + r"(?:$|[\s\.\+\-_])"
+            )
         else:
             pattern1 = r"(\b|[\.\+\-_])" + re.escape(words[0]) + r"(\b|[\.\+\-_])"
         try:
@@ -1227,7 +1283,7 @@ class Database:
             # Paginating an existing search — stick to level 1 only.
             return merged[:max_results]
 
-        if len(words) == 1 or len(merged) >= max_results:
+        if len(words) == 1 or merged:
             return merged[:max_results]
 
         # Level 2: all words present, any order, anywhere in the name.
@@ -1239,11 +1295,11 @@ class Database:
             level2 = []
         _add(level2)
 
-        if len(merged) >= max_results:
+        if merged:
             return merged[:max_results]
 
-        # Level 3: EVERY word, checked independently — always runs, not
-        # just when levels 1/2 came back empty.
+        # Level 3: individual significant words, only when the two stronger
+        # title-matching strategies found nothing.
         async def _word_hits(word):
             try:
                 regex_w = compile_regex(r"(\b|[\.\+\-_])" + re.escape(word) + r"(\b|[\.\+\-_])")
@@ -1264,6 +1320,24 @@ class Database:
         # Keep level 1 → level 2 → level 3 insertion order. Sorting the final
         # merged list by ObjectId made fresh but weak matches outrank exact ones.
         return merged[:max_results]
+
+    async def get_search_results(self, query, max_results=40, offset=0):
+        """Return a short-lived cached search result when available."""
+        if isinstance(query, list):
+            normalized_query = tuple(str(item).strip().lower() for item in query)
+        else:
+            normalized_query = str(query).strip().lower()
+        cache_key = (normalized_query, int(max_results), int(offset))
+        query_cache = getattr(self, "_query_cache", None)
+        if query_cache is not None:
+            cached = query_cache.get(cache_key)
+            if cached is not None:
+                return cached
+
+        results = await self._get_search_results_uncached(query, max_results, offset)
+        if query_cache is not None:
+            query_cache.set(cache_key, results)
+        return results
 
     async def get_prefix_suggestions(self, query, limit=3):
         clean = re.sub(r"[^a-zA-Z0-9]", " ", query.strip())

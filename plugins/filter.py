@@ -303,65 +303,6 @@ def _variant_label(f, show_title: bool, title=None, year=None) -> str:
     return label if len(label) <= 52 else label[:51] + "…"
 
 
-def _build_movie_result_buttons(results: list, session_id: str, page: int, per_page: int = 8):
-    """Movie-search button builder — groups same-title files (different
-    quality/language variants) next to each other instead of leaving them
-    scattered by the size-based sort, and shows a clean Title (Year) ·
-    Language · Quality · Size label instead of the raw indexed filename.
-    Every button (grouped or not) is independently tappable and self-
-    labeled — no separate non-clickable "header" row, since a keyboard
-    button that does nothing on tap is worse UX than a bit of repeated
-    title text. Grouping is purely a rendering-order choice: pagination
-    math (page/total_pages) and the sendfile# callback on every button are
-    unchanged, so this never adds a tap versus the un-grouped list. Series
-    results use the separate, untouched _build_result_buttons() below
-    instead — grouping by title would otherwise put every episode of a
-    series next to each other with an identical label."""
-    total = len(results)
-    total_pages = max(1, (total + per_page - 1) // per_page)
-    page = max(0, min(page, total_pages - 1))
-    start_idx = page * per_page
-    page_files = results[start_idx: start_idx + per_page]
-
-    groups = OrderedDict()
-    display_titles = set()
-    display_years = set()
-    for f in page_files:
-        title, year = _display_title(f["file_name"])
-        key = title.lower()
-        display_titles.add(key)
-        if year:
-            display_years.add(year)
-        if key not in groups:
-            groups[key] = {"files": []}
-        groups[key]["files"].append(f)
-
-    buttons = []
-    repeat_title = len(display_titles) > 1 or len(display_years) > 1
-    for group in groups.values():
-        for f in group["files"]:
-            # When every result is the same title, repeating that title on
-            # eight buttons hides the useful differences. Show only quality,
-            # language and size; retain the title when results are mixed.
-            label = _variant_label(
-                f,
-                show_title=repeat_title,
-            )
-            buttons.append([InlineKeyboardButton(label, callback_data=f"sendfile#{f['_id']}")])
-
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("‹ Previous", callback_data=f"page#{session_id}#{page-1}"))
-    if total_pages > 1:
-        nav.append(InlineKeyboardButton(f"{page+1} / {total_pages}", callback_data="ignore"))
-    if page < total_pages - 1:
-        nav.append(InlineKeyboardButton("Next ›", callback_data=f"page#{session_id}#{page+1}"))
-    if nav:
-        buttons.append(nav)
-
-    return buttons, page, total_pages
-
-
 async def _auto_delete_search(status_msg, original_msg, manual_query):
     await db.schedule_deletion(status_msg.chat.id, status_msg.id, 300)
     if not manual_query:
@@ -377,7 +318,57 @@ def _fmt_size(file_doc):
     size_mb = file_doc.get("file_size", 0) / (1024 * 1024)
     if size_mb >= 1000:
         return f"{size_mb / 1024:.2f} GB"
-    return f"{size_mb:.0f} MB"
+    return f"{size_mb:.2f} MB"
+
+
+_EPISODE_TAG_RE = re.compile(
+    r'(?<![A-Za-z0-9])S\s*(\d{1,2})\s*E\s*(\d{1,3})(?![A-Za-z0-9])',
+    re.IGNORECASE,
+)
+
+
+def _listing_name(filename: str) -> tuple[str, str]:
+    """Return a cleaned full filename and its normalized episode tag.
+
+    Useful release details stay visible; only promotional content, the file
+    extension, bracket characters and filename separators are removed.
+    """
+    name = _PROMO_RE.sub(" ", filename or "")
+    name = _EXT_RE.sub("", name.strip())
+
+    episode_match = _EPISODE_TAG_RE.search(name)
+    episode = ""
+    if episode_match:
+        episode = f"S{int(episode_match.group(1)):02d}E{int(episode_match.group(2)):02d}"
+        name = _EPISODE_TAG_RE.sub(" ", name, count=1)
+
+    name = _STRAY_BRACKET_RE.sub(" ", name)
+    name = _TITLE_SEP_RE.sub(" ", name)
+    name = _TITLE_WS_RE.sub(" ", name).strip(" |")
+    return name or "Unnamed file", episode
+
+
+def _flat_file_label(file_doc: dict, max_length: int = 64) -> str:
+    """Format one flat result button as ``[size] [episode] filename``."""
+    name, episode = _listing_name(file_doc.get("file_name", ""))
+    prefix = f"[{_fmt_size(file_doc)}]"
+    if episode:
+        prefix += f" [{episode}]"
+    label = f"{prefix} {name}"
+    return label if len(label) <= max_length else label[:max_length - 1].rstrip() + "…"
+
+
+def _build_results_caption(query: str, total: int, page: int, total_pages: int,
+                           first_name: str = "") -> str:
+    """Build the identical results heading used in DMs and groups."""
+    lines = [f"🔎 <b>Results Found For {_html(query)}</b>"]
+    if first_name:
+        lines.append(f"👤 <b>{_html(first_name)}</b>")
+    lines.extend([
+        "",
+        f"📁 <b>Files:</b> {total}  •  📚 <b>Page:</b> {page + 1} / {total_pages}",
+    ])
+    return "\n".join(lines)
 
 
 _SERIES_RE = re.compile(r'\b[Ss]\d{1,2}[Ee]\d{1,2}\b|\b[Ss]eason\s*\d+\b|\b[Ee]pisode\s*\d+\b', re.IGNORECASE)
@@ -403,14 +394,8 @@ def _series_sort_key(f):
 
 
 def _sort_results(results: list) -> list:
-    """"Smart" sort — the pre-existing default: series-aware chronological
-    order if any series content is detected, else size descending."""
-    if not results:
-        return results
-    has_series = any(_is_series(f.get("file_name", "")) for f in results)
-    if has_series:
-        return sorted(results, key=_series_sort_key)
-    return sorted(results, key=lambda f: f.get("file_size", 0), reverse=True)
+    """Preserve the database relevance order for the ungrouped flat list."""
+    return list(results)
 
 
 def _apply_result_filters(results: list, data: dict) -> list:
@@ -508,10 +493,8 @@ def _build_caption(config, file_data, delete_minutes, bot_username):
     )
 
 
-def _build_result_buttons(results: list, session_id: str, page: int, per_page: int = 8):
-    """Builds the file-button rows plus Prev/Next row for one page of
-    results. Used for the plain movie-results view and the expanded
-    (per-episode) series view — they render identically once expanded."""
+def _build_result_buttons(results: list, session_id: str, page: int, per_page: int = 10):
+    """Build the shared, ungrouped file rows plus simple pagination."""
     total = len(results)
     total_pages = max(1, (total + per_page - 1) // per_page)
     page = max(0, min(page, total_pages - 1))
@@ -520,105 +503,37 @@ def _build_result_buttons(results: list, session_id: str, page: int, per_page: i
 
     buttons = []
     for f in page_files:
-        title, year = _display_title(f["file_name"])
-        btn_text = _variant_label(f, show_title=True, title=title, year=year)
+        btn_text = _flat_file_label(f)
         buttons.append([InlineKeyboardButton(btn_text, callback_data=f"sendfile#{f['_id']}")])
 
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("‹ Previous", callback_data=f"page#{session_id}#{page-1}"))
-    if total_pages > 1:
-        nav.append(InlineKeyboardButton(f"{page+1} / {total_pages}", callback_data="ignore"))
+        nav.append(InlineKeyboardButton("⬅ PREV", callback_data=f"page#{session_id}#{page-1}"))
     if page < total_pages - 1:
-        nav.append(InlineKeyboardButton("Next ›", callback_data=f"page#{session_id}#{page+1}"))
+        nav.append(InlineKeyboardButton("NEXT ➡", callback_data=f"page#{session_id}#{page+1}"))
     if nav:
         buttons.append(nav)
 
     return buttons, page, total_pages
 
 
+# Keep the older public helper name used by tests/extensions, but route it to
+# the same flat builder so movie and series results cannot diverge again.
+def _build_movie_result_buttons(results: list, session_id: str, page: int,
+                                per_page: int = 10):
+    return _build_result_buttons(results, session_id, page, per_page)
+
+
 async def _render_results_view(client, message, session_id: str, page: int, data: dict, user_id=None):
-    """Single shared renderer for every results screen — the initial
-    search render, Prev/Next pagination, and the series expand toggle all
-    funnel through this one function so they can never drift out of sync
-    with each other (the old code duplicated this whole block between
-    show_results and handle_pagination).
-    """
-    source_results = data["results"]
-    results = _apply_result_filters(source_results, data)
-    query   = data["query"]
-    series_expanded = data.get("series_expanded", False)
-
-    total     = len(results)
-    source_total = len(source_results)
-    _del_secs = int(data.get("auto_delete_time", 300))
-    _del_mins = max(1, _del_secs // 60)
-
-    has_series = _has_series_content(results)
-
-    if not results:
-        caption = (
-            f"🔎 <b>No files match these filters</b>\n\n"
-            f"Try another language or quality for <code>{_html(query)}</code>."
-        )
-        buttons = [
-            _result_filter_row(session_id, data),
-            [InlineKeyboardButton("↺ Clear Filters", callback_data=f"clearfilters#{session_id}")],
-            [InlineKeyboardButton("⌂ Back to Home", callback_data="start_home")],
-        ]
-        markup = InlineKeyboardMarkup(buttons)
-    # A single, unambiguous match gets a direct "hero" card instead of the
-    # list view — still exactly one tap to the file, same sendfile# callback
-    # and verification-gate path as every other result.
-    elif total == 1 and not has_series:
-
-        f = results[0]
-        title, year = _display_title(f["file_name"])
-        meta = _variant_label(f, show_title=False)
-        caption = (
-            f"🎬 <b>{_html(title)}{f' ({year})' if year else ''}</b>\n"
-            f"<blockquote>{meta}</blockquote>\n"
-            f"<i>⏳ Available for {_del_mins} min</i>"
-        )
-        buttons = [
-            [InlineKeyboardButton("⬇ Get This File", callback_data=f"sendfile#{f['_id']}")],
-            _result_filter_row(session_id, data) if source_total > 1 else [],
-            [InlineKeyboardButton("⌂ Home", callback_data="start_home")],
-        ]
-        buttons = [row for row in buttons if row]
-        markup = InlineKeyboardMarkup(buttons)
-    else:
-        buttons = [_result_filter_row(session_id, data)]
-
-        if has_series and not series_expanded:
-            page, total_pages = 0, 1
-        elif has_series:
-            file_buttons, page, total_pages = _build_result_buttons(results, session_id, page)
-            buttons.extend(file_buttons)
-        else:
-            file_buttons, page, total_pages = _build_movie_result_buttons(results, session_id, page)
-            buttons.extend(file_buttons)
-
-        count_text = (
-            f"{total} of {source_total} files"
-            if total != source_total else f"{total} files"
-        )
-        caption = (
-            f"<b>🎬 {_html(query.title())}</b>\n"
-            f"<blockquote>{count_text}  •  Available for {_del_mins} min</blockquote>\n"
-        )
-
-        if has_series and not series_expanded:
-            caption += "Episodes are grouped to keep this list tidy."
-            buttons.append([InlineKeyboardButton(
-                f"📺 Browse All {total} Episodes",
-                callback_data=f"expandseries#{session_id}"
-            )])
-        else:
-            caption += "<i>Choose a file by size, language and quality.</i>"
-
-        buttons.append([InlineKeyboardButton("⌂ Back to Home", callback_data="start_home")])
-        markup = InlineKeyboardMarkup(buttons)
+    """Render every successful DM search with the shared flat list UI."""
+    results = data["results"]
+    query = data["query"]
+    total = len(results)
+    buttons, page, total_pages = _build_result_buttons(results, session_id, page)
+    caption = _build_results_caption(
+        query, total, page, total_pages, data.get("first_name", "")
+    )
+    markup = InlineKeyboardMarkup(buttons)
 
     # Results render as plain text only now — there's no TMDB poster to
     # upgrade a status message into a photo with. The media-message branch

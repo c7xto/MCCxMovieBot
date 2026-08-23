@@ -7,7 +7,11 @@ asyncio.set_event_loop(asyncio.new_event_loop())
 from plugins.filter import (  # noqa: E402
     _apply_result_filters,
     _build_movie_result_buttons,
+    _build_results_caption,
     _display_title,
+    _flat_file_label,
+    _listing_name,
+    _sort_results,
     _variant_label,
     clean_query,
     extract_attributes,
@@ -54,20 +58,54 @@ def test_result_filters_can_combine_language_and_quality():
     assert _apply_result_filters(results, data) == results[:1]
 
 
-def test_same_title_buttons_do_not_repeat_the_movie_name():
-    results = [
-        {"_id": "a", "file_name": "KGF Chapter 1 2018 Tamil 720p mkv", "file_size": 1},
-        {"_id": "b", "file_name": "KGF Chapter 1 Tamil HDRip mkv", "file_size": 2},
-    ]
-    rows, _, _ = _build_movie_result_buttons(results, "session", 0)
-    assert all("KGF" not in row[0].text for row in rows)
+def test_flat_label_keeps_useful_details_and_moves_episode_after_size():
+    file_doc = {
+        "_id": "a",
+        "file_name": "Reacher_S01E03_2022_1080p-H265_DDP5.1_@spam.mkv",
+        "file_size": 2 * 1024 * 1024 * 1024,
+    }
+    label = _flat_file_label(file_doc)
+    assert label == "[2.00 GB] [S01E03] Reacher 2022 1080p H265 DDP5 1"
+    assert not any(char in label for char in "_-@")
+    assert "mkv" not in label.lower()
 
 
-def test_different_release_years_remain_distinguishable():
+def test_listing_name_removes_brackets_extension_and_promotional_url():
+    name, episode = _listing_name(
+        "[Reacher].S2E8.English.WEB-DL.x265 https://t.me/spam mkv"
+    )
+    assert name == "Reacher English WEB DL x265"
+    assert episode == "S02E08"
+
+
+def test_flat_results_show_ten_files_without_grouping():
     results = [
-        {"_id": "a", "file_name": "Aavesham 2024 Malayalam 1080p mkv", "file_size": 1},
-        {"_id": "b", "file_name": "Aavesham 1979 Malayalam 720p mp4", "file_size": 2},
+        {
+            "_id": str(index),
+            "file_name": f"KGF Chapter 2 2022 Tamil {index} 1080p mkv",
+            "file_size": index * 1024 * 1024,
+        }
+        for index in range(1, 12)
     ]
-    rows, _, _ = _build_movie_result_buttons(results, "session", 0)
-    assert "(2024)" in rows[0][0].text
-    assert "(1979)" in rows[1][0].text
+    rows, page, total_pages = _build_movie_result_buttons(results, "session", 0)
+    assert page == 0
+    assert total_pages == 2
+    assert len(rows) == 11  # ten files plus NEXT
+    assert all("KGF Chapter 2" in row[0].text for row in rows[:10])
+    assert rows[-1][0].text == "NEXT ➡"
+
+
+def test_results_caption_contains_shared_count_and_page_header():
+    caption = _build_results_caption("reacher 2022", 152, 0, 16, "7")
+    assert "Results Found For reacher 2022" in caption
+    assert "Files:</b> 152" in caption
+    assert "Page:</b> 1 / 16" in caption
+    assert "👤 <b>7</b>" in caption
+
+
+def test_flat_listing_preserves_database_relevance_order():
+    results = [
+        {"_id": "exact", "file_name": "Reacher 2022", "file_size": 1},
+        {"_id": "related", "file_name": "Jack Reacher 2012", "file_size": 999},
+    ]
+    assert _sort_results(results) == results

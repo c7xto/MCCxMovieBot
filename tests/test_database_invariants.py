@@ -5,7 +5,7 @@ import pytest
 from bson import ObjectId
 from pymongo.errors import BulkWriteError
 
-from database.db import Database, deduplicate_file_batch, normalize_file_name
+from database.db import Database, _SearchCache, deduplicate_file_batch, normalize_file_name
 from utils import callback_data
 
 
@@ -149,17 +149,53 @@ async def test_empty_registry_with_existing_files_requires_migration():
 
 
 @pytest.mark.asyncio
-async def test_search_preserves_relevance_tiers():
+async def test_multiword_search_uses_one_anchor_scan_and_filters_all_tokens():
     database = bare_database()
-    database._regex_search = AsyncMock(side_effect=[
-        [{"file_id": "exact"}],
-        [{"file_id": "loose"}],
-        [{"file_id": "word-a"}],
-        [{"file_id": "word-b"}],
+    database._regex_search = AsyncMock(return_value=[
+        {"file_id": "old", "file_name": "Jack Reacher 2012"},
+        {"file_id": "exact", "file_name": "Reacher S01E03 2022 1080p"},
     ])
 
-    results = await database.get_search_results("alpha beta", max_results=10)
-    assert [doc["file_id"] for doc in results] == ["exact", "loose", "word-a", "word-b"]
+    results = await database.get_search_results("reacher 2022", max_results=10)
+    assert [doc["file_id"] for doc in results] == ["exact", "old"]
+    database._regex_search.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_multiword_search_falls_back_to_anchor_candidates():
+    database = bare_database()
+    database._regex_search = AsyncMock(return_value=[
+        {"file_id": "related", "file_name": "Reacher 2012"},
+    ])
+
+    results = await database.get_search_results("reacher 2099", max_results=10)
+    assert [doc["file_id"] for doc in results] == ["related"]
+    database._regex_search.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_strict_search_does_not_match_inside_another_word():
+    database = bare_database()
+    database._regex_search = AsyncMock(return_value=[{"file_id": "exact"}])
+
+    await database.get_search_results("reacher 2022", max_results=1)
+
+    regex = database._regex_search.await_args.args[0]
+    assert regex.search("Reacher 2022 1080p")
+    assert not regex.search("The Preacher 2022 720p")
+
+
+@pytest.mark.asyncio
+async def test_repeated_query_uses_short_lived_result_cache():
+    database = bare_database()
+    database._query_cache = _SearchCache(maxsize=4, default_ttl=120)
+    database._regex_search = AsyncMock(return_value=[{"file_id": "cached"}])
+
+    first = await database.get_search_results("kgf")
+    second = await database.get_search_results("KGF")
+
+    assert first == second
+    database._regex_search.assert_awaited_once()
 
 
 @pytest.mark.asyncio

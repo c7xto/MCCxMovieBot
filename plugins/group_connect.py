@@ -3,7 +3,6 @@ import time
 import secrets
 import asyncio
 import logging
-from collections import OrderedDict
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode, ChatAction
 from pyrogram.errors import MessageNotModified, FloodWait
@@ -13,7 +12,7 @@ from pyrogram.types import (
 from database.db import db
 from plugins.filter import (
     send_smart_log, _sort_results, clean_query,
-    _display_title, _variant_label
+    _flat_file_label, _build_results_caption
 )
 from plugins.health_monitor import _log_task_crash
 from utils import _no_preview, _html
@@ -25,51 +24,22 @@ logger = logging.getLogger(__name__)
 
 def _build_group_buttons(page_files, client_username, session_id, page,
                           total, total_pages):
-    """
-    Build the same title-grouped, clean-label button rows as filter.py's
-    _build_movie_result_buttons(), but each button is a URL that opens the
-    bot DM and sends the file (via ?start=file_<id>) instead of a callback,
-    since group chats deliver via PM handoff, not directly. Every button is
-    independently tappable and self-labeled — no non-clickable header row.
-    """
-    groups = OrderedDict()
-    display_titles = set()
-    display_years = set()
-    for f in page_files:
-        title, year = _display_title(f["file_name"])
-        key = title.lower()
-        display_titles.add(key)
-        if year:
-            display_years.add(year)
-        if key not in groups:
-            groups[key] = {"files": []}
-        groups[key]["files"].append(f)
-
+    """Build the same flat rows as DM, using deep links for delivery."""
     buttons = []
-    repeat_title = len(display_titles) > 1 or len(display_years) > 1
-    for group in groups.values():
-        for f in group["files"]:
-            label = _variant_label(
-                f,
-                show_title=repeat_title,
-            )
-            bot_url = f"https://t.me/{client_username}?start=file_{f['_id']}"
-            buttons.append([InlineKeyboardButton(label, url=bot_url)])
+    for f in page_files:
+        bot_url = f"https://t.me/{client_username}?start=file_{f['_id']}"
+        buttons.append([InlineKeyboardButton(_flat_file_label(f), url=bot_url)])
 
     # Navigation row — pagination goes back to DM full search for group
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton(
-            "‹ Previous",
+            "⬅ PREV",
             callback_data=f"grppage#{session_id}#{page - 1}"
-        ))
-    if total_pages > 1:
-        nav.append(InlineKeyboardButton(
-            f"{page + 1} / {total_pages}", callback_data="ignore"
         ))
     if page < total_pages - 1:
         nav.append(InlineKeyboardButton(
-            "Next ›",
+            "NEXT ➡",
             callback_data=f"grppage#{session_id}#{page + 1}"
         ))
     if nav:
@@ -78,14 +48,8 @@ def _build_group_buttons(page_files, client_username, session_id, page,
     return buttons
 
 
-def _build_caption(query, total, speed, del_mins):
-    """Search-results caption for the group chat — same minimal style as
-    filter.py's _render_results_view, adapted for the single-page group view."""
-    return (
-        f"<b>🎬 {_html(query.title())}</b>\n"
-        f"<blockquote>{total} files  •  Available for {del_mins} min</blockquote>\n"
-        f"<i>Choose quality, language and size. Delivery opens privately.</i>"
-    )
+def _build_caption(query, total, page, total_pages, first_name=""):
+    return _build_results_caption(query, total, page, total_pages, first_name)
 
 
 def _is_whitelist_ok(config: dict, group_doc) -> bool:
@@ -264,7 +228,6 @@ async def group_search(client: Client, message: Message):
     # Group Manager -> Group Settings -> Set Auto-Delete.
     custom_del = (group.get("settings", {}) if group else {}).get("auto_delete_time")
     _del_secs  = int(custom_del) if custom_del else int(config.get("auto_delete_time", 300))
-    _del_mins  = max(1, _del_secs // 60)
     speed     = f"{time_taken:.3f}s"
 
     session_data = {
@@ -276,40 +239,22 @@ async def group_search(client: Client, message: Message):
         "is_group":         True,
         "group_chat_id":    message.chat.id,
         "user_id":          message.from_user.id,
+        "first_name":       message.from_user.first_name or "",
     }
     await db.save_search(session_id, session_data)
 
     # Build page 0
-    per_page    = 8
+    per_page    = 10
     total       = len(sorted_files)
     total_pages = max(1, (total + per_page - 1) // per_page)
     page_files  = sorted_files[:per_page]
 
-    # A single, unambiguous match gets a direct "Get It Now" card instead of
-    # the list view — still exactly one tap (opens PM, delivers the file),
-    # same deep-link/gating path as every other result.
-    if total == 1:
-        f = sorted_files[0]
-        title, year = _display_title(f["file_name"])
-        meta = _variant_label(f, show_title=False)
-        caption = (
-            f"🎬 <b>{_html(title)}{f' ({year})' if year else ''}</b>\n"
-            f"<blockquote>{meta}</blockquote>\n"
-            f"<i>Open privately · Available for {_del_mins} min</i>"
-        )
-        bot_url = f"https://t.me/{client.me.username}?start=file_{f['_id']}"
-        buttons = [
-            [InlineKeyboardButton("⬇ Get File Privately", url=bot_url)],
-            [InlineKeyboardButton("⌂ Open Movie Hub", url=f"https://t.me/{client.me.username}")],
-        ]
-    else:
-        caption = _build_caption(query, total, speed, _del_mins)
-        buttons = _build_group_buttons(
-            page_files, client.me.username, session_id, 0, total, total_pages
-        )
-        buttons.append([InlineKeyboardButton(
-            "⌂ Open Movie Hub", url=f"https://t.me/{client.me.username}"
-        )])
+    caption = _build_caption(
+        query, total, 0, total_pages, message.from_user.first_name or ""
+    )
+    buttons = _build_group_buttons(
+        page_files, client.me.username, session_id, 0, total, total_pages
+    )
     markup = InlineKeyboardMarkup(buttons)
 
     # Send the finished card directly.  Kurigram can wait indefinitely when
@@ -330,16 +275,12 @@ async def group_search(client: Client, message: Message):
         # Telegram's markup limits and avoids pagination state entirely.
         logger.exception("Full group result-card send failed for %r: %s", query, exc)
         compact_buttons = []
-        for index, file_doc in enumerate(page_files, 1):
-            compact_label = _variant_label(file_doc, show_title=False)
-            compact_label = f"{index}. {compact_label}"[:52]
+        for file_doc in page_files:
+            compact_label = _flat_file_label(file_doc)
             compact_buttons.append([InlineKeyboardButton(
                 compact_label,
                 url=f"https://t.me/{client.me.username}?start=file_{file_doc['_id']}",
             )])
-        compact_buttons.append([InlineKeyboardButton(
-            "⌂ Open Movie Hub", url=f"https://t.me/{client.me.username}"
-        )])
         try:
             result_msg = await asyncio.wait_for(
                 message.reply_text(
@@ -385,23 +326,19 @@ async def handle_group_pagination(client: Client, callback: CallbackQuery):
 
     results     = data["results"]
     query       = data["query"]
-    per_page    = 8
+    per_page    = 10
     total       = len(results)
     total_pages = max(1, (total + per_page - 1) // per_page)
     page        = max(0, min(page, total_pages - 1))
     start_idx   = page * per_page
     page_files  = results[start_idx: start_idx + per_page]
 
-    _del_secs = int(data.get("auto_delete_time", 300))
-    _del_mins = max(1, _del_secs // 60)
-
-    caption = _build_caption(query, total, data.get("speed", ""), _del_mins)
+    caption = _build_caption(
+        query, total, page, total_pages, data.get("first_name", "")
+    )
     buttons = _build_group_buttons(
         page_files, client.me.username, session_id, page, total, total_pages
     )
-    buttons.append([InlineKeyboardButton(
-        "🤖 Open Bot", url=f"https://t.me/{client.me.username}"
-    )])
     markup = InlineKeyboardMarkup(buttons)
 
     try:
