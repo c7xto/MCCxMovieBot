@@ -113,6 +113,7 @@ _YEAR_RE = re.compile(r'^(19\d{2}|20\d{2})$')
 _PAREN_YEAR_RE = re.compile(r'[\(\[](\d{4})[\)\]]')
 _BRACKET_GROUP_RE = re.compile(r'[\[\(].*?[\]\)]')
 _TITLE_SEP_RE = re.compile(r'[._\-–—]+')
+_LISTING_SEP_RE = re.compile(r'[._\-–—#+|]+')
 _TITLE_WS_RE = re.compile(r'\s+')
 _STRAY_BRACKET_RE = re.compile(r'[\[\]\(\)\{\}]+')
 _PROMO_RE = re.compile(
@@ -343,7 +344,7 @@ def _listing_name(filename: str) -> tuple[str, str]:
         name = _EPISODE_TAG_RE.sub(" ", name, count=1)
 
     name = _STRAY_BRACKET_RE.sub(" ", name)
-    name = _TITLE_SEP_RE.sub(" ", name)
+    name = _LISTING_SEP_RE.sub(" ", name)
     name = _TITLE_WS_RE.sub(" ", name).strip(" |")
     return name or "Unnamed file", episode
 

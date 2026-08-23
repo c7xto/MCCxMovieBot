@@ -72,7 +72,7 @@ def test_flat_label_keeps_useful_details_and_moves_episode_after_size():
 
 def test_listing_name_removes_brackets_extension_and_promotional_url():
     name, episode = _listing_name(
-        "[Reacher].S2E8.English.WEB-DL.x265 https://t.me/spam mkv"
+        "[Reacher].S2E8.English+WEB-DL.#x265| https://t.me/spam mkv"
     )
     assert name == "Reacher English WEB DL x265"
     assert episode == "S02E08"
