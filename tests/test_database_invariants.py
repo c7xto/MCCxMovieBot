@@ -12,6 +12,9 @@ from database.db import (
     deduplicate_search_results,
     normalize_file_name,
     normalized_search_identity,
+    primary_search_identity,
+    rank_search_results,
+    suggest_search_titles,
 )
 from utils import callback_data
 
@@ -106,6 +109,30 @@ def test_search_deduplication_keeps_real_size_variants():
     assert [doc["file_id"] for doc in deduplicate_search_results(files)] == ["a", "c"]
 
 
+def test_primary_title_ignores_hidden_episode_title():
+    assert primary_search_identity(
+        "On Call S01E07 War Machine 1080p WEB-DL.mkv"
+    ) == "on call"
+    assert primary_search_identity(
+        "War Machine 2026 1080p WEB-DL.mkv"
+    ) == "war machine"
+
+
+def test_fuzzy_title_ranking_removes_episode_title_false_positive():
+    files = [
+        {"file_id": "episode", "file_name": "On Call S01E07 War Machine 720p.mkv"},
+        {"file_id": "movie", "file_name": "War Machine 2026 1080p.mkv"},
+    ]
+    assert [doc["file_id"] for doc in rank_search_results(
+        "war machine", files, 40
+    )] == ["movie"]
+
+
+def test_catalog_suggestions_correct_typos_without_short_substring_noise():
+    choices = ("war machine", "a", "ash", "on call")
+    assert suggest_search_titles("war mashine", choices=choices) == ["war machine"]
+
+
 def test_callback_data_respects_telegram_utf8_byte_limit():
     payload = callback_data("reqmovie#", "മലയാളം സിനിമ" * 10)
     assert len(payload.encode("utf-8")) <= 64
@@ -188,7 +215,8 @@ async def test_multiword_search_uses_reference_ordered_pattern():
 
 
 @pytest.mark.asyncio
-async def test_multiword_search_does_not_relax_title_words():
+async def test_multiword_search_does_not_relax_title_words(monkeypatch):
+    monkeypatch.setattr("database.db._SEARCH_TITLE_CATALOG", ())
     database = bare_database()
     database._regex_search = AsyncMock(return_value=[])
 
@@ -219,13 +247,15 @@ async def test_reference_search_passes_result_limit_and_offset_to_database():
     database._regex_search = AsyncMock(return_value=[])
 
     await database.get_search_results("reacher 2022", max_results=10, offset=20)
-    assert database._regex_search.await_args.args[1:] == (10, 20)
+    assert database._regex_search.await_args.args[1:] == (80, 20)
 
 
 @pytest.mark.asyncio
 async def test_strict_search_does_not_match_inside_another_word():
     database = bare_database()
-    database._regex_search = AsyncMock(return_value=[{"file_id": "exact"}])
+    database._regex_search = AsyncMock(return_value=[
+        {"file_id": "exact", "file_name": "Reacher S01E01 720p"}
+    ])
 
     await database.get_search_results("reacher", max_results=1)
 
@@ -238,13 +268,31 @@ async def test_strict_search_does_not_match_inside_another_word():
 async def test_repeated_query_uses_short_lived_result_cache():
     database = bare_database()
     database._query_cache = _SearchCache(maxsize=4, default_ttl=120)
-    database._regex_search = AsyncMock(return_value=[{"file_id": "cached"}])
+    database._regex_search = AsyncMock(return_value=[
+        {"file_id": "cached", "file_name": "KGF Chapter 1 2018 720p"}
+    ])
 
     first = await database.get_search_results("kgf")
     second = await database.get_search_results("KGF")
 
     assert first == second
     database._regex_search.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_catalog_typo_correction_runs_precise_corrected_search(monkeypatch):
+    monkeypatch.setattr("database.db._SEARCH_TITLE_CATALOG", ("war machine",))
+    database = bare_database()
+    database._regex_search = AsyncMock(side_effect=[
+        [],
+        [{"file_id": "movie", "file_name": "War Machine 2026 1080p"}],
+    ])
+
+    results = await database.get_search_results("war mashine", max_results=10)
+    assert [doc["file_id"] for doc in results] == ["movie"]
+    assert database._regex_search.await_count == 2
+    corrected_regex = database._regex_search.await_args_list[1].args[0]
+    assert corrected_regex.search("War Machine 2026")
 
 
 @pytest.mark.asyncio

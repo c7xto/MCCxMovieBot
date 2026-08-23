@@ -190,6 +190,13 @@ class AutoFilterBot(Client):
 
         logger.info("✅ Bot fully ready.")
 
+        catalog_task = asyncio.create_task(db.ensure_search_catalog())
+        catalog_task.add_done_callback(
+            lambda t: _log_task_crash(t, self, "ensure_search_catalog")
+        )
+        self.background_tasks.append(catalog_task)
+        logger.info("✅ Fuzzy-search catalog worker started.")
+
         health_task = asyncio.create_task(run_health_monitor(self))
         health_task.add_done_callback(lambda t: _log_task_crash(t, self, "run_health_monitor"))
         self.background_tasks.append(health_task)

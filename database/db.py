@@ -2,8 +2,10 @@ import os
 import re
 import time
 import json
+import gzip
 import asyncio
 import logging
+from pathlib import Path
 from datetime import datetime, timezone
 from collections import OrderedDict
 from functools import lru_cache
@@ -12,6 +14,7 @@ import certifi
 from pymongo import AsyncMongoClient, InsertOne, UpdateOne
 from pymongo.errors import DuplicateKeyError, BulkWriteError
 from dotenv import load_dotenv
+from rapidfuzz import fuzz, process
 
 try:
     import dns  # noqa: F401 — dnspython; required for mongodb+srv:// URIs.
@@ -29,6 +32,9 @@ except ImportError as e:
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+_SEARCH_CATALOG_PATH = Path(__file__).resolve().parents[1] / "runtime" / "search_titles.txt.gz"
+_SEARCH_TITLE_CATALOG: tuple[str, ...] = ()
 
 
 class AllClustersFullError(Exception):
@@ -75,8 +81,20 @@ _OPTIONAL_SEARCH_TOKENS = {
     "malayalam", "tamil", "telugu", "hindi", "english", "kannada",
     "dual", "multi", "audio", "dubbed", "sub", "subs", "esub", "esubs",
     "2160p", "1080p", "720p", "480p", "4k", "uhd", "hdrip", "webrip",
-    "webdl", "bluray", "predvd", "cam", "hevc", "x265", "x264",
+    "web", "dl", "webdl", "bluray", "predvd", "cam", "hevc", "x265", "x264",
 }
+_SEARCH_SERIES_MARKER_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:S(?:EASON)?\s*\d{1,2}|"
+    r"E(?:P(?:ISODE)?)?\s*\d{1,3})",
+    re.IGNORECASE,
+)
+_SEARCH_BRACKET_GROUP_RE = re.compile(r"[\[({][^\])}]{1,80}[\])}]")
+_STRONG_METADATA_RE = re.compile(
+    r"^(?:2160p|1080p|720p|480p|360p|4k|uhd|hdrip|webrip|webdl|"
+    r"bluray|predvd|cam|hevc|avc|x26[45]|h26[45]|aac\d*|ddp?\d*|"
+    r"eac3|ac3|10bit|amzn|nf|hq|yts|mkv|mp4|avi|mov)$",
+    re.IGNORECASE,
+)
 
 
 def normalize_file_name(name: str) -> str:
@@ -146,6 +164,136 @@ def _is_optional_search_token(token: str) -> bool:
     return bool(re.fullmatch(r"(?:19|20)\d{2}", token)) or (
         token.casefold() in _OPTIONAL_SEARCH_TOKENS
     )
+
+
+def primary_search_identity(name: str) -> str:
+    """Extract the title users see, excluding hidden episode-title text."""
+    without_tags = _SEARCH_BRACKET_GROUP_RE.sub(" ", name or "")
+    normalized = normalize_file_name(without_tags)
+    tokens = normalized.split()
+    while tokens and tokens[-1].casefold() in _SEARCH_EXTENSION_TOKENS:
+        tokens.pop()
+    if not tokens:
+        return ""
+
+    normalized = " ".join(tokens)
+    series_marker = _SEARCH_SERIES_MARKER_RE.search(normalized)
+    if series_marker:
+        return normalized[:series_marker.start()].strip().casefold()
+
+    year_positions = [
+        index for index, token in enumerate(tokens)
+        if re.fullmatch(r"(?:19|20)\d{2}", token)
+    ]
+    if year_positions:
+        # For numeric titles such as ``1917 2019``, the final year is release
+        # metadata while the earlier number remains part of the title.
+        cut_at = year_positions[-1]
+        title_tokens = tokens[:cut_at]
+        if title_tokens:
+            return " ".join(title_tokens).casefold()
+
+    for index, token in enumerate(tokens[1:], 1):
+        if _STRONG_METADATA_RE.fullmatch(token):
+            return " ".join(tokens[:index]).casefold()
+    return " ".join(tokens).casefold()
+
+
+def _fuzzy_query_identity(query: str) -> str:
+    tokens = normalized_search_identity(query).split()
+    title_tokens = [token for token in tokens if not _is_optional_search_token(token)]
+    return " ".join(title_tokens or tokens)
+
+
+def rank_search_results(query: str, files: list, max_results: int) -> list:
+    """Keep candidates whose visible title fuzzily matches the query.
+
+    Scoring a bounded Mongo result set makes typo tolerance inexpensive while
+    ensuring a phrase found only in an episode title cannot outrank a movie
+    with that actual title.
+    """
+    query_identity = _fuzzy_query_identity(query)
+    if not query_identity or not files:
+        return []
+
+    scored = []
+    for position, file_doc in enumerate(files):
+        identity = primary_search_identity(file_doc.get("file_name", ""))
+        if not identity:
+            continue
+        direct_score = fuzz.ratio(query_identity, identity)
+        weighted_score = fuzz.WRatio(query_identity, identity)
+        score = (0.7 * direct_score) + (0.3 * weighted_score)
+        if identity == query_identity:
+            score = 100.0
+        elif identity.startswith(query_identity + " "):
+            score = max(score, 96.0)
+        elif len(query_identity.split()) == len(identity.split()):
+            # A user may reverse two title words. Apply the order-independent
+            # score only when neither side contains extra words.
+            score = max(
+                score,
+                fuzz.token_sort_ratio(query_identity, identity) * 0.9,
+            )
+        scored.append((score, position, file_doc))
+
+    if not scored:
+        return []
+    best_score = max(item[0] for item in scored)
+    if best_score < 75.0:
+        return []
+    cutoff = max(75.0, best_score - 10.0)
+    ranked = sorted(
+        (item for item in scored if item[0] >= cutoff),
+        key=lambda item: (-item[0], item[1]),
+    )
+    return [item[2] for item in ranked[:max_results]]
+
+
+def load_search_catalog() -> int:
+    """Load the compact, local unique-title catalog when it exists."""
+    global _SEARCH_TITLE_CATALOG
+    if not _SEARCH_CATALOG_PATH.exists():
+        _SEARCH_TITLE_CATALOG = ()
+        return 0
+    try:
+        with gzip.open(_SEARCH_CATALOG_PATH, "rt", encoding="utf-8") as handle:
+            _SEARCH_TITLE_CATALOG = tuple(
+                line.strip() for line in handle if line.strip()
+            )
+    except (OSError, UnicodeError) as exc:
+        logger.warning("Could not load fuzzy-search title catalog: %s", exc)
+        _SEARCH_TITLE_CATALOG = ()
+    return len(_SEARCH_TITLE_CATALOG)
+
+
+def suggest_search_titles(query: str, limit: int = 3,
+                          choices=None) -> list[str]:
+    """Return the closest known visible titles using RapidFuzz."""
+    query_identity = _fuzzy_query_identity(query)
+    catalog = _SEARCH_TITLE_CATALOG if choices is None else choices
+    if not query_identity or not catalog:
+        return []
+    # WRatio intentionally rewards a short substring inside a long string;
+    # that is useful for release filenames but harmful for a title catalog
+    # (``avsham`` could rank a one-letter title highly). Plain edit similarity
+    # handles spelling, while token-sort similarity handles reversed words.
+    matches = process.extract(
+        query_identity, catalog, scorer=fuzz.ratio,
+        score_cutoff=72.0, limit=limit,
+    )
+    reordered = process.extract(
+        query_identity, catalog, scorer=fuzz.token_sort_ratio,
+        score_cutoff=80.0, limit=limit,
+    )
+    best = {}
+    for title, score, _ in matches + reordered:
+        best[title] = max(score, best.get(title, 0.0))
+    return [
+        title for title, _ in sorted(
+            best.items(), key=lambda item: (-item[1], len(item[0]), item[0])
+        )[:limit]
+    ]
 
 
 def deduplicate_file_batch(files_list):
@@ -281,6 +429,10 @@ class Database:
         self._query_cache = _SearchCache(maxsize=512, default_ttl=120)
         self._db_size_cache = {}  # id(db_instance) -> (fetched_at, size_mb)
         self._file_count_cache = (0.0, 0)
+        self._catalog_building = False
+        catalog_size = load_search_catalog()
+        if catalog_size:
+            logger.info("✅ Loaded fuzzy-search catalog: %s titles", catalog_size)
 
         if self.dbs:
             # Keep movie shards in their original numbered databases, but put
@@ -648,6 +800,79 @@ class Database:
         query_cache = getattr(self, "_query_cache", None)
         if query_cache is not None:
             query_cache.clear()
+
+    async def ensure_search_catalog(self, force=False):
+        """Build a compact unique-title catalog without duplicating files.
+
+        The scan runs as a background startup task. Exact searches remain
+        available throughout; typo correction activates when the generated
+        gzip catalog is atomically installed.
+        """
+        global _SEARCH_TITLE_CATALOG
+        if self._catalog_building:
+            return len(_SEARCH_TITLE_CATALOG)
+        if not force and _SEARCH_TITLE_CATALOG and _SEARCH_CATALOG_PATH.exists():
+            age = time.time() - _SEARCH_CATALOG_PATH.stat().st_mtime
+            if age < 7 * 24 * 3600:
+                return len(_SEARCH_TITLE_CATALOG)
+
+        self._catalog_building = True
+        titles = set(_SEARCH_TITLE_CATALOG)
+        scanned = 0
+        started = time.monotonic()
+        logger.info("🔤 Building fuzzy-search title catalog in background...")
+        try:
+            for cluster_number, collection in enumerate(self.file_cols, 1):
+                cluster_count = 0
+                try:
+                    cursor = collection.find(
+                        {}, {"file_name": 1, "_id": 0}
+                    ).batch_size(2000)
+                    async for file_doc in cursor:
+                        identity = primary_search_identity(
+                            file_doc.get("file_name", "")
+                        )
+                        if identity:
+                            titles.add(identity)
+                        cluster_count += 1
+                        scanned += 1
+                        if scanned % 100000 == 0:
+                            logger.info(
+                                "🔤 Search catalog: %,d files → %,d titles",
+                                scanned, len(titles),
+                            )
+                except Exception as exc:
+                    logger.warning(
+                        "Search-catalog scan skipped remainder of cluster %s: %s",
+                        cluster_number, exc,
+                    )
+                logger.info(
+                    "🔤 Search catalog cluster %s complete: %,d files",
+                    cluster_number, cluster_count,
+                )
+
+            if not titles:
+                return 0
+            sorted_titles = tuple(sorted(titles))
+
+            def _write_catalog():
+                _SEARCH_CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+                temporary = _SEARCH_CATALOG_PATH.with_suffix(".tmp.gz")
+                with gzip.open(temporary, "wt", encoding="utf-8", compresslevel=6) as handle:
+                    handle.write("\n".join(sorted_titles))
+                    handle.write("\n")
+                os.replace(temporary, _SEARCH_CATALOG_PATH)
+
+            await asyncio.to_thread(_write_catalog)
+            _SEARCH_TITLE_CATALOG = sorted_titles
+            self._invalidate_file_count()
+            logger.info(
+                "✅ Fuzzy-search catalog ready: %,d titles from %,d files in %.1fs",
+                len(sorted_titles), scanned, time.monotonic() - started,
+            )
+            return len(sorted_titles)
+        finally:
+            self._catalog_building = False
 
     async def registry_needs_migration(self):
         """Detect the dangerous upgrade case: old files but no registry."""
@@ -1252,13 +1477,12 @@ class Database:
         return files[:max_results]
 
     async def _get_search_results_uncached(self, query, max_results=40, offset=0):
-        """Use DreamXBotz-style ordered filename matching.
+        """Use ordered Mongo candidates followed by fuzzy title ranking.
 
         Every word in a multi-word query must occur in the typed order and
         be separated by a normal filename delimiter. A one-word query uses
-        the reference bot's boundary expression. No anchor-only or any-order
-        fallback is used; only optional release metadata may be removed after
-        a strict miss, so unrelated titles cannot fill a result page.
+        the reference bot's boundary expression. Candidates are then scored
+        against their primary visible title, not hidden episode-title text.
         """
         if isinstance(query, list):
             raw_pattern = "|".join(re.escape(q.strip()) for q in query if q and q.strip())
@@ -1276,14 +1500,16 @@ class Database:
         words = [word for word in query.split() if word][:12]
         if not words:
             return []
+        candidate_limit = max(80, max_results * 2)
 
         try:
             regex = compile_regex(_reference_search_pattern(words))
         except re.error:
             return []
-        results = await self._regex_search(regex, max_results, offset)
-        if results or offset or len(words) == 1:
-            return results
+        candidates = await self._regex_search(regex, candidate_limit, offset)
+        ranked = rank_search_results(query, candidates, max_results)
+        if ranked or offset:
+            return ranked
 
         # Real libraries are inconsistent about release metadata. The
         # reference query is always attempted first; if it misses, retry the
@@ -1292,13 +1518,44 @@ class Database:
         title_words = [
             word for word in words if not _is_optional_search_token(word)
         ]
-        if not title_words or title_words == words:
-            return []
-        try:
-            fallback_regex = compile_regex(_reference_search_pattern(title_words))
-        except re.error:
-            return []
-        return await self._regex_search(fallback_regex, max_results, offset)
+        if title_words and title_words != words:
+            try:
+                fallback_regex = compile_regex(
+                    _reference_search_pattern(title_words)
+                )
+            except re.error:
+                fallback_regex = None
+            if fallback_regex is not None:
+                candidates = await self._regex_search(
+                    fallback_regex, candidate_limit, offset
+                )
+                ranked = rank_search_results(query, candidates, max_results)
+                if ranked:
+                    return ranked
+
+        # Typo fallback: RapidFuzz compares against the compact catalog of
+        # unique visible titles, then Mongo performs the normal precise lookup
+        # for the corrected title. No fuzzy scan ever touches all file rows.
+        query_identity = _fuzzy_query_identity(query)
+        for suggestion in suggest_search_titles(query, limit=3):
+            if suggestion == query_identity:
+                continue
+            suggestion_words = suggestion.split()[:12]
+            if not suggestion_words:
+                continue
+            try:
+                suggestion_regex = compile_regex(
+                    _reference_search_pattern(suggestion_words)
+                )
+            except re.error:
+                continue
+            candidates = await self._regex_search(
+                suggestion_regex, candidate_limit, 0
+            )
+            ranked = rank_search_results(query, candidates, max_results)
+            if ranked:
+                return ranked
+        return []
 
     async def get_search_results(self, query, max_results=40, offset=0):
         """Return a short-lived cached search result when available."""
