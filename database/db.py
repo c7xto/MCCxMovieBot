@@ -70,6 +70,7 @@ def compile_regex(pattern):
 _JUNK_TAG_RE = re.compile(r"http\S+|www\.\S+|@\w+", re.IGNORECASE)
 _SYMBOL_RE = re.compile(r"[_\-\.#+$%^&*()!~`,;:\"'?/<>\[\]{}=|\\]")
 _WS_COLLAPSE_RE = re.compile(r"\s+")
+_SEARCH_EXTENSION_TOKENS = {"mkv", "mp4", "avi", "mov", "zip", "srt"}
 _SEARCH_FALLBACK_STOP = {
     "the", "and", "for", "with", "from", "movie", "film", "part",
     "season", "episode", "chapter", "full", "official", "malayalam",
@@ -89,6 +90,40 @@ def normalize_file_name(name: str) -> str:
     cleaned = _SYMBOL_RE.sub(" ", cleaned)
     cleaned = _WS_COLLAPSE_RE.sub(" ", cleaned).strip()
     return cleaned or name.strip()
+
+
+@lru_cache(maxsize=16384)
+def normalized_search_identity(name: str) -> str:
+    """Stable, compact identity used for ranking and duplicate suppression.
+
+    It is derived from the existing normalized filename, so legacy records
+    need no migration and no second large indexed field is stored in Atlas.
+    """
+    tokens = normalize_file_name(name).casefold().split()
+    while tokens and tokens[-1] in _SEARCH_EXTENSION_TOKENS:
+        tokens.pop()
+    return " ".join(tokens)
+
+
+def deduplicate_search_results(files: list) -> list:
+    """Remove identical file IDs and identical name/size records stably."""
+    unique = []
+    seen_file_ids = set()
+    seen_content = set()
+    for file_doc in files:
+        file_id = file_doc.get("file_id")
+        identity = normalized_search_identity(file_doc.get("file_name", ""))
+        signature = (identity, int(file_doc.get("file_size", 0) or 0))
+        if file_id and file_id in seen_file_ids:
+            continue
+        if identity and signature in seen_content:
+            continue
+        if file_id:
+            seen_file_ids.add(file_id)
+        if identity:
+            seen_content.add(signature)
+        unique.append(file_doc)
+    return unique
 
 
 def deduplicate_file_batch(files_list):
@@ -735,9 +770,18 @@ class Database:
         if not files_list:
             return 0, 0
 
+        # Normalize defensively here too. The bulk indexer already cleans its
+        # input, but keeping the database boundary authoritative guarantees
+        # every caller produces the same searchable identity.
+        normalized_files = []
+        for incoming in files_list:
+            file_doc = dict(incoming)
+            file_doc["file_name"] = normalize_file_name(file_doc.get("file_name", ""))
+            normalized_files.append(file_doc)
+
         # De-duplicate the incoming batch before reserving IDs. Filtering via
         # an accepted-id set after reservation reintroduced duplicate entries.
-        unique_files, internal_duplicates = deduplicate_file_batch(files_list)
+        unique_files, internal_duplicates = deduplicate_file_batch(normalized_files)
 
         incoming_ids = [f["file_id"] for f in unique_files]
         accepted_ids, duplicates = await self._registry_bulk_reserve(incoming_ids)
@@ -916,9 +960,13 @@ class Database:
             obj_id = ObjectId(file_obj_id)
         except Exception:
             return False
+        normalized_name = normalize_file_name(new_name)
         for col in self.file_cols:
-            result = await col.update_one({"_id": obj_id}, {"$set": {"file_name": new_name}})
+            result = await col.update_one(
+                {"_id": obj_id}, {"$set": {"file_name": normalized_name}}
+            )
             if result.matched_count > 0:
+                self._invalidate_file_count()
                 return True
         return False
 
@@ -1140,7 +1188,7 @@ class Database:
             self._invalidate_file_count()
         return migrated, skipped
 
-    async def _regex_search(self, regex, max_results, offset=0):
+    async def _regex_search(self, regex, max_results, offset=0, retain_candidates=False):
         """Run a single compiled regex against file_name across every
         cluster, dedup by file_id, sorted newest-first. Shared by every
         tier of get_search_results()."""
@@ -1172,17 +1220,10 @@ class Database:
 
         cluster_results = await asyncio.gather(*[_search_cluster(col) for col in self.file_cols])
 
-        seen_ids = set()
-        files = []
-        for docs in cluster_results:
-            for doc in docs:
-                fid = doc.get("file_id")
-                if fid in seen_ids:
-                    continue
-                seen_ids.add(fid)
-                files.append(doc)
-
-        return files[:max_results]
+        files = deduplicate_search_results([
+            doc for docs in cluster_results for doc in docs
+        ])
+        return files if retain_candidates else files[:max_results]
 
     async def _get_search_results_uncached(self, query, max_results=40, offset=0):
         """Search three relevance levels, stopping at the first useful one:
@@ -1231,25 +1272,44 @@ class Database:
                 anchor_regex = compile_regex(
                     r"(?:^|[\s\.\+\-_])" + re.escape(anchor) + r"(?:$|[\s\.\+\-_])"
                 )
-                candidates = await self._regex_search(anchor_regex, max_results)
+                candidates = await self._regex_search(
+                    anchor_regex, max_results, retain_candidates=True
+                )
             except re.error:
                 return []
 
             requested = {word.casefold() for word in words}
-            exact = []
-            exact_ids = set()
-            for doc in candidates:
-                normalized = normalize_file_name(doc.get("file_name", "")).casefold()
-                file_tokens = set(normalized.split())
-                if requested.issubset(file_tokens):
-                    exact.append(doc)
-                    exact_ids.add(doc.get("file_id"))
-            # Exact-token matches lead, followed by the remaining title-word
-            # candidates. The year/language part of a user's query is often
-            # absent from otherwise correct indexed filenames, so dropping
-            # those candidates entirely would hide valid releases.
-            related = [doc for doc in candidates if doc.get("file_id") not in exact_ids]
-            return (exact + related)[:max_results]
+            ordered_query = [word.casefold() for word in words]
+
+            def _relevance(file_doc):
+                identity = normalized_search_identity(file_doc.get("file_name", ""))
+                tokens = identity.split()
+                token_set = set(tokens)
+                matched = sum(word in token_set for word in requested)
+                exact = requested.issubset(token_set)
+                phrase = " ".join(ordered_query) in identity
+                try:
+                    anchor_position = tokens.index(anchor.casefold())
+                except ValueError:
+                    anchor_position = len(tokens) + 1
+                return (not exact, not phrase, -matched, anchor_position)
+
+            # Rank the complete cross-cluster candidate set before applying
+            # the public result cap; previously cluster order could crowd out
+            # a stronger exact match from a later shard. If any candidate has
+            # every requested token, exclude loose anchor-only matches so the
+            # presentation layer's size sorting cannot put a smaller but
+            # irrelevant title/year above the requested movie.
+            ranked = sorted(candidates, key=_relevance)
+            exact_matches = [
+                file_doc for file_doc in ranked
+                if requested.issubset(
+                    set(normalized_search_identity(
+                        file_doc.get("file_name", "")
+                    ).split())
+                )
+            ]
+            return (exact_matches or ranked)[:max_results]
 
         seen_ids = set()
         merged = []

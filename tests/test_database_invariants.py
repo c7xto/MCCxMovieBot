@@ -5,7 +5,14 @@ import pytest
 from bson import ObjectId
 from pymongo.errors import BulkWriteError
 
-from database.db import Database, _SearchCache, deduplicate_file_batch, normalize_file_name
+from database.db import (
+    Database,
+    _SearchCache,
+    deduplicate_file_batch,
+    deduplicate_search_results,
+    normalize_file_name,
+    normalized_search_identity,
+)
 from utils import callback_data
 
 
@@ -83,6 +90,22 @@ def test_filename_normalization_removes_promotional_noise():
     assert normalize_file_name("[Site]_Movie.Name.2026_@channel.mkv") == "Site Movie Name 2026 mkv"
 
 
+def test_search_identity_is_casefolded_and_extension_free():
+    assert normalized_search_identity("[Site]_Movie.Name.2026_@channel.MKV") == (
+        "site movie name 2026"
+    )
+
+
+def test_search_deduplication_keeps_real_size_variants():
+    files = [
+        {"file_id": "a", "file_name": "Movie.Name.mkv", "file_size": 100},
+        {"file_id": "b", "file_name": "Movie_Name.mp4", "file_size": 100},
+        {"file_id": "c", "file_name": "Movie Name mkv", "file_size": 200},
+        {"file_id": "a", "file_name": "unrelated", "file_size": 300},
+    ]
+    assert [doc["file_id"] for doc in deduplicate_search_results(files)] == ["a", "c"]
+
+
 def test_callback_data_respects_telegram_utf8_byte_limit():
     payload = callback_data("reqmovie#", "മലയാളം സിനിമ" * 10)
     assert len(payload.encode("utf-8")) <= 64
@@ -157,7 +180,7 @@ async def test_multiword_search_uses_one_anchor_scan_and_filters_all_tokens():
     ])
 
     results = await database.get_search_results("reacher 2022", max_results=10)
-    assert [doc["file_id"] for doc in results] == ["exact", "old"]
+    assert [doc["file_id"] for doc in results] == ["exact"]
     database._regex_search.assert_awaited_once()
 
 
@@ -171,6 +194,19 @@ async def test_multiword_search_falls_back_to_anchor_candidates():
     results = await database.get_search_results("reacher 2099", max_results=10)
     assert [doc["file_id"] for doc in results] == ["related"]
     database._regex_search.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_multiword_search_ranks_before_applying_result_cap():
+    database = bare_database()
+    database._regex_search = AsyncMock(return_value=[
+        {"file_id": "related", "file_name": "Reacher 2012"},
+        {"file_id": "exact", "file_name": "Reacher S01E03 2022 1080p"},
+    ])
+
+    results = await database.get_search_results("reacher 2022", max_results=1)
+    assert [doc["file_id"] for doc in results] == ["exact"]
+    assert database._regex_search.await_args.kwargs["retain_candidates"] is True
 
 
 @pytest.mark.asyncio

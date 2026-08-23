@@ -476,10 +476,26 @@ def _sort_results(results: list) -> list:
     """
     if not results:
         return []
-    if _has_series_content(results):
-        return sorted(results, key=_series_sort_key)
+    unique_results = []
+    seen_labels = set()
+    for file_doc in results:
+        # Use the untruncated smart label plus exact byte size as the semantic
+        # identity. This catches duplicate releases with different Telegram
+        # file IDs or harmless source-prefix differences while retaining real
+        # variants (different episode, size, language, quality or codec).
+        signature = (
+            int(file_doc.get("file_size", 0) or 0),
+            _flat_file_label(file_doc, max_length=512).casefold(),
+        )
+        if signature in seen_labels:
+            continue
+        seen_labels.add(signature)
+        unique_results.append(file_doc)
+
+    if _has_series_content(unique_results):
+        return sorted(unique_results, key=_series_sort_key)
     return sorted(
-        results,
+        unique_results,
         key=lambda f: (
             int(f.get("file_size", 0) or 0),
             f.get("file_name", "").casefold(),

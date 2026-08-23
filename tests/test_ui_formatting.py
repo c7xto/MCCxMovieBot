@@ -150,3 +150,27 @@ def test_series_results_sort_by_season_then_episode():
     assert [item["_id"] for item in _sort_results(results)] == [
         "s1e2-small", "s1e2-large", "e3", "s1e8", "s2e1", "movie"
     ]
+
+
+def test_smart_result_deduplication_hides_duplicate_episode_titles():
+    results = [
+        {
+            "_id": "first",
+            "file_name": "Reacher S01E01 Welcome to Margrave 720p x265.mkv",
+            "file_size": 300,
+        },
+        {
+            "_id": "duplicate",
+            "file_name": "Reacher S01E01 Pilot Episode 720p x265.mp4",
+            "file_size": 300,
+        },
+        {
+            "_id": "size-variant",
+            "file_name": "Reacher S01E01 720p x265.mkv",
+            "file_size": 400,
+        },
+    ]
+
+    assert [item["_id"] for item in _sort_results(results)] == [
+        "first", "size-variant"
+    ]
