@@ -372,9 +372,19 @@ def _build_results_caption(query: str, total: int, page: int, total_pages: int,
     return "\n".join(lines)
 
 
-_SERIES_RE = re.compile(r'\b[Ss]\d{1,2}[Ee]\d{1,2}\b|\b[Ss]eason\s*\d+\b|\b[Ee]pisode\s*\d+\b', re.IGNORECASE)
-_SEASON_NUM_RE = re.compile(r'[Ss](\d{1,2})')
-_EPISODE_NUM_RE = re.compile(r'[Ee](\d{1,2})')
+_SERIES_RE = re.compile(
+    r'(?<![A-Za-z0-9])(?:S(?:EASON)?[\s._-]*\d{1,2}|'
+    r'E(?:P(?:ISODE)?)?[\s._-]*\d{1,3})',
+    re.IGNORECASE,
+)
+_SEASON_NUM_RE = re.compile(
+    r'(?<![A-Za-z0-9])S(?:EASON)?[\s._-]*0*(\d{1,2})', re.IGNORECASE
+)
+_EPISODE_NUM_RE = re.compile(
+    r'(?<![A-Za-z0-9])(?:S(?:EASON)?[\s._-]*\d{1,2}[\s._-]*)?'
+    r'E(?:P(?:ISODE)?)?[\s._-]*0*(\d{1,3})',
+    re.IGNORECASE,
+)
 
 
 def _is_series(filename: str) -> bool:
@@ -389,14 +399,31 @@ def _series_sort_key(f):
     name = f.get("file_name", "")
     s = _SEASON_NUM_RE.search(name)
     e = _EPISODE_NUM_RE.search(name)
-    season  = int(s.group(1)) if s else 0
+    season  = int(s.group(1)) if s else (1 if e else 0)
     episode = int(e.group(1)) if e else 0
-    return (season, episode)
+    size = int(f.get("file_size", 0) or 0)
+    if s or e:
+        return (0, season, episode, size, name.casefold())
+    return (1, 0, 0, size, name.casefold())
 
 
 def _sort_results(results: list) -> list:
-    """Preserve the database relevance order for the ungrouped flat list."""
-    return list(results)
+    """Movies sort small-to-large; series sort by season and episode.
+
+    A mixed search keeps episodic matches first in chronological order and
+    puts any related movie/non-series matches afterwards by ascending size.
+    """
+    if not results:
+        return []
+    if _has_series_content(results):
+        return sorted(results, key=_series_sort_key)
+    return sorted(
+        results,
+        key=lambda f: (
+            int(f.get("file_size", 0) or 0),
+            f.get("file_name", "").casefold(),
+        ),
+    )
 
 
 def _apply_result_filters(results: list, data: dict) -> list:
