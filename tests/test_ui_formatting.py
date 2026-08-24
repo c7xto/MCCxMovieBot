@@ -1,6 +1,5 @@
 import asyncio
-import gzip
-import json
+from types import SimpleNamespace
 
 # Kurigram's synchronous compatibility layer expects an event loop to exist
 # while plugin modules register their handlers on newer Python versions.
@@ -18,17 +17,16 @@ from plugins.filter import (  # noqa: E402
     clean_query,
     extract_attributes,
 )
-from plugins.search_indicator import _sticker_stream  # noqa: E402
+from plugins.search_indicator import _select_search_sticker  # noqa: E402
 from plugins.start import _build_start_ui  # noqa: E402
 
 
-def test_search_indicator_is_valid_small_tgs_animation():
-    sticker = _sticker_stream()
-    assert sticker.name == "searching.tgs"
-    assert len(sticker.getvalue()) < 64 * 1024
-    animation = json.loads(gzip.decompress(sticker.getvalue()))
-    assert animation["w"] == animation["h"] == 512
-    assert animation["layers"]
+def test_search_indicator_selects_native_animated_magnifying_sticker():
+    stickers = [
+        SimpleNamespace(emoji="🔎", is_animated=False, file_id="static"),
+        SimpleNamespace(emoji="🔍", is_animated=True, file_id="animated"),
+    ]
+    assert _select_search_sticker(stickers).file_id == "animated"
 
 
 def test_home_screen_uses_live_count_and_clean_button_order():
