@@ -105,8 +105,7 @@ def _build_start_ui(config, mention, total_files, bot_username, update_link, gro
         "<b>🎬 MCCx Movie Bot</b>\n"
         "<blockquote>" + strings["welcome_greeting"] + "\n"
         + strings["welcome_body"] + "</blockquote>\n"
-        "<b>📚 Library</b>  •  " + strings["files_counting"] + "\n"
-        "<b>💡 Try</b>  <code>Aavesham 2024 Malayalam 1080p</code>"
+        "<b>📚 " + strings["files_counting"] + "</b>"
     )
     # An admin-customized welcome_text is a single free-text field with no
     # per-language variant — the language toggle only swaps the *default*.
@@ -146,14 +145,19 @@ def _build_start_ui(config, mention, total_files, bot_username, update_link, gro
         InlineKeyboardButton("🔎 Search Guide", callback_data="help_menu"),
         _lang_button(lang),
     ])
-    community_row = [
-        InlineKeyboardButton("➕ Add to Group", url=f"https://t.me/{bot_username}?startgroup=true")
-    ]
+    discovery_row = []
     if group_link:
-        community_row.append(InlineKeyboardButton("💬 Request", url=group_link))
-    buttons.append(community_row)
+        discovery_row.append(InlineKeyboardButton("📝 Request Movie", url=group_link))
     if update_link:
-        buttons.append([InlineKeyboardButton("📢 Updates & New Releases", url=update_link)])
+        discovery_row.append(InlineKeyboardButton("📢 New Releases", url=update_link))
+    if discovery_row:
+        buttons.append(discovery_row)
+    buttons.append([
+        InlineKeyboardButton(
+            "➕ Add Bot to Group",
+            url=f"https://t.me/{bot_username}?startgroup=true",
+        )
+    ])
     return text, InlineKeyboardMarkup(buttons)
 
 

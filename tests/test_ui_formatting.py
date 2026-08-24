@@ -19,6 +19,7 @@ from plugins.filter import (  # noqa: E402
     extract_attributes,
 )
 from plugins.search_indicator import _sticker_stream  # noqa: E402
+from plugins.start import _build_start_ui  # noqa: E402
 
 
 def test_search_indicator_is_valid_small_tgs_animation():
@@ -28,6 +29,21 @@ def test_search_indicator_is_valid_small_tgs_animation():
     animation = json.loads(gzip.decompress(sticker.getvalue()))
     assert animation["w"] == animation["h"] == 512
     assert animation["layers"]
+
+
+def test_home_screen_uses_live_count_and_clean_button_order():
+    text, markup = _build_start_ui(
+        {}, "Tester", 1_130_509, "MCCxMovieBot", "https://t.me/releases",
+        "https://t.me/requests", first_name="Tester",
+    )
+
+    assert "1,130,509 files available" in text
+    assert "Aavesham" not in text
+    assert [[button.text for button in row] for row in markup.inline_keyboard] == [
+        ["🔎 Search Guide", "🌐 മലയാളം"],
+        ["📝 Request Movie", "📢 New Releases"],
+        ["➕ Add Bot to Group"],
+    ]
 
 
 def test_display_title_removes_release_name_noise():
