@@ -155,18 +155,19 @@ def test_results_caption_contains_shared_count_and_page_header():
     assert "👤 <b>7</b>" in caption
 
 
-def test_movie_results_sort_from_smallest_to_largest():
+def test_movie_results_sort_from_largest_to_smallest():
     results = [
         {"_id": "large", "file_name": "Movie 1080p", "file_size": 999},
         {"_id": "small", "file_name": "Movie 480p", "file_size": 1},
         {"_id": "medium", "file_name": "Movie 720p", "file_size": 500},
     ]
-    assert [item["_id"] for item in _sort_results(results)] == ["small", "medium", "large"]
+    assert [item["_id"] for item in _sort_results(results)] == ["large", "medium", "small"]
 
 
 def test_series_results_sort_by_season_then_episode():
     results = [
-        {"_id": "movie", "file_name": "Reacher Movie 2012", "file_size": 1},
+        {"_id": "movie-small", "file_name": "Reacher Movie 2012", "file_size": 1},
+        {"_id": "movie-large", "file_name": "Reacher Movie 2012 4K", "file_size": 999},
         {"_id": "s2e1", "file_name": "Reacher S02E01 1080p", "file_size": 300},
         {"_id": "s1e8", "file_name": "Reacher Season 1 Episode 8", "file_size": 200},
         {"_id": "s1e2-large", "file_name": "Reacher S01 EP02 1080p", "file_size": 400},
@@ -174,7 +175,8 @@ def test_series_results_sort_by_season_then_episode():
         {"_id": "e3", "file_name": "Reacher E03 480p", "file_size": 50},
     ]
     assert [item["_id"] for item in _sort_results(results)] == [
-        "s1e2-small", "s1e2-large", "e3", "s1e8", "s2e1", "movie"
+        "s1e2-small", "s1e2-large", "e3", "s1e8", "s2e1",
+        "movie-large", "movie-small"
     ]
 
 

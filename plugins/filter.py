@@ -466,14 +466,14 @@ def _series_sort_key(f):
     size = int(f.get("file_size", 0) or 0)
     if s or e:
         return (0, season, episode, size, name.casefold())
-    return (1, 0, 0, size, name.casefold())
+    return (1, 0, 0, -size, name.casefold())
 
 
 def _sort_results(results: list) -> list:
-    """Movies sort small-to-large; series sort by season and episode.
+    """Movies sort large-to-small; series sort by season and episode.
 
     A mixed search keeps episodic matches first in chronological order and
-    puts any related movie/non-series matches afterwards by ascending size.
+    puts any related movie/non-series matches afterwards by descending size.
     """
     if not results:
         return []
@@ -498,7 +498,7 @@ def _sort_results(results: list) -> list:
     return sorted(
         unique_results,
         key=lambda f: (
-            int(f.get("file_size", 0) or 0),
+            -int(f.get("file_size", 0) or 0),
             f.get("file_name", "").casefold(),
         ),
     )
