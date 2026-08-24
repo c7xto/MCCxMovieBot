@@ -4,7 +4,7 @@ import secrets
 import asyncio
 import logging
 from pyrogram import Client, filters
-from pyrogram.enums import ParseMode, ChatAction
+from pyrogram.enums import ParseMode
 from pyrogram.errors import MessageNotModified, FloodWait
 from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -15,6 +15,7 @@ from plugins.filter import (
     _flat_file_label, _build_results_caption
 )
 from plugins.health_monitor import _log_task_crash
+from plugins.search_indicator import show_search_indicator, remove_search_indicator
 from utils import _no_preview, _html
 
 logger = logging.getLogger(__name__)
@@ -173,13 +174,13 @@ async def group_search(client: Client, message: Message):
     if not query:
         return
 
-    try:
-        await client.send_chat_action(message.chat.id, ChatAction.TYPING)
-    except Exception:
-        pass
-
+    indicator = await show_search_indicator(client, message.chat.id)
     start_time = time.time()
-    results    = await db.get_search_results(query)
+    try:
+        results = await db.get_search_results(query)
+    except Exception:
+        await remove_search_indicator(indicator)
+        raise
     # increment_group_search has no internal try/except, unlike the other
     # fire-and-forget calls in this file — a transient Mongo error here would
     # otherwise vanish into asyncio's default "Task exception was never
@@ -189,6 +190,7 @@ async def group_search(client: Client, message: Message):
 
     # ── No results ────────────────────────────────────────────────────────────
     if not results:
+        await remove_search_indicator(indicator)
         should_alert = await db.log_missed_search(query)
         if should_alert:
             asyncio.create_task(send_smart_log(client,
@@ -256,6 +258,8 @@ async def group_search(client: Client, message: Message):
         page_files, client.me.username, session_id, 0, total, total_pages
     )
     markup = InlineKeyboardMarkup(buttons)
+
+    await remove_search_indicator(indicator)
 
     # Send the finished card directly.  Kurigram can wait indefinitely when
     # editing a just-sent group message on some MTProto sessions; that left

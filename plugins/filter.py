@@ -13,12 +13,13 @@ from pyrogram.errors import (
     FileReferenceInvalid, MediaEmpty, MediaInvalid,
 )
 from pyrogram import Client, filters
-from pyrogram.enums import ParseMode, ChatAction
+from pyrogram.enums import ParseMode
 from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 )
 from database.db import db
 from plugins.req_fsub import check_verification_gates
+from plugins.search_indicator import show_search_indicator, remove_search_indicator
 from utils import (
     is_subscribed, is_subscribed_join_only, send_fsub_message, _parse_fsub_entry,
     ADMIN_ID, _no_preview, _html, callback_data,
@@ -645,23 +646,26 @@ async def _render_results_view(client, message, session_id: str, page: int, data
     # is just a safe fallback for a session started just before this deploy.
     is_media_msg = bool(
         getattr(message, "photo", None) or getattr(message, "video", None) or
-        getattr(message, "animation", None) or getattr(message, "document", None)
+        getattr(message, "animation", None) or getattr(message, "document", None) or
+        getattr(message, "sticker", None)
     )
 
     try:
         if is_media_msg:
             chat_id = message.chat.id
             await message.delete()
-            await client.send_message(
+            return await client.send_message(
                 chat_id, caption, reply_markup=markup,
                 parse_mode=ParseMode.HTML, **_no_preview()
             )
         else:
             await message.edit_text(text=caption, reply_markup=markup, parse_mode=ParseMode.HTML)
+            return message
     except MessageNotModified:
-        pass
+        return message
     except Exception as e:
         logger.error(f"_render_results_view error: {e}")
+        return message
 
 
 async def show_results(client, message, session_id, page):
@@ -672,7 +676,7 @@ async def show_results(client, message, session_id, page):
         except Exception:
             pass
         return
-    await _render_results_view(client, message, session_id, page, data)
+    return await _render_results_view(client, message, session_id, page, data)
 
 
 route_menu = show_results
@@ -741,15 +745,16 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
     if not query:
         return
 
-    try:
-        await client.send_chat_action(message.chat.id, ChatAction.TYPING)
-    except Exception:
-        pass
-
+    indicator = await show_search_indicator(client, message.chat.id)
     start_time = time.time()
-    results    = await db.get_search_results(query)
+    try:
+        results = await db.get_search_results(query)
+    except Exception:
+        await remove_search_indicator(indicator)
+        raise
 
     if not results:
+        await remove_search_indicator(indicator)
         google_url = f"https://www.google.com/search?q={quote(query)}"
         safe_query = query[:40]
 
@@ -809,11 +814,8 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
     }
     await db.save_search(session_id, session_data)
 
-    status_msg = await message.reply_text(
-        "🔎 <b>Searching your library…</b>", reply_parameters=None, parse_mode=ParseMode.HTML
-    )
-    await show_results(client, status_msg, session_id, 0)
-    await _auto_delete_search(status_msg, message, manual_query)
+    result_msg = await show_results(client, indicator, session_id, 0)
+    await _auto_delete_search(result_msg or indicator, message, manual_query)
 
 
 @Client.on_callback_query(filters.regex(r"^page#"))

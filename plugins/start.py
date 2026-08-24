@@ -5,6 +5,7 @@ import time
 import secrets
 from dotenv import load_dotenv
 from plugins.filter import route_menu
+from plugins.search_indicator import show_search_indicator, remove_search_indicator
 from utils import _no_preview, _html, callback_data, HELP_STEPS_EN, HELP_FOOTER_EN
 from pyrogram import Client, filters
 from pyrogram.errors import (
@@ -178,9 +179,15 @@ async def _execute_search(client, status_msg, query: str, config: dict, user_id=
             )],
             [InlineKeyboardButton("⌂ Back to Home", callback_data="start_home")],
         ])
+        text = f"🔎 " + strings["no_results"].format(query=_html(query))
+        if getattr(status_msg, "sticker", None):
+            chat_id = status_msg.chat.id
+            await remove_search_indicator(status_msg)
+            return await client.send_message(
+                chat_id, text, reply_markup=markup, parse_mode=ParseMode.HTML
+            )
         return await status_msg.edit_text(
-            f"🔎 " + strings["no_results"].format(query=_html(query)),
-            reply_markup=markup, parse_mode=ParseMode.HTML
+            text, reply_markup=markup, parse_mode=ParseMode.HTML
         )
 
     await db.clear_old_searches()
@@ -263,10 +270,7 @@ async def _handle_search_payload(client, message, config, payload: str):
     else:
         raw_query = payload
     query = urllib.parse.unquote(raw_query).replace("_", " ")
-    status_msg = await message.reply_text(
-        "🔎 <b>Searching your library…</b>\n<i>Matching title, language and quality</i>",
-        parse_mode=ParseMode.HTML, reply_parameters=None
-    )
+    status_msg = await show_search_indicator(client, message.chat.id)
     return await _execute_search(
         client, status_msg, query, config,
         user_id=message.from_user.id, first_name=message.from_user.first_name
