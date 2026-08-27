@@ -5,20 +5,40 @@ import asyncio
 import logging
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
-from pyrogram.errors import MessageNotModified, FloodWait
+from pyrogram.errors import MessageNotModified
 from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 )
 from database.db import db
+from plugins.access_policy import authorize_user_action, enforce_user_action
 from plugins.filter import (
     send_smart_log, _sort_results, clean_query,
     _flat_file_label, _build_results_caption
 )
-from plugins.health_monitor import _log_task_crash
 from plugins.search_indicator import show_search_indicator, remove_search_indicator
-from utils import _no_preview, _html
+from plugins.telegram_retry import INTERACTIVE_RETRY, telegram_call
+from plugins.task_supervisor import TaskConflict, supervisor
+from plugins.workload import (
+    WorkloadRejected,
+    enforce_search_rate_limits,
+    search_slot,
+    validate_search_query,
+)
+from utils import _no_preview, _html, html_user_mention
 
 logger = logging.getLogger(__name__)
+
+
+def _spawn_group_task(coroutine, key):
+    try:
+        supervisor.spawn(
+            coroutine,
+            key=key,
+            owner="group_connect",
+            drain_on_shutdown=True,
+        )
+    except TaskConflict:
+        logger.info("Group background task skipped key=%s", key)
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -86,24 +106,30 @@ async def auto_connect_group(client: Client, message: Message):
                 await client.leave_chat(message.chat.id)
             except Exception:
                 pass
-            asyncio.create_task(send_smart_log(client,
+            _spawn_group_task(send_smart_log(client,
                 f"🔒 **#WhitelistBlocked**\n\n📌 {message.chat.title}\n"
                 f"🆔 `{message.chat.id}`\n\n"
                 f"Whitelist mode is ON and this group isn't approved — left automatically. "
                 f"Whitelist it in Group Manager, then re-add the bot."
-            ))
+            ), f"log:whitelist:{message.chat.id}:{time.monotonic_ns()}")
             return
 
         await db.add_group(message.chat.id, message.chat.title)
 
         try:
             total_members = await client.get_chat_members_count(message.chat.id)
-            added_by = message.from_user.mention if message.from_user else "Unknown"
-            asyncio.create_task(send_smart_log(client,
-                f"🏘 **#NewGroup**\n\n📌 {message.chat.title}\n"
-                f"🆔 `{message.chat.id}`\n👥 `{total_members}` members\n"
-                f"👤 Added by: {added_by}"
-            ))
+            added_by = (
+                html_user_mention(message.from_user)
+                if message.from_user else "Unknown"
+            )
+            _spawn_group_task(send_smart_log(client,
+                "🏘 <b>#NewGroup</b>\n\n"
+                f"📌 {_html(message.chat.title)}\n"
+                f"🆔 <code>{message.chat.id}</code>\n"
+                f"👥 <code>{total_members}</code> members\n"
+                f"👤 Added by: {added_by}",
+                parse_mode=ParseMode.HTML,
+            ), f"log:new-group:{message.chat.id}:{time.monotonic_ns()}")
         except Exception as e:
             logger.error(f"New group log failed: {e}")
 
@@ -130,7 +156,8 @@ async def group_search(client: Client, message: Message):
     if (message.text or "").lstrip().startswith("/"):
         return
 
-    if await db.is_banned(message.from_user.id):
+    access = await authorize_user_action(message.from_user.id, "group_search")
+    if not access.allowed:
         return
 
     if await db.is_group_banned(message.chat.id):
@@ -140,16 +167,13 @@ async def group_search(client: Client, message: Message):
             pass
         return
 
-    config = await db.get_config()
+    config = access.config
     group  = await db.get_group(message.chat.id)
     if not _is_whitelist_ok(config, group):
         try:
             await client.leave_chat(message.chat.id)
         except Exception:
             pass
-        return
-
-    if config.get("maintenance_mode"):
         return
 
     raw_query = message.text.strip()
@@ -161,7 +185,8 @@ async def group_search(client: Client, message: Message):
         try:
             await message.delete()
             warning = await message.reply_text(
-                f"⚠️ {message.from_user.mention}, <b>No Chatting Allowed.</b>\n"
+                f"⚠️ {html_user_mention(message.from_user)}, "
+                f"<b>No Chatting Allowed.</b>\n"
                 f"<blockquote>Type a Movie or Series name only.</blockquote>",
                 parse_mode=ParseMode.HTML
             )
@@ -174,10 +199,20 @@ async def group_search(client: Client, message: Message):
     if not query:
         return
 
+    try:
+        query = validate_search_query(query)
+        await enforce_search_rate_limits(message.from_user.id, message.chat.id)
+    except WorkloadRejected as exc:
+        return await message.reply_text(exc.public_message)
+
     indicator = await show_search_indicator(client, message.chat.id)
     start_time = time.time()
     try:
-        results = await db.get_search_results(query)
+        async with search_slot("group_search"):
+            results = await db.get_search_results(query)
+    except WorkloadRejected as exc:
+        await remove_search_indicator(indicator)
+        return await message.reply_text(exc.public_message)
     except Exception:
         await remove_search_indicator(indicator)
         raise
@@ -185,18 +220,23 @@ async def group_search(client: Client, message: Message):
     # fire-and-forget calls in this file — a transient Mongo error here would
     # otherwise vanish into asyncio's default "Task exception was never
     # retrieved" log instead of reaching the admin log channel.
-    count_task = asyncio.create_task(db.increment_group_search(message.chat.id))
-    count_task.add_done_callback(lambda t: _log_task_crash(t, client, "increment_group_search"))
+    _spawn_group_task(
+        db.increment_group_search(message.chat.id),
+        f"metric:group-search:{message.chat.id}:{message.id}",
+    )
 
     # ── No results ────────────────────────────────────────────────────────────
     if not results:
         await remove_search_indicator(indicator)
         should_alert = await db.log_missed_search(query)
         if should_alert:
-            asyncio.create_task(send_smart_log(client,
-                f"❌ **#MissedSearch**\n\n🎬 `{query}`\n"
-                f"👤 {message.from_user.mention}\n📍 Group Chat"
-            ))
+            _spawn_group_task(send_smart_log(client,
+                "❌ <b>#MissedSearch</b>\n\n"
+                f"🎬 <code>{_html(query)}</code>\n"
+                f"👤 {html_user_mention(message.from_user)}\n"
+                "📍 Group Chat",
+                parse_mode=ParseMode.HTML,
+            ), f"log:missed-group:{message.chat.id}:{time.monotonic_ns()}")
 
         safe_query = re.sub(r'[^a-zA-Z0-9]', '_', query)[:40]
         markup = InlineKeyboardMarkup([
@@ -267,10 +307,16 @@ async def group_search(client: Client, message: Message):
     # A bounded direct send avoids that edit round-trip entirely.
     try:
         result_msg = await asyncio.wait_for(
-            message.reply_text(
-                text=caption,
-                reply_markup=markup,
-                parse_mode=ParseMode.HTML,
+            telegram_call(
+                lambda: message.reply_text(
+                    text=caption,
+                    reply_markup=markup,
+                    parse_mode=ParseMode.HTML,
+                ),
+                route="group_search_results",
+                policy=INTERACTIVE_RETRY,
+                retry_safe=True,
+                idempotency_key=f"group-results:{message.chat.id}:{message.id}",
             ),
             timeout=20,
         )
@@ -287,10 +333,16 @@ async def group_search(client: Client, message: Message):
             )])
         try:
             result_msg = await asyncio.wait_for(
-                message.reply_text(
-                    text=caption,
-                    reply_markup=InlineKeyboardMarkup(compact_buttons),
-                    parse_mode=ParseMode.HTML,
+                telegram_call(
+                    lambda: message.reply_text(
+                        text=caption,
+                        reply_markup=InlineKeyboardMarkup(compact_buttons),
+                        parse_mode=ParseMode.HTML,
+                    ),
+                    route="group_search_results_compact",
+                    policy=INTERACTIVE_RETRY,
+                    retry_safe=True,
+                    idempotency_key=f"group-compact:{message.chat.id}:{message.id}",
                 ),
                 timeout=20,
             )
@@ -300,13 +352,19 @@ async def group_search(client: Client, message: Message):
                 query,
                 fallback_exc,
             )
-            result_msg = await message.reply_text(
-                (
-                    f"🎬 <b>{_html(query.title())}</b>\n"
-                    f"<blockquote>{total} matches found.</blockquote>\n"
-                    f"Open @{client.me.username} privately to get the files."
+            result_msg = await telegram_call(
+                lambda: message.reply_text(
+                    (
+                        f"🎬 <b>{_html(query.title())}</b>\n"
+                        f"<blockquote>{total} matches found.</blockquote>\n"
+                        f"Open @{client.me.username} privately to get the files."
+                    ),
+                    parse_mode=ParseMode.HTML,
                 ),
-                parse_mode=ParseMode.HTML,
+                route="group_search_results_text",
+                policy=INTERACTIVE_RETRY,
+                retry_safe=True,
+                idempotency_key=f"group-text:{message.chat.id}:{message.id}",
             )
 
     await db.schedule_deletion(result_msg.chat.id, result_msg.id, _del_secs)
@@ -316,6 +374,8 @@ async def group_search(client: Client, message: Message):
 
 @Client.on_callback_query(filters.regex(r"^grppage#"))
 async def handle_group_pagination(client: Client, callback: CallbackQuery):
+    if not (await enforce_user_action(callback, "search_navigation")).allowed:
+        return
     parts      = callback.data.split("#")
     session_id = parts[1]
     page       = int(parts[2])
@@ -346,7 +406,17 @@ async def handle_group_pagination(client: Client, callback: CallbackQuery):
     markup = InlineKeyboardMarkup(buttons)
 
     try:
-        await callback.message.edit_text(text=caption, reply_markup=markup, parse_mode=ParseMode.HTML)
+        await telegram_call(
+            lambda: callback.message.edit_text(
+                text=caption, reply_markup=markup, parse_mode=ParseMode.HTML
+            ),
+            route="group_search_pagination",
+            policy=INTERACTIVE_RETRY,
+            retry_safe=True,
+            idempotency_key=(
+                f"group-page:{callback.message.chat.id}:{callback.message.id}:{page}"
+            ),
+        )
     except MessageNotModified:
         pass
     except Exception as e:

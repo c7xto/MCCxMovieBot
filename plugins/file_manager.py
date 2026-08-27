@@ -1,14 +1,15 @@
 import os
-import asyncio
 import logging
+import time
 from dotenv import load_dotenv
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.enums import ParseMode
 from database.db import db
 from plugins.state import get_state, set_state, clear_state
-from plugins.health_monitor import _log_task_crash
-from utils import ADMIN_ID
+from plugins.task_supervisor import TaskConflict, supervisor
+from plugins.callbacks import answer_callback_safely
+from utils import ADMIN_ID, _html, report_internal_error
 
 load_dotenv()
 
@@ -27,6 +28,7 @@ _cached_dupes = {}
 
 @Client.on_callback_query(filters.regex(r"^file_manager_menu$") & filters.user(ADMIN_ID))
 async def file_manager_menu(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback)
     total_files = await db.get_total_files()
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔎 Find Files", callback_data="fm_search"),
@@ -45,7 +47,6 @@ async def file_manager_menu(client: Client, callback: CallbackQuery):
         await callback.message.edit_text(text, reply_markup=markup)
     except Exception:
         await callback.message.reply_text(text, reply_markup=markup)
-    await callback.answer()
 
 
 # ── SEARCH & DELETE ───────────────────────────────────────────────────────────
@@ -68,12 +69,16 @@ async def filesearch_cmd(client: Client, message: Message):
 
 
 async def _do_file_search(client, message_obj, query):
-    status = await message_obj.reply_text(f"🔍 Searching for `{query}`...")
+    status = await message_obj.reply_text(
+        f"🔍 Searching for <code>{_html(query)}</code>...",
+        parse_mode=ParseMode.HTML,
+    )
     results = await db.admin_search_files(query, limit=15)
 
     if not results:
         await status.edit_text(
-            f"❌ No files found for `{query}`.",
+            f"❌ No files found for <code>{_html(query)}</code>.",
+            parse_mode=ParseMode.HTML,
             reply_markup=_BACK_BTN
         )
         return
@@ -93,11 +98,11 @@ async def _do_file_search(client, message_obj, query):
         ])
 
         await message_obj.reply_text(
-            f"📄 `{name}`\n"
-            f"💿 Size: `{size_str}`  •  Cluster: `{cluster}`\n"
-            f"🆔 `{obj_id}`",
+            f"📄 <code>{_html(name)}</code>\n"
+            f"💿 Size: <code>{size_str}</code>  •  Cluster: <code>{cluster}</code>\n"
+            f"🆔 <code>{obj_id}</code>",
             reply_markup=markup,
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode=ParseMode.HTML,
         )
 
 
@@ -141,15 +146,23 @@ async def fm_editname_prompt(client: Client, callback: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^fm_duplicates$") & filters.user(ADMIN_ID))
 async def fm_duplicates(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback, "🔎 Starting safe scan…")
     await callback.message.edit_text(
-        "🔄 **Scanning for duplicates...**\n\n"
-        "_(This scans all clusters and may take a minute for large databases)_"
+        "🧬 **Duplicate Report • Starting**\n\n"
+        "This is a report-only scan. Nothing will be deleted."
     )
-    await callback.answer()
 
     # Run in background so it doesn't timeout
-    scan_task = asyncio.create_task(_run_duplicate_scan(client, callback.message, callback.from_user.id))
-    scan_task.add_done_callback(lambda t: _log_task_crash(t, client, "duplicate_scan"))
+    try:
+        supervisor.spawn(
+            _run_duplicate_scan(client, callback.message, callback.from_user.id),
+            key="maintenance:duplicate-scan",
+            owner=f"admin:{callback.from_user.id}",
+            resources=("movie-catalog",),
+            drain_on_shutdown=True,
+        )
+    except TaskConflict as exc:
+        await callback.message.edit_text(f"⚠️ **Scan not started:** `{exc}`")
 
 
 @Client.on_callback_query(filters.regex(r"^fm_dupes_page#") & filters.user(ADMIN_ID))
@@ -160,96 +173,106 @@ async def fm_dupes_page(client: Client, callback: CallbackQuery):
     except (ValueError, IndexError):
         return await callback.answer("❌ Malformed callback.", show_alert=True)
     await callback.answer()
-    dupes = _cached_dupes.get(callback.from_user.id)
-    if not dupes:
+    report = _cached_dupes.get(callback.from_user.id)
+    if not report:
         await callback.message.edit_text(
             "⚠️ Scan results expired. Please re-run duplicate scan.",
             reply_markup=_BACK_BTN
         )
         return
-    await _show_dupes_page(callback, dupes, page=page)
+    await _show_dupes_page(callback, report, page=page)
 
 
-@Client.on_callback_query(filters.regex(r"^fm_del_dupes#") & filters.user(ADMIN_ID))
-async def fm_del_dupes(client: Client, callback: CallbackQuery):
-    """
-    Deletes the duplicate IDs passed in callback data.
-    db.find_duplicate_files() now returns ids = list of IDs TO DELETE (not keep).
-    keep_id (oldest) is already excluded from the list before being put in callback.
-    """
-    try:
-        ids_raw = callback.data.split("#")[1]
-    except IndexError:
-        return await callback.answer("❌ Malformed data.", show_alert=True)
+@Client.on_callback_query(filters.regex(r"^fm_dupe_review#") & filters.user(ADMIN_ID))
+async def fm_review_duplicate_group(client: Client, callback: CallbackQuery):
+    await callback.answer(
+        "Report only: deletion will be added only after you approve the report.",
+        show_alert=True,
+    )
 
-    ids = [i for i in ids_raw.split(",") if i]
-    if not ids:
-        await callback.answer("Nothing to delete.", show_alert=True)
-        return
 
-    deleted = 0
-    for obj_id in ids:
-        if await db.delete_file_by_obj_id(obj_id):
-            deleted += 1
-
-    await callback.answer(f"✅ Deleted {deleted} duplicate(s). Oldest copy kept.", show_alert=True)
-
-    # Remove from this admin's cached list
-    admin_id = callback.from_user.id
-    dupes = _cached_dupes.get(admin_id, [])
-    ids_set = set(ids)
-    for i, d in enumerate(dupes):
-        if ids_set.intersection(set(d.get("ids", []))):
-            dupes.pop(i)
-            break
-    _cached_dupes[admin_id] = dupes
-
-    if dupes:
-        await _show_dupes_page(callback, dupes, page=0)
-    else:
-        await callback.message.edit_text(
-            "✅ **All duplicates resolved!** Database is clean.",
-            reply_markup=_BACK_BTN
-        )
+@Client.on_callback_query(filters.regex(r"^fm_dupe_delete#") & filters.user(ADMIN_ID))
+async def fm_delete_duplicate_group(client: Client, callback: CallbackQuery):
+    await callback.answer(
+        "Deletion is disabled in report-only mode. No files were changed.",
+        show_alert=True,
+    )
 
 
 async def _run_duplicate_scan(client, status_msg, admin_id):
-    try:
-        dupes = await db.find_duplicate_files()
+    last_update = 0.0
 
-        if not dupes:
+    async def show_progress(progress):
+        nonlocal last_update
+        now = time.monotonic()
+        if progress.get("phase") != "comparing" and now - last_update < 3.0:
+            return
+        last_update = now
+        scanned = int(progress.get("scanned", 0))
+        total = max(scanned, int(progress.get("total", 0)))
+        elapsed = max(0.1, float(progress.get("elapsed", 0.1)))
+        speed = scanned / elapsed
+        remaining = max(0, total - scanned)
+        eta = int(remaining / speed) if speed > 0 else 0
+        phase = (
+            "Comparing safely"
+            if progress.get("phase") == "comparing"
+            else f"Scanning cluster {progress.get('cluster', 1)}/{progress.get('clusters', 1)}"
+        )
+        await status_msg.edit_text(
+            f"🧬 **Duplicate Report • {phase}**\n\n"
+            f"📨 Scanned  `{scanned:,} / {total:,}`\n"
+            f"⚙️ Speed    `{speed:,.0f} files/s`\n"
+            f"⌛ ETA      `{'Finishing…' if not remaining else f'{eta // 60}m {eta % 60}s'}`\n\n"
+            f"🔒 Report only • no files will be deleted"
+        )
+
+    try:
+        report = await db.scan_duplicate_report(show_progress)
+        dupes = report["groups"]
+        summary = report["summary"]
+
+        if not summary["exact_groups"] and not summary["probable_groups"]:
             await status_msg.edit_text(
-                "✅ **No duplicates found!** Your database is clean.",
+                f"✅ **Duplicate Report Complete**\n\n"
+                f"📨 Scanned: `{summary['scanned']:,}` files\n"
+                f"🧬 No exact or probable duplicates found.\n\n"
+                f"🔒 No files were changed.",
                 reply_markup=_BACK_BTN
             )
             return
 
-        _cached_dupes[admin_id] = dupes
-        await _show_dupes_page(status_msg, dupes, page=0)
+        _cached_dupes[admin_id] = report
+        await _show_dupes_page(status_msg, report, page=0)
 
-    except Exception as e:
+    except Exception as error:
+        reference = report_internal_error(logger, "duplicate_scan", error)
         await status_msg.edit_text(
-            f"❌ Duplicate scan failed: `{e}`",
+            f"❌ Duplicate scan failed. Reference: `{reference}`",
             reply_markup=_BACK_BTN
         )
 
 
-async def _show_dupes_page(msg_or_callback, dupes, page=0):
-    """Shows duplicate files as paginated inline buttons with delete-all option."""
+async def _show_dupes_page(msg_or_callback, report, page=0):
+    """Show a paginated, report-only duplicate summary."""
+    dupes = report["groups"]
+    summary = report["summary"]
     per_page = 8
     total = len(dupes)
     start = page * per_page
     end = min(start + per_page, total)
     page_dupes = dupes[start:end]
 
-    exact_count = sum(1 for d in dupes if d.get("type") == "exact")
-    fid_count   = sum(1 for d in dupes if d.get("type") == "file_id")
     total_pages = max(1, (total + per_page - 1) // per_page)
     text = (
-        f"🔄 **Duplicate Groups: {total}**\n"
-        f"_(🔴 {exact_count} name+size  •  🟠 {fid_count} file_id — "
-        f"Page {page+1}/{total_pages})_\n\n"
-        f"_Oldest copy is always kept. Only extras are deleted._\n\n"
+        f"🧬 **Duplicate Report • Page {page+1}/{total_pages}**\n\n"
+        f"📨 Scanned: `{summary['scanned']:,}` files\n"
+        f"🟠 Exact: `{summary['exact_groups']:,}` groups • "
+        f"`{summary['exact_extras']:,}` extra copies\n"
+        f"🟡 Probable: `{summary['probable_groups']:,}` groups • "
+        f"`{summary['probable_matches']:,}` matches\n\n"
+        f"🔒 **Report only. Nothing was deleted.**\n"
+        f"Language, quality, codec, size, season and episode variants are preserved.\n\n"
     )
 
     buttons = []
@@ -257,27 +280,13 @@ async def _show_dupes_page(msg_or_callback, dupes, page=0):
         name = dupe['name'][:35]
         count = dupe['count']
         dtype = dupe.get('type', 'exact')
-        type_icon = "🔴" if dtype == "exact" else "🟠"
-        # ids = list of IDs TO DELETE (keep_id already excluded by db layer)
-        delete_ids = dupe.get('ids', [])
-        ids_joined = ",".join(delete_ids[:10])  # max 10 in callback
-        extras = len(delete_ids)
+        type_icon = "🟠" if dtype == "exact" else "🟡"
         size_mb = dupe.get('size', 0) / (1024 * 1024)
         size_str = f"{size_mb:.0f}MB" if size_mb > 0 else ""
-        text += f"{type_icon} `{name[:30]}` — {count} copies  {size_str}\n"
-        if extras > 0:
-            buttons.append([
-                InlineKeyboardButton(
-                    f"🗑 Delete {extras} extra(s) — {name[:22]}",
-                    callback_data=f"fm_del_dupes#{ids_joined}"
-                )
-            ])
-
-    # Delete All button
-    buttons.append([InlineKeyboardButton(
-        "💣 Delete ALL Duplicates (Keep Oldest)",
-        callback_data="fm_delete_all_dupes"
-    )])
+        label = "copies" if dtype == "exact" else "possible matches"
+        text += f"{type_icon} `{name[:30]}` — {count} {label}  {size_str}\n"
+        if dupe.get("truncated"):
+            text += "  ℹ️ Only part of this large group is shown.\n"
 
     # Pagination
     nav = []
@@ -300,29 +309,21 @@ async def _show_dupes_page(msg_or_callback, dupes, page=0):
 
 
 @Client.on_callback_query(filters.regex(r"^fm_delete_all_dupes$") & filters.user(ADMIN_ID))
+async def fm_review_all_duplicates(client: Client, callback: CallbackQuery):
+    await callback.answer(
+        "Deletion is disabled in report-only mode. No files were changed.",
+        show_alert=True,
+    )
+
+
+@Client.on_callback_query(
+    filters.regex(r"^fm_delete_all_dupes_confirm$") & filters.user(ADMIN_ID)
+)
 async def fm_delete_all_dupes(client: Client, callback: CallbackQuery):
-    """Runs delete_duplicates_all() — keeps oldest copy of every duplicate group."""
-    await callback.answer("⏳ Running full duplicate purge...", show_alert=False)
-    try:
-        await callback.message.edit_text(
-            "⏳ **Purging all duplicates...**\n\n"
-            "This may take a few minutes on large databases.\n"
-            "Oldest copy of each file will be kept.",
-            reply_markup=_BACK_BTN
-        )
-        deleted = await db.delete_duplicates_all()
-        await callback.message.edit_text(
-            f"✅ **Duplicate Purge Complete!**\n\n"
-            f"🗑 Deleted: `{deleted:,}` duplicate files\n"
-            f"✔️ Oldest copy of each file preserved.",
-            reply_markup=_BACK_BTN
-        )
-        _cached_dupes.pop(callback.from_user.id, None)
-    except Exception as e:
-        await callback.message.edit_text(
-            f"❌ Purge failed: `{e}`",
-            reply_markup=_BACK_BTN
-        )
+    await callback.answer(
+        "Deletion is disabled in report-only mode. No files were changed.",
+        show_alert=True,
+    )
 
 
 # ── BULK DELETE BY PATTERN ────────────────────────────────────────────────────
@@ -406,8 +407,18 @@ async def fm_migrate_confirm(client: Client, callback: CallbackQuery):
         f"_(This runs in background — you'll be notified when done)_"
     )
     await callback.answer()
-    migrate_task = asyncio.create_task(_run_migration(client, status, from_idx, to_idx))
-    migrate_task.add_done_callback(lambda t: _log_task_crash(t, client, f"cluster_migration({from_idx}->{to_idx})"))
+    try:
+        supervisor.spawn(
+            _run_migration(client, status, from_idx, to_idx),
+            key=f"maintenance:migration:{from_idx}:{to_idx}",
+            owner=f"admin:{callback.from_user.id}",
+            resources=(
+                "movie-catalog", f"cluster:{from_idx}", f"cluster:{to_idx}"
+            ),
+            drain_on_shutdown=True,
+        )
+    except TaskConflict as exc:
+        await status.edit_text(f"⚠️ **Migration not started:** `{exc}`")
 
 
 async def _run_migration(client, status_msg, from_idx, to_idx):
@@ -427,8 +438,11 @@ async def _run_migration(client, status_msg, from_idx, to_idx):
                 f"Cluster {from_idx+1} → Cluster {to_idx+1}",
                 reply_markup=_BACK_BTN
             )
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Migration error: `{e}`", reply_markup=_BACK_BTN)
+    except Exception as error:
+        reference = report_internal_error(logger, "file_migration", error)
+        await status_msg.edit_text(
+            f"❌ Migration error. Reference: `{reference}`", reply_markup=_BACK_BTN
+        )
 
 
 # ── FILES BY LANGUAGE ─────────────────────────────────────────────────────────
@@ -461,8 +475,12 @@ async def fm_by_language(client: Client, callback: CallbackQuery):
         text += f"\n📁 **Total Tagged:** `{total:,}`"
 
         await callback.message.edit_text(text, reply_markup=_BACK_BTN)
-    except Exception as e:
-        await callback.message.edit_text(f"❌ Error: `{e}`", reply_markup=_BACK_BTN)
+    except Exception as error:
+        reference = report_internal_error(logger, "language_counts", error)
+        await callback.message.edit_text(
+            f"❌ Could not count languages. Reference: `{reference}`",
+            reply_markup=_BACK_BTN,
+        )
 
 
 # ── TOP MISSING FILES ─────────────────────────────────────────────────────────
@@ -482,20 +500,29 @@ async def fm_missing_files(client: Client, callback: CallbackQuery):
             return
 
         buttons = []
-        text = "📋 **Top Missing Files** _(most searched, not in DB)_\n\n"
+        text = "📋 <b>Top Missing Files</b> <i>(most searched, not in DB)</i>\n\n"
         for i, entry in enumerate(missed, 1):
-            text += f"{i}. `{entry.get('original', entry['_id'])}` — **{entry['count']}x**\n"
+            title = entry.get("original", entry["_id"])
+            text += f"{i}. <code>{_html(title)}</code> — <b>{entry['count']}x</b>\n"
             buttons.append([
                 InlineKeyboardButton(
-                    f"✅ Mark Fulfilled — {entry.get('original', entry['_id'])[:20]}",
+                    f"✅ Mark Fulfilled — {title[:20]}",
                     callback_data=f"fm_clear_missed#{entry['_id']}"
                 )
             ])
 
         buttons.append([InlineKeyboardButton("🔙 Back", callback_data="file_manager_menu")])
-        await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
-    except Exception as e:
-        await callback.message.edit_text(f"❌ Error: `{e}`", reply_markup=_BACK_BTN)
+        await callback.message.edit_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as error:
+        reference = report_internal_error(logger, "missing_files", error)
+        await callback.message.edit_text(
+            f"❌ Could not load missing files. Reference: `{reference}`",
+            reply_markup=_BACK_BTN,
+        )
 
 
 @Client.on_callback_query(filters.regex(r"^fm_clear_missed#") & filters.user(ADMIN_ID))

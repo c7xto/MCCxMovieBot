@@ -4,9 +4,25 @@ import urllib.parse
 import time
 import secrets
 from dotenv import load_dotenv
+from plugins.access_policy import authorize_user_action, enforce_user_action
 from plugins.filter import route_menu
 from plugins.search_indicator import show_search_indicator, remove_search_indicator
-from utils import _no_preview, _html, callback_data, HELP_STEPS_EN, HELP_FOOTER_EN
+from plugins.workload import (
+    WorkloadRejected,
+    delivery_guard,
+    enforce_search_rate_limits,
+    search_slot,
+    validate_search_query,
+)
+from plugins.telegram_retry import DELIVERY_RETRY, telegram_call
+from utils import (
+    _no_preview,
+    _html,
+    callback_data,
+    HELP_STEPS_EN,
+    HELP_FOOTER_EN,
+    html_user_mention,
+)
 from pyrogram import Client, filters
 from pyrogram.errors import (
     FileIdInvalid, FileReferenceEmpty, FileReferenceExpired,
@@ -161,17 +177,41 @@ def _build_start_ui(config, mention, total_files, bot_username, update_link, gro
     return text, InlineKeyboardMarkup(buttons)
 
 
+async def _show_workload_rejection(client, status_msg, message):
+    if getattr(status_msg, "sticker", None):
+        chat_id = status_msg.chat.id
+        await remove_search_indicator(status_msg)
+        return await client.send_message(chat_id, message)
+    return await status_msg.edit_text(message)
+
+
 async def _execute_search(client, status_msg, query: str, config: dict, user_id=None, first_name=""):
     """Runs a search and renders page 0 of results into status_msg.
     Shared by every /start deep-link search entry point (search_, req_
     fulfillment redirects, etc.) so they stay in sync with one implementation.
     """
+    access = await authorize_user_action(user_id, "search", config)
+    if not access.allowed:
+        await status_msg.edit_text(access.message or "Action denied.")
+        return
+    config = access.config
+
+    try:
+        query = validate_search_query(query)
+        await enforce_search_rate_limits(user_id)
+    except WorkloadRejected as exc:
+        return await _show_workload_rejection(client, status_msg, exc.public_message)
+
     try:
         await client.send_chat_action(status_msg.chat.id, ChatAction.TYPING)
     except Exception:
         pass
 
-    results = await db.get_search_results(query)
+    try:
+        async with search_slot("start_search"):
+            results = await db.get_search_results(query)
+    except WorkloadRejected as exc:
+        return await _show_workload_rejection(client, status_msg, exc.public_message)
 
     if not results:
         lang = await db.get_user_language(user_id) if user_id is not None else "en"
@@ -213,6 +253,8 @@ async def _handle_file_link(client, message, file_obj_id: str):
     """Deep-link payload: file_<obj_id> — direct file delivery (mainly the
     group-search "Open in PM" buttons), gated by the same unified
     Verification Gates check as the in-DM sendfile# button."""
+    if not (await enforce_user_action(message, "file_delivery")).allowed:
+        return
     file_data = await db.get_file(file_obj_id)
     if not file_data:
         return await message.reply_text(
@@ -224,17 +266,33 @@ async def _handle_file_link(client, message, file_obj_id: str):
     if not await check_verification_gates(client, message, file_obj_id):
         return
 
-    config = await db.get_config()
+    access = await enforce_user_action(message, "file_delivery")
+    if not access.allowed:
+        return
+    guard = delivery_guard(message.from_user.id, file_obj_id)
+    try:
+        await guard.__aenter__()
+    except WorkloadRejected as exc:
+        return await message.reply_text(exc.public_message)
+    config = access.config
     delete_seconds = int(config.get("auto_delete_time", 300))
     delete_minutes = delete_seconds // 60
 
     from plugins.filter import _auto_delete_file, _build_caption
     try:
-        sent = await client.send_cached_media(
-            chat_id=message.chat.id,
-            file_id=file_data["file_id"],
-            caption=_build_caption(config, file_data, delete_minutes, client.me.username),
-            parse_mode=ParseMode.HTML
+        sent = await telegram_call(
+            lambda: client.send_cached_media(
+                chat_id=message.chat.id,
+                file_id=file_data["file_id"],
+                caption=_build_caption(
+                    config, file_data, delete_minutes, client.me.username
+                ),
+                parse_mode=ParseMode.HTML,
+            ),
+            route="file_delivery_deep_link",
+            policy=DELIVERY_RETRY,
+            retry_safe=True,
+            idempotency_key=f"{message.from_user.id}:{file_obj_id}",
         )
         await _auto_delete_file(sent, file_data['file_name'], client.me.username, delete_seconds)
     except (FileIdInvalid, FileReferenceEmpty, FileReferenceExpired,
@@ -247,6 +305,8 @@ async def _handle_file_link(client, message, file_obj_id: str):
     except Exception as exc:
         logger.error("Deep-linked file delivery failed for %s: %s", file_data["file_id"], exc)
         await message.reply_text(f"{ICON_FAIL} Could not send this file right now. Please try again.")
+    finally:
+        await guard.__aexit__(None, None, None)
 
 
 async def _handle_request_link(message, raw_query: str):
@@ -285,6 +345,8 @@ async def _handle_search_payload(client, message, config, payload: str):
 async def start_handler(client: Client, message: Message):
     # 1. Fetch live config from Database
     config = await db.get_config()
+    if not (await enforce_user_action(message, "start", config)).allowed:
+        return
     START_MEDIA = config.get("start_media", "https://files.catbox.moe/wvdeci.mp4")
     UPDATE_CHANNEL_LINK = config.get("update_channel", "")
     MAIN_GROUP_LINK = config.get("main_group", "")
@@ -301,10 +363,11 @@ async def start_handler(client: Client, message: Message):
             user_count = await db.get_user_count()
             await client.send_message(
                 LOG_CHANNEL_ID,
-                f"🆕 **New User Alert**\n\n"
-                f"👤 **User:** {message.from_user.mention}\n"
-                f"🆔 **ID:** `{message.from_user.id}`\n"
-                f"📊 **Total Users:** `{user_count:,}`"
+                "🆕 <b>New User Alert</b>\n\n"
+                f"👤 <b>User:</b> {html_user_mention(message.from_user)}\n"
+                f"🆔 <b>ID:</b> <code>{message.from_user.id}</code>\n"
+                f"📊 <b>Total Users:</b> <code>{user_count:,}</code>",
+                parse_mode=ParseMode.HTML,
             )
         except Exception:
             pass

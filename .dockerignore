@@ -1,6 +1,11 @@
 .git
 .github
 .env
+*.session
+*.session-journal
+runtime/
+.deployed_sha
+.deployed_files.json
 .venv
 __pycache__
 *.py[cod]

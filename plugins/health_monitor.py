@@ -2,20 +2,59 @@
 Background tasks started from bot.py:
   - Health monitor — pings clusters every 10 min, alerts on issues
 """
-import os
 import asyncio
-import logging
-import time
 import datetime
+import logging
+import os
+import time
+from pathlib import Path
+
+from pyrogram import Client, filters
 from pyrogram.errors import FloodWait
+from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from database.db import db
 from plugins.filter import send_smart_log
+from plugins.workload import workload_snapshot
+from plugins.telegram_retry import (
+    BACKGROUND_RETRY,
+    INTERACTIVE_RETRY,
+    telegram_call,
+    telegram_retry_snapshot,
+)
+from utils import ADMIN_ID, report_internal_error
 
 logger = logging.getLogger(__name__)
 
 # Tracks last alert per issue so we don't spam the log channel
 _last_alert = {}
 _ALERT_COOLDOWN = 3600  # 1 hour between repeat alerts for same issue
+MAX_DELETION_ATTEMPTS = 8
+_DELETION_ALREADY_GONE_ERRORS = {
+    "MessageEmpty",
+    "MessageIdInvalid",
+    "MsgIdInvalid",
+}
+_DELETION_PERMANENT_ERRORS = {
+    "ChannelPrivate",
+    "ChatAdminRequired",
+    "MessageDeleteForbidden",
+    "MessageTooOld",
+    "PeerIdInvalid",
+}
+
+
+def classify_deletion_error(error: Exception) -> str:
+    names = {cls.__name__ for cls in type(error).__mro__}
+    if names & _DELETION_ALREADY_GONE_ERRORS:
+        return "already_gone"
+    if names & _DELETION_PERMANENT_ERRORS:
+        return "permanent"
+    return "transient"
+
+
+def deletion_retry_delay(attempts: int, retry_after: int | None = None) -> int:
+    delay = min(6 * 3600, 30 * (2 ** min(max(0, attempts), 10)))
+    return max(delay, max(0, int(retry_after or 0)))
 
 
 async def _should_alert(key: str) -> bool:
@@ -30,23 +69,6 @@ async def _should_alert(key: str) -> bool:
 async def _clear_alert(key: str):
     """Clears an alert key so recovery is reported even within cooldown."""
     _last_alert.pop(key, None)
-
-
-def _log_task_crash(task: asyncio.Task, client, label: str):
-    """Attach via task.add_done_callback(...) on any fire-and-forget
-    asyncio.create_task(...) so an unhandled exception is surfaced to the
-    log channel instead of dying silently — by default it's only visible
-    via asyncio's own "Task exception was never retrieved" stderr log,
-    which nobody is watching."""
-    if task.cancelled():
-        return
-    exc = task.exception()
-    if exc:
-        logger.error(f"{label} crashed: {exc}")
-        asyncio.create_task(send_smart_log(
-            client,
-            f"💥 **#BackgroundTaskCrashed**\n\n🏷 **Task:** `{label}`\n🛑 **Error:** `{exc}`"
-        ))
 
 
 async def check_all_channels(client, config):
@@ -70,8 +92,17 @@ async def check_all_channels(client, config):
                     "text": f"{label}: ⚪ Not configured"}
         try:
             ch = int(ch_id) if str(ch_id).lstrip('-').isdigit() else str(ch_id)
-            await client.get_chat(ch)
-            member = await client.get_chat_member(ch, client.me.id)
+            async def _read_channel():
+                await client.get_chat(ch)
+                return await client.get_chat_member(ch, client.me.id)
+
+            member = await telegram_call(
+                _read_channel,
+                route="channel_health",
+                policy=INTERACTIVE_RETRY,
+                retry_safe=True,
+                idempotency_key=f"channel-health:{ch}",
+            )
             status = member.status.name
             if status == "ADMINISTRATOR":
                 return {"label": label, "ok": True, "fix": fix,
@@ -83,12 +114,14 @@ async def check_all_channels(client, config):
                 return {"label": label, "ok": False, "fix": fix,
                         "text": f"{label}: ❓ Status `{status}` — `{ch_id}`"}
         except FloodWait as e:
-            await asyncio.sleep(e.value)
             return {"label": label, "ok": False, "fix": fix,
-                    "text": f"{label}: ⏳ Rate-limited, retry health check — `{ch_id}`"}
-        except Exception as e:
+                    "text": f"{label}: ⏳ Rate-limited ({e.value}s), retry later — `{ch_id}`"}
+        except Exception as error:
+            reference = report_internal_error(
+                logger, "channel_health", error, channel_id=ch_id
+            )
             return {"label": label, "ok": False, "fix": fix,
-                    "text": f"{label}: ❌ No access — `{ch_id}`\n  _({str(e)[:60]})_"}
+                    "text": f"{label}: ❌ No access — `{ch_id}`\n  Reference: `{reference}`"}
 
     results.append(await _check("📡 Log Channel",    config.get("log_channel"), fix="edit_logchannel"))
     results.append(await _check("📢 Update Channel", config.get("update_channel_id"), fix="edit_updatechid"))
@@ -174,10 +207,10 @@ async def check_known_issues(client, config):
         pass
 
     # ── TMDB key ───────────────────────────────────────────────────────────────
-    if not os.getenv("TMDB_API_KEY"):
+    if not (os.getenv("TMDB_BEARER_TOKEN") or os.getenv("TMDB_API_READ_TOKEN")):
         findings.append({
             "label": "TMDB", "ok": None,
-            "text": "ℹ️ `TMDB_API_KEY` is not set — new-upload announcements will post without a poster/rating."
+            "text": "ℹ️ `TMDB_BEARER_TOKEN` is not set — new-upload announcements will post without a poster/rating."
         })
 
     if not findings:
@@ -197,7 +230,25 @@ async def run_health_monitor(client):
     while True:
         await asyncio.sleep(600)  # 10 minutes
 
+        ready_file = Path(os.getenv("SESSION_WORKDIR", "runtime")) / "ready"
+        try:
+            await asyncio.to_thread(ready_file.touch)
+        except OSError as exc:
+            logger.warning("Could not refresh readiness marker: %s", type(exc).__name__)
+
         issues = []
+        logger.info("workload_metrics %s", workload_snapshot())
+        logger.info("telegram_retry_metrics %s", telegram_retry_snapshot())
+        try:
+            logger.info(
+                "notification_outbox_depth %s",
+                await db.notification_outbox_depth(),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not read notification outbox depth: %s",
+                type(exc).__name__,
+            )
 
         # ── 1. Ping all clusters ──────────────────────────────────────────────
         for i, db_instance in enumerate(db.dbs):
@@ -211,14 +262,17 @@ async def run_health_monitor(client):
                         client,
                         f"✅ **#ClusterRecovered**\n\nCluster {i+1} is back online."
                     )
-            except Exception as e:
-                issues.append(f"Cluster {i+1} unreachable: {e}")
+            except Exception as error:
+                reference = report_internal_error(
+                    logger, "cluster_health", error, cluster=i + 1
+                )
+                issues.append(f"Cluster {i+1} unreachable ({reference})")
                 if await _should_alert(key):
                     await send_smart_log(
                         client,
                         f"🚨 **#HealthAlert — Cluster {i+1} Down**\n\n"
                         f"MongoDB Cluster {i+1} is not responding.\n"
-                        f"Error: `{str(e)[:100]}`"
+                        f"Reference: `{reference}`"
                     )
 
         # ── 2. Check for stale indexer tasks ──────────────────────────────────
@@ -241,6 +295,37 @@ async def run_health_monitor(client):
         except Exception:
             pass
 
+        # Repair registry location metadata independently of ingestion. A
+        # successful physical insert must never be repeated merely because
+        # its best-effort location update failed.
+        key = "registry_reconciliation"
+        try:
+            registry_stats = await db.reconcile_registry_locations(limit=250)
+            if registry_stats["repaired"]:
+                logger.info(
+                    "Registry reconciliation repaired %s/%s checked entries",
+                    registry_stats["repaired"],
+                    registry_stats["checked"],
+                )
+            if registry_stats["unresolved"]:
+                issues.append(
+                    f"Registry entries unresolved: {registry_stats['unresolved']}"
+                )
+                if await _should_alert(key):
+                    await send_smart_log(
+                        client,
+                        f"⚠️ **#HealthAlert — Registry Reconciliation**\n\n"
+                        f"`{registry_stats['unresolved']}` of "
+                        f"`{registry_stats['checked']}` checked registry entries "
+                        f"could not be matched to a physical file.",
+                    )
+            else:
+                _last_alert.pop(key, None)
+        except Exception as exc:
+            logger.warning(
+                "Registry reconciliation failed: %s", type(exc).__name__
+            )
+
         # Heartbeat removed — was noise in log channel
 
 
@@ -255,9 +340,89 @@ async def run_cache_reaper():
     while True:
         await asyncio.sleep(300)
         try:
-            db._search_cache.purge(db._search_cache.default_ttl)
+            db.purge_caches()
+            logger.info("cache_metrics %s", db.cache_metrics())
         except Exception as e:
             logger.warning(f"Cache reaper error: {e}")
+
+
+async def _dead_letter_deletion(client, job, error, *, permanent):
+    dead_letter_id = await db.dead_letter_deletion(job, error, permanent)
+    logger.error(
+        "Deletion dead-lettered job=%s chat=%s message=%s error_type=%s",
+        dead_letter_id,
+        job.get("chat_id"),
+        job.get("message_id"),
+        type(error).__name__,
+    )
+    await send_smart_log(
+        client,
+        "🚨 **#DeletionDeadLetter**\n\n"
+        f"Chat: `{job.get('chat_id')}`\n"
+        f"Message: `{job.get('message_id')}`\n"
+        f"Attempts: `{int(job.get('attempts', 0)) + 1}`\n"
+        f"Error: `{type(error).__name__}`\n\n"
+        "The job was retained and can be retried below.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "Retry deletion",
+                callback_data=f"retry_deletion#{dead_letter_id}",
+            )
+        ]]),
+    )
+    return "dead_lettered"
+
+
+async def process_deletion_job(client, job):
+    """Process one durable deletion job and retain every terminal failure."""
+    try:
+        await telegram_call(
+            lambda: client.delete_messages(job["chat_id"], job["message_id"]),
+            route="scheduled_deletion",
+            policy=BACKGROUND_RETRY,
+            retry_safe=True,
+            idempotency_key=f"delete:{job['chat_id']}:{job['message_id']}",
+        )
+        await db.complete_deletion(job["_id"])
+        return "completed"
+    except FloodWait as error:
+        attempts = int(job.get("attempts", 0))
+        if attempts + 1 >= MAX_DELETION_ATTEMPTS:
+            return await _dead_letter_deletion(
+                client, job, error, permanent=False
+            )
+        await db.retry_deletion(
+            job["_id"], deletion_retry_delay(attempts, error.value)
+        )
+        return "retry_scheduled"
+    except Exception as error:
+        classification = classify_deletion_error(error)
+        if classification == "already_gone":
+            await db.complete_deletion(job["_id"])
+            return "completed_absent"
+        attempts = int(job.get("attempts", 0))
+        if classification == "permanent" or attempts + 1 >= MAX_DELETION_ATTEMPTS:
+            return await _dead_letter_deletion(
+                client,
+                job,
+                error,
+                permanent=classification == "permanent",
+            )
+        await db.retry_deletion(job["_id"], deletion_retry_delay(attempts))
+        return "retry_scheduled"
+
+
+@Client.on_callback_query(
+    filters.regex(r"^retry_deletion#") & filters.user(ADMIN_ID)
+)
+async def retry_dead_letter_callback(client: Client, callback: CallbackQuery):
+    job_id = callback.data.split("#", 1)[1]
+    retried = await db.retry_dead_letter_deletion(job_id)
+    if not retried:
+        await callback.answer("Deletion job is missing or was already retried.", show_alert=True)
+        return
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer("Deletion queued for retry.", show_alert=True)
 
 
 async def run_deletion_worker(client):
@@ -270,21 +435,22 @@ async def run_deletion_worker(client):
                 continue
             for job in jobs:
                 try:
-                    await client.delete_messages(job["chat_id"], job["message_id"])
-                    await db.complete_deletion(job["_id"])
-                except FloodWait as e:
-                    await db.retry_deletion(job["_id"], max(5, e.value))
-                except Exception as e:
-                    if job.get("attempts", 0) >= 2:
-                        logger.warning(
-                            "Dropping deletion job %s after repeated failure: %s",
-                            job.get("_id"), e,
+                    await process_deletion_job(client, job)
+                except Exception as error:
+                    logger.error(
+                        "Deletion job processing failed without state loss job=%s: %s",
+                        job.get("_id"),
+                        error,
+                    )
+                    try:
+                        await db.retry_deletion(
+                            job["_id"],
+                            deletion_retry_delay(int(job.get("attempts", 0))),
                         )
-                        await db.complete_deletion(job["_id"])
-                    else:
-                        await db.retry_deletion(job["_id"], 60)
+                    except Exception:
+                        logger.exception(
+                            "Could not defer deletion job after processing failure"
+                        )
         except Exception as e:
             logger.error("Deletion worker iteration failed: %s", e)
             await asyncio.sleep(10)
-
-

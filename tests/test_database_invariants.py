@@ -14,6 +14,7 @@ from database.db import (
     normalized_search_identity,
     primary_search_identity,
     rank_search_results,
+    search_tokens_for_name,
     suggest_search_titles,
 )
 from utils import callback_data
@@ -89,6 +90,16 @@ def test_batch_deduplication_keeps_first_document():
     assert duplicates == 2
 
 
+def test_batch_deduplication_uses_stable_content_identity_when_available():
+    files, duplicates = deduplicate_file_batch([
+        {"file_id": "bot-a", "file_unique_id": "same-content", "file_name": "A"},
+        {"file_id": "bot-b", "file_unique_id": "same-content", "file_name": "A copy"},
+        {"file_id": "bot-c", "file_unique_id": "different", "file_name": "C"},
+    ])
+    assert [item["file_id"] for item in files] == ["bot-a", "bot-c"]
+    assert duplicates == 1
+
+
 def test_filename_normalization_removes_promotional_noise():
     assert normalize_file_name("[Site]_Movie.Name.2026_@channel.mkv") == "Site Movie Name 2026 mkv"
 
@@ -97,6 +108,12 @@ def test_search_identity_is_casefolded_and_extension_free():
     assert normalized_search_identity("[Site]_Movie.Name.2026_@channel.MKV") == (
         "site movie name 2026"
     )
+
+
+def test_search_tokens_are_bounded_casefolded_and_unique():
+    assert search_tokens_for_name("Movie.Movie.2026.MKV") == [
+        "movie", "2026", "mkv"
+    ]
 
 
 def test_search_deduplication_keeps_real_size_variants():
@@ -199,76 +216,85 @@ async def test_empty_registry_with_existing_files_requires_migration():
 
 
 @pytest.mark.asyncio
-async def test_multiword_search_uses_reference_ordered_pattern():
+async def test_multiword_search_uses_indexed_tokens():
     database = bare_database()
-    database._regex_search = AsyncMock(return_value=[
+    database._indexed_token_search = AsyncMock(return_value=[
         {"file_id": "exact", "file_name": "Reacher S01E03 2022 1080p"},
     ])
 
     results = await database.get_search_results("reacher 2022", max_results=10)
     assert [doc["file_id"] for doc in results] == ["exact"]
-    database._regex_search.assert_awaited_once()
-    regex = database._regex_search.await_args.args[0]
-    assert regex.search("Reacher S01E03 2022 1080p")
-    assert not regex.search("2022 Reacher S01E03 1080p")
-    assert not regex.search("The Preacher 2022 720p")
+    database._indexed_token_search.assert_awaited_once()
+    assert database._indexed_token_search.await_args.args[0] == [["reacher", "2022"]]
 
 
 @pytest.mark.asyncio
 async def test_multiword_search_does_not_relax_title_words(monkeypatch):
     monkeypatch.setattr("database.db._SEARCH_TITLE_CATALOG", ())
     database = bare_database()
-    database._regex_search = AsyncMock(return_value=[])
+    database._indexed_token_search = AsyncMock(return_value=[])
 
     results = await database.get_search_results("reacher nonsense", max_results=10)
     assert results == []
-    database._regex_search.assert_awaited_once()
+    database._indexed_token_search.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_missing_metadata_retries_with_reference_title_search():
     database = bare_database()
-    database._regex_search = AsyncMock(side_effect=[
+    database._indexed_token_search = AsyncMock(side_effect=[
         [],
         [{"file_id": "series", "file_name": "Reacher S01E01 720p"}],
     ])
 
     results = await database.get_search_results("reacher 2022", max_results=10)
     assert [doc["file_id"] for doc in results] == ["series"]
-    assert database._regex_search.await_count == 2
-    fallback_regex = database._regex_search.await_args_list[1].args[0]
-    assert fallback_regex.search("Reacher S01E01 720p")
-    assert not fallback_regex.search("The Preacher 2022")
+    assert database._indexed_token_search.await_count == 2
+    assert database._indexed_token_search.await_args_list[1].args[0] == [["reacher"]]
 
 
 @pytest.mark.asyncio
 async def test_reference_search_passes_result_limit_and_offset_to_database():
     database = bare_database()
-    database._regex_search = AsyncMock(return_value=[])
+    database._indexed_token_search = AsyncMock(return_value=[])
 
     await database.get_search_results("reacher 2022", max_results=10, offset=20)
-    assert database._regex_search.await_args.args[1:] == (80, 20)
+    assert database._indexed_token_search.await_args.args[1:] == (80, 20)
 
 
 @pytest.mark.asyncio
-async def test_strict_search_does_not_match_inside_another_word():
+async def test_strict_search_uses_an_exact_index_token():
     database = bare_database()
-    database._regex_search = AsyncMock(return_value=[
+    database._indexed_token_search = AsyncMock(return_value=[
         {"file_id": "exact", "file_name": "Reacher S01E01 720p"}
     ])
 
     await database.get_search_results("reacher", max_results=1)
 
-    regex = database._regex_search.await_args.args[0]
-    assert regex.search("Reacher 1080p")
-    assert not regex.search("The Preacher 720p")
+    assert database._indexed_token_search.await_args.args[0] == [["reacher"]]
+
+
+@pytest.mark.asyncio
+async def test_legacy_library_uses_compatible_reference_search_without_migration():
+    database = bare_database()
+    database._search_tokens_complete = False
+    database._legacy_search_results = AsyncMock(return_value=[
+        {"file_id": "legacy", "file_name": "Aavesham 2024 Malayalam"}
+    ])
+    database._indexed_token_search = AsyncMock()
+
+    results = await database.get_search_results("aavesham 2024")
+
+    assert [doc["file_id"] for doc in results] == ["legacy"]
+    database._legacy_search_results.assert_awaited_once()
+    database._indexed_token_search.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_repeated_query_uses_short_lived_result_cache():
     database = bare_database()
     database._query_cache = _SearchCache(maxsize=4, default_ttl=120)
-    database._regex_search = AsyncMock(return_value=[
+    database._indexed_token_search = AsyncMock(return_value=[
         {"file_id": "cached", "file_name": "KGF Chapter 1 2018 720p"}
     ])
 
@@ -276,23 +302,24 @@ async def test_repeated_query_uses_short_lived_result_cache():
     second = await database.get_search_results("KGF")
 
     assert first == second
-    database._regex_search.assert_awaited_once()
+    database._indexed_token_search.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_catalog_typo_correction_runs_precise_corrected_search(monkeypatch):
     monkeypatch.setattr("database.db._SEARCH_TITLE_CATALOG", ("war machine",))
     database = bare_database()
-    database._regex_search = AsyncMock(side_effect=[
+    database._indexed_token_search = AsyncMock(side_effect=[
         [],
         [{"file_id": "movie", "file_name": "War Machine 2026 1080p"}],
     ])
 
     results = await database.get_search_results("war mashine", max_results=10)
     assert [doc["file_id"] for doc in results] == ["movie"]
-    assert database._regex_search.await_count == 2
-    corrected_regex = database._regex_search.await_args_list[1].args[0]
-    assert corrected_regex.search("War Machine 2026")
+    assert database._indexed_token_search.await_count == 2
+    assert database._indexed_token_search.await_args_list[1].args[0] == [
+        ["war", "machine"]
+    ]
 
 
 @pytest.mark.asyncio
@@ -311,21 +338,33 @@ async def test_capacity_uses_whole_cluster_and_ignores_system_databases():
 
 
 @pytest.mark.asyncio
-async def test_existing_shard_indexes_are_verified_without_writes():
+async def test_existing_shard_indexes_are_verified_without_shard_writes():
     database = bare_database()
     collection = SimpleNamespace(
         index_information=AsyncMock(return_value={
             "_id_": {"key": [("_id", 1)]},
             "file_name_1": {"key": [("file_name", 1)]},
             "file_id_1": {"key": [("file_id", 1)]},
+            "search_tokens_1": {"key": [("search_tokens", 1)]},
         }),
         create_index=AsyncMock(),
     )
     database.file_cols = [collection]
     database.main_db = None
     database.deletion_col = None
+    database.deletion_dead_letter_col = None
+    database.broadcast_col = None
     database.groups_col = None
-    database.registry_col = None
+    database.registry_col = SimpleNamespace(
+        index_information=AsyncMock(return_value={
+            "file_id_1": {"key": [("file_id", 1)], "unique": True},
+            "movie_id_1": {"key": [("movie_id", 1)]},
+        }),
+        create_index=AsyncMock(),
+    )
+    database.rate_limits_col = SimpleNamespace(create_index=AsyncMock())
+    database.action_leases_col = SimpleNamespace(create_index=AsyncMock())
+    database.announcement_col = SimpleNamespace(create_index=AsyncMock())
 
     await database.ensure_indexes()
 

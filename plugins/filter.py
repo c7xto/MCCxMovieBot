@@ -4,11 +4,10 @@ import time
 import secrets
 import asyncio
 import logging
-from collections import OrderedDict
 from urllib.parse import quote
 from dotenv import load_dotenv
 from pyrogram.errors import (
-    MessageNotModified, FloodWait, UserNotParticipant,
+    MessageNotModified,
     FileIdInvalid, FileReferenceEmpty, FileReferenceExpired,
     FileReferenceInvalid, MediaEmpty, MediaInvalid,
 )
@@ -18,21 +17,33 @@ from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 )
 from database.db import db
+from plugins.access_policy import enforce_user_action
 from plugins.req_fsub import check_verification_gates
 from plugins.search_indicator import show_search_indicator, remove_search_indicator
+from plugins.workload import (
+    WorkloadRejected,
+    delivery_guard,
+    enforce_search_rate_limits,
+    search_slot,
+    validate_search_query,
+)
+from plugins.telegram_retry import DELIVERY_RETRY, INTERACTIVE_RETRY, telegram_call
+from plugins.task_supervisor import TaskConflict, supervisor
 from utils import (
-    is_subscribed, is_subscribed_join_only, send_fsub_message, _parse_fsub_entry,
-    ADMIN_ID, _no_preview, _html, callback_data,
+    get_subscription_status_by_id, send_fsub_message, _parse_fsub_entry,
+    _no_preview, _html, callback_data, html_user_mention,
+)
+from verification import (
+    VerificationResult,
+    VerificationStatus,
+    check_channel_membership,
+    verification_unavailable_message,
 )
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
 IGNORE_WORDS = {"hi", "hello", "bro", "pls", "plz", "bot", "help", "admin", "sir"}
-
-_COOLDOWN_MAX = 10000
-USER_SEARCH_COOLDOWN = OrderedDict()  # LRU: oldest entry is first
-COOLDOWN_TIME = 2
 
 LANGUAGES = ["Malayalam", "Tamil", "Telugu", "Hindi", "English", "Kannada", "Dual Audio", "Multi Audio"]
 QUALITIES  = ["4K", "1080p", "720p", "480p", "HDRip", "WEB-DL", "WEBRip", "BluRay", "PreDVD", "CAM", "HD Rip"]
@@ -43,12 +54,20 @@ LANG_EMOJI = {
     "Dual Audio": "🎧", "Multi Audio": "🎵", "Other": "🌐"
 }
 
-async def send_smart_log(client, text):
+async def send_smart_log(client, text, reply_markup=None, parse_mode=None):
     try:
         config   = await db.get_config()
         log_chat = config.get("log_channel", 0)
         if log_chat:
-            await client.send_message(log_chat, text, **_no_preview())
+            options = _no_preview()
+            if parse_mode is not None:
+                options["parse_mode"] = parse_mode
+            await client.send_message(
+                log_chat,
+                text,
+                reply_markup=reply_markup,
+                **options,
+            )
     except Exception:
         pass
 
@@ -654,12 +673,26 @@ async def _render_results_view(client, message, session_id: str, page: int, data
         if is_media_msg:
             chat_id = message.chat.id
             await message.delete()
-            return await client.send_message(
-                chat_id, caption, reply_markup=markup,
-                parse_mode=ParseMode.HTML, **_no_preview()
+            return await telegram_call(
+                lambda: client.send_message(
+                    chat_id, caption, reply_markup=markup,
+                    parse_mode=ParseMode.HTML, **_no_preview()
+                ),
+                route="private_search_results_send",
+                policy=INTERACTIVE_RETRY,
+                retry_safe=True,
+                idempotency_key=f"search-results:{chat_id}:{session_id}:{page}",
             )
         else:
-            await message.edit_text(text=caption, reply_markup=markup, parse_mode=ParseMode.HTML)
+            await telegram_call(
+                lambda: message.edit_text(
+                    text=caption, reply_markup=markup, parse_mode=ParseMode.HTML
+                ),
+                route="private_search_results_edit",
+                policy=INTERACTIVE_RETRY,
+                retry_safe=True,
+                idempotency_key=f"search-edit:{message.chat.id}:{message.id}:{page}",
+            )
             return message
     except MessageNotModified:
         return message
@@ -692,40 +725,19 @@ route_menu = show_results
 async def auto_filter(client: Client, message: Message, manual_query=None):
     user_id = message.from_user.id
 
-    if await db.is_banned(user_id):
-        return await message.reply_text("🚫 **You are banned from using this bot.**", reply_parameters=None)
+    access = await enforce_user_action(message, "search")
+    if not access.allowed:
+        return
+    config = access.config
 
-    config = await db.get_config()
-    if config.get("maintenance_mode") and user_id not in ADMIN_ID:
+    subscription = await get_subscription_status_by_id(client, user_id, config)
+    if subscription.status is VerificationStatus.INDETERMINATE:
         return await message.reply_text(
-            config.get("maintenance_message", "🔧 Bot is under maintenance. Back soon!"),
-            reply_parameters=None
+            verification_unavailable_message(subscription), reply_parameters=None
         )
-
-    if not await is_subscribed_join_only(client, message):
+    if subscription.status is VerificationStatus.DENY:
         await send_fsub_message(client, message)
         return
-
-    current_time = time.time()
-    if user_id in USER_SEARCH_COOLDOWN:
-        passed = current_time - USER_SEARCH_COOLDOWN[user_id]
-        USER_SEARCH_COOLDOWN.move_to_end(user_id)
-        if passed < COOLDOWN_TIME:
-            warning = await message.reply_text(
-                f"⏳ Wait `{int(COOLDOWN_TIME - passed) + 1}s` before searching again.",
-                reply_parameters=None
-            )
-            await asyncio.sleep(2)
-            try:
-                await warning.delete()
-            except Exception:
-                pass
-            return
-
-    if len(USER_SEARCH_COOLDOWN) >= _COOLDOWN_MAX:
-        USER_SEARCH_COOLDOWN.popitem(last=False)  # evict least-recently-used
-    USER_SEARCH_COOLDOWN[user_id] = current_time
-    USER_SEARCH_COOLDOWN.move_to_end(user_id)
 
     if manual_query:
         query = manual_query
@@ -745,10 +757,20 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
     if not query:
         return
 
+    try:
+        query = validate_search_query(query)
+        await enforce_search_rate_limits(user_id)
+    except WorkloadRejected as exc:
+        return await message.reply_text(exc.public_message, reply_parameters=None)
+
     indicator = await show_search_indicator(client, message.chat.id)
     start_time = time.time()
     try:
-        results = await db.get_search_results(query)
+        async with search_slot("private_search"):
+            results = await db.get_search_results(query)
+    except WorkloadRejected as exc:
+        await remove_search_indicator(indicator)
+        return await message.reply_text(exc.public_message, reply_parameters=None)
     except Exception:
         await remove_search_indicator(indicator)
         raise
@@ -760,11 +782,22 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
 
         should_alert = await db.log_missed_search(query)
         if should_alert:
-            asyncio.create_task(send_smart_log(
-                client,
-                f"❌ **#MissedSearch**\n\n🎬 `{query}`\n"
-                f"👤 {message.from_user.mention}\n📍 Private Chat"
-            ))
+            try:
+                supervisor.spawn(
+                    send_smart_log(
+                        client,
+                        "❌ <b>#MissedSearch</b>\n\n"
+                        f"🎬 <code>{_html(query)}</code>\n"
+                        f"👤 {html_user_mention(message.from_user)}\n"
+                        "📍 Private Chat",
+                        parse_mode=ParseMode.HTML,
+                    ),
+                    key=f"log:missed-private:{user_id}:{time.monotonic_ns()}",
+                    owner="filter",
+                    drain_on_shutdown=True,
+                )
+            except TaskConflict:
+                logger.info("Missed-search log skipped during shutdown")
 
         suggestions = await db.get_prefix_suggestions(query, limit=3)
         sug_row = []
@@ -820,6 +853,8 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
 
 @Client.on_callback_query(filters.regex(r"^page#"))
 async def handle_pagination(client: Client, callback: CallbackQuery):
+    if not (await enforce_user_action(callback, "search_navigation")).allowed:
+        return
     parts      = callback.data.split("#")
     session_id = parts[1]
     page       = int(parts[2])
@@ -838,6 +873,8 @@ async def handle_pagination(client: Client, callback: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^expandseries#"))
 async def handle_expand_series(client: Client, callback: CallbackQuery):
+    if not (await enforce_user_action(callback, "search_navigation")).allowed:
+        return
     session_id = callback.data.split("#", 1)[1]
 
     data = await db.get_search(session_id)
@@ -855,6 +892,8 @@ async def handle_expand_series(client: Client, callback: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^filtermenu#"))
 async def show_filter_menu(client: Client, callback: CallbackQuery):
+    if not (await enforce_user_action(callback, "search_navigation")).allowed:
+        return
     _, session_id, kind = callback.data.split("#", 2)
     if kind not in {"language", "quality"}:
         return await callback.answer("Invalid filter.", show_alert=True)
@@ -896,6 +935,8 @@ async def show_filter_menu(client: Client, callback: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^applyfilter#"))
 async def apply_result_filter(client: Client, callback: CallbackQuery):
+    if not (await enforce_user_action(callback, "search_navigation")).allowed:
+        return
     _, session_id, kind, value = callback.data.split("#", 3)
     if kind not in {"language", "quality"}:
         return await callback.answer("Invalid filter.", show_alert=True)
@@ -916,6 +957,8 @@ async def apply_result_filter(client: Client, callback: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^clearfilters#"))
 async def clear_result_filters(client: Client, callback: CallbackQuery):
+    if not (await enforce_user_action(callback, "search_navigation")).allowed:
+        return
     session_id = callback.data.split("#", 1)[1]
     data = await db.get_search(session_id)
     if not data:
@@ -939,6 +982,8 @@ async def handle_ignore(client: Client, callback: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^sendfile#"))
 async def send_movie_file(client: Client, callback: CallbackQuery):
+    if not (await enforce_user_action(callback, "file_delivery")).allowed:
+        return
     _, file_obj_id = callback.data.split("#")
     file_data = await db.get_file(file_obj_id)
 
@@ -948,18 +993,36 @@ async def send_movie_file(client: Client, callback: CallbackQuery):
     if not await check_verification_gates(client, callback, file_obj_id):
         return
 
+    access = await enforce_user_action(callback, "file_delivery")
+    if not access.allowed:
+        return
+
+    guard = delivery_guard(callback.from_user.id, file_obj_id)
+    try:
+        await guard.__aenter__()
+    except WorkloadRejected as exc:
+        return await callback.answer(exc.public_message, show_alert=True)
+
     await callback.answer("📤 Sending file...", show_alert=False)
 
-    config         = await db.get_config()
+    config         = access.config
     delete_seconds = int(config.get("auto_delete_time", 300))
     delete_minutes = delete_seconds // 60
 
     try:
-        sent = await client.send_cached_media(
-            chat_id=callback.message.chat.id,
-            file_id=file_data["file_id"],
-            caption=_build_caption(config, file_data, delete_minutes, client.me.username),
-            parse_mode=ParseMode.HTML
+        sent = await telegram_call(
+            lambda: client.send_cached_media(
+                chat_id=callback.message.chat.id,
+                file_id=file_data["file_id"],
+                caption=_build_caption(
+                    config, file_data, delete_minutes, client.me.username
+                ),
+                parse_mode=ParseMode.HTML,
+            ),
+            route="file_delivery_callback",
+            policy=DELIVERY_RETRY,
+            retry_safe=True,
+            idempotency_key=f"{callback.from_user.id}:{file_obj_id}",
         )
         await _auto_delete_file(sent, file_data["file_name"], client.me.username, delete_seconds)
     except (FileIdInvalid, FileReferenceEmpty, FileReferenceExpired,
@@ -980,27 +1043,19 @@ async def send_movie_file(client: Client, callback: CallbackQuery):
     except Exception as e:
         await callback.message.reply_text("❌ Could not send this file right now. Please try again.")
         logger.error(f"send_cached_media failed: {e}")
+    finally:
+        await guard.__aexit__(None, None, None)
 
 
-async def _fsub_needs_join(client, channel_id, user_id) -> bool:
-    """True if this user still needs to join channel_id — same per-channel
-    try/except semantics check_fsub_callback always used: KICKED/BANNED/LEFT
-    or UserNotParticipant means still needs to join; any other error is
-    treated as already-joined (fail open, consistent with
-    utils.is_subscribed elsewhere)."""
-    try:
-        ch = int(channel_id) if str(channel_id).lstrip('-').isdigit() else str(channel_id)
-        member = await client.get_chat_member(ch, user_id)
-        return member.status.name in ["KICKED", "BANNED", "LEFT"]
-    except UserNotParticipant:
-        return True
-    except Exception as e:
-        logger.warning(f"FSub check error on channel {channel_id}: {e}")
-        return False
+async def _fsub_membership(client, channel_id, user_id) -> VerificationResult:
+    """Return the shared tri-state membership result for legacy FSub UI."""
+    return await check_channel_membership(client, channel_id, user_id)
 
 
 @Client.on_callback_query(filters.regex(r"^check_fsub#"))
 async def check_fsub_callback(client: Client, callback: CallbackQuery):
+    if not (await enforce_user_action(callback, "verification")).allowed:
+        return
     file_part       = callback.data.split("#")[1]
     pending_file_id = file_part if file_part != "none" else None
 
@@ -1019,20 +1074,35 @@ async def check_fsub_callback(client: Client, callback: CallbackQuery):
 
     # Membership checks are independent Telegram API calls — run them
     # concurrently instead of one at a time.
-    raw_flags = await asyncio.gather(
-        *[_fsub_needs_join(client, channel_id, user_id) for _, _, channel_id in valid],
+    membership_results = await asyncio.gather(
+        *[_fsub_membership(client, channel_id, user_id) for _, _, channel_id in valid],
         return_exceptions=True
     ) if valid else []
-    # _fsub_needs_join already fails open (returns False = "doesn't need to
-    # join") on any error internally — same defense-in-depth reasoning as
-    # req_fsub.py's gather calls: this should never actually see an
-    # exception object, but guards against a future change silently
-    # breaking the fail-open guarantee.
-    needs_join_flags = [False if isinstance(r, BaseException) else r for r in raw_flags]
+
+    indeterminate = next(
+        (
+            result
+            for result in membership_results
+            if isinstance(result, BaseException)
+            or result.status is VerificationStatus.INDETERMINATE
+        ),
+        None,
+    )
+    if indeterminate is not None:
+        result = (
+            VerificationResult.indeterminate("membership_task_error")
+            if isinstance(indeterminate, BaseException)
+            else indeterminate
+        )
+        logger.warning("verification_indeterminate gate=legacy_fsub reason=%s", result.reason)
+        return await callback.answer(
+            verification_unavailable_message(result), show_alert=True
+        )
 
     remaining = []
-    for (i, entry, channel_id), needs_join in zip(valid, needs_join_flags):
-        if not needs_join:
+    link_error = False
+    for (i, entry, channel_id), membership in zip(valid, membership_results):
+        if membership.status is VerificationStatus.PASS:
             continue  # already joined
 
         # Same join-link resolution as utils.send_fsub_message.
@@ -1052,6 +1122,7 @@ async def check_fsub_callback(client: Client, callback: CallbackQuery):
                 link = f"https://t.me/{ch_str}"
         except Exception as e:
             logger.warning(f"Could not build FSub join link for {channel_id}: {e}")
+            link_error = True
             continue
 
         try:
@@ -1060,6 +1131,12 @@ async def check_fsub_callback(client: Client, callback: CallbackQuery):
         except Exception:
             ch_name = f"Channel {i}"
         remaining.append([InlineKeyboardButton(f"📢 Join {ch_name}", url=link)])
+
+    if link_error:
+        logger.warning("verification_indeterminate gate=legacy_fsub reason=join_link")
+        return await callback.answer(
+            verification_unavailable_message(), show_alert=True
+        )
 
     if remaining:
         remaining.append([InlineKeyboardButton(
@@ -1076,6 +1153,9 @@ async def check_fsub_callback(client: Client, callback: CallbackQuery):
             pass
         return
 
+    access = await enforce_user_action(callback, "file_delivery")
+    if not access.allowed:
+        return
     await callback.answer("✅ Verified! Sending your file...", show_alert=False)
     chat_id = callback.message.chat.id
     try:
@@ -1089,16 +1169,31 @@ async def check_fsub_callback(client: Client, callback: CallbackQuery):
             await client.send_message(chat_id, "✅ Verified! But the file is no longer available.")
             return
 
-        cfg            = await db.get_config()
+        guard = delivery_guard(user_id, pending_file_id)
+        try:
+            await guard.__aenter__()
+        except WorkloadRejected as exc:
+            await client.send_message(chat_id, exc.public_message)
+            return
+
+        cfg            = access.config
         delete_seconds = int(cfg.get("auto_delete_time", 300))
         delete_minutes = delete_seconds // 60
 
         try:
-            sent = await client.send_cached_media(
-                chat_id=chat_id,
-                file_id=file_data["file_id"],
-                caption=_build_caption(cfg, file_data, delete_minutes, client.me.username),
-                parse_mode=ParseMode.HTML
+            sent = await telegram_call(
+                lambda: client.send_cached_media(
+                    chat_id=chat_id,
+                    file_id=file_data["file_id"],
+                    caption=_build_caption(
+                        cfg, file_data, delete_minutes, client.me.username
+                    ),
+                    parse_mode=ParseMode.HTML,
+                ),
+                route="file_delivery_legacy_fsub",
+                policy=DELIVERY_RETRY,
+                retry_safe=True,
+                idempotency_key=f"{user_id}:{pending_file_id}",
             )
             await _auto_delete_file(sent, file_data["file_name"], client.me.username, delete_seconds)
         except (FileIdInvalid, FileReferenceEmpty, FileReferenceExpired,
@@ -1109,6 +1204,8 @@ async def check_fsub_callback(client: Client, callback: CallbackQuery):
         except Exception as e:
             await client.send_message(chat_id, "❌ Could not send file right now. Try again.")
             logger.error("FSub delivery failed: %s", e)
+        finally:
+            await guard.__aexit__(None, None, None)
     else:
         await client.send_message(
             chat_id,

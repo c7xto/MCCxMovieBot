@@ -2,7 +2,8 @@ import os
 import sys
 import asyncio
 import logging
-import tempfile
+import time
+from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -13,6 +14,8 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
+from plugins.log_safety import install_log_redaction
+install_log_redaction()
 logger = logging.getLogger(__name__)
 
 
@@ -85,29 +88,33 @@ def _verify_environment():
 
 _verify_environment()
 
-from pyrogram import Client
-from database.db import db
-from plugins.health_monitor import (
-    run_health_monitor, run_cache_reaper, run_deletion_worker, _log_task_crash,
+PROJECT_ROOT = Path(__file__).resolve().parent
+from plugins.process_lock import (
+    AlreadyRunningError,
+    ProcessLockError,
+    acquire_process_lock,
+    prepare_private_runtime_dir,
 )
-
-# ── Cross-platform single-instance lock ──────────────────────────────────────
-_lock_path = os.path.join(tempfile.gettempdir(), "mccxbot.lock")
-_lock_file = open(_lock_path, "a+")
-_lock_file.seek(0)
-_lock_file.write("0")
-_lock_file.flush()
 try:
-    if os.name == "nt":
-        import msvcrt
-        _lock_file.seek(0)
-        msvcrt.locking(_lock_file.fileno(), msvcrt.LK_NBLCK, 1)
-    else:
-        import fcntl
-        fcntl.flock(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-except OSError:
+    SESSION_WORKDIR = prepare_private_runtime_dir(Path(
+        os.getenv("SESSION_WORKDIR") or PROJECT_ROOT / "runtime"
+    ))
+    _lock_file = acquire_process_lock(SESSION_WORKDIR)
+except AlreadyRunningError:
     logger.critical("Another MCCxBot instance is already running.")
     sys.exit(1)
+except ProcessLockError as error:
+    logger.critical("Secure runtime lock initialization failed: %s", error)
+    sys.exit(1)
+
+from pyrogram import Client
+from database.db import db
+from database.index_policy import RequiredIndexError
+from plugins.health_monitor import (
+    run_health_monitor, run_cache_reaper, run_deletion_worker,
+)
+from plugins.task_supervisor import supervisor
+from tmdb import close_tmdb_client, start_tmdb_client
 
 # Suppress noisy third-party logs
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
@@ -121,11 +128,21 @@ logging.getLogger("aiohttp").setLevel(logging.WARNING)
 API_ID    = int(os.getenv("API_ID", 0))
 API_HASH  = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+READY_FILE = SESSION_WORKDIR / "ready"
+
+
+def _write_ready_marker():
+    READY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    READY_FILE.write_text(str(time.time()), encoding="ascii")
+
+
+def _remove_ready_marker():
+    READY_FILE.unlink(missing_ok=True)
 
 
 class AutoFilterBot(Client):
     def __init__(self):
-        self.background_tasks = []
+        SESSION_WORKDIR.mkdir(parents=True, exist_ok=True)
         super().__init__(
             name="MCCxBot",
             api_id=API_ID,
@@ -133,7 +150,8 @@ class AutoFilterBot(Client):
             bot_token=BOT_TOKEN,
             plugins=dict(root="plugins"),
             sleep_threshold=60,
-            max_concurrent_transmissions=3
+            max_concurrent_transmissions=3,
+            workdir=str(SESSION_WORKDIR),
         )
 
     async def start(self, *args, use_qr=False, except_ids=None, **kwargs):
@@ -151,6 +169,7 @@ class AutoFilterBot(Client):
         )
         me = await self.get_me()
         logger.info(f"🚀 Bot started as @{me.username}")
+        await start_tmdb_client()
 
         logger.info("🔌 Validating MongoDB connections...")
         if not db.dbs:
@@ -180,7 +199,11 @@ class AutoFilterBot(Client):
         await db.clear_old_searches(expiry_seconds=0)
 
         logger.info("📑 Ensuring database indexes...")
-        await db.ensure_indexes()
+        try:
+            await db.ensure_indexes()
+        except RequiredIndexError:
+            await super().stop()
+            raise
 
         if await db.registry_needs_migration():
             await super().stop()
@@ -189,38 +212,62 @@ class AutoFilterBot(Client):
                 "Run `python tools/migrate_registry.py` once before starting the bot."
             )
 
-        logger.info("✅ Bot fully ready.")
+        db._search_tokens_complete = not await db.search_tokens_need_migration()
+        if not db._search_tokens_complete:
+            logger.info(
+                "ℹ️ Legacy movie rows detected; using the compatible reference "
+                "search without expanding existing Atlas records."
+            )
 
-        catalog_task = asyncio.create_task(db.ensure_search_catalog())
-        catalog_task.add_done_callback(
-            lambda t: _log_task_crash(t, self, "ensure_search_catalog")
+        logger.info("✅ Bot fully ready.")
+        await asyncio.to_thread(_write_ready_marker)
+
+        supervisor.start_accepting()
+        supervisor.spawn(
+            db.ensure_search_catalog(),
+            key="worker:search_catalog",
+            owner="bot",
+            resources=("search-catalog",),
+            drain_on_shutdown=True,
         )
-        self.background_tasks.append(catalog_task)
         logger.info("✅ Fuzzy-search catalog worker started.")
 
-        health_task = asyncio.create_task(run_health_monitor(self))
-        health_task.add_done_callback(lambda t: _log_task_crash(t, self, "run_health_monitor"))
-        self.background_tasks.append(health_task)
+        supervisor.spawn(
+            run_health_monitor(self), key="worker:health", owner="bot"
+        )
         logger.info("✅ Health monitor started.")
 
-        reaper_task = asyncio.create_task(run_cache_reaper())
-        reaper_task.add_done_callback(lambda t: _log_task_crash(t, self, "run_cache_reaper"))
-        self.background_tasks.append(reaper_task)
+        supervisor.spawn(
+            run_cache_reaper(), key="worker:cache_reaper", owner="bot"
+        )
         logger.info("✅ Search-cache reaper started.")
 
-        deletion_task = asyncio.create_task(run_deletion_worker(self))
-        deletion_task.add_done_callback(lambda t: _log_task_crash(t, self, "run_deletion_worker"))
-        self.background_tasks.append(deletion_task)
+        supervisor.spawn(
+            run_deletion_worker(self), key="worker:deletion", owner="bot"
+        )
         logger.info("✅ Durable deletion worker started.")
 
+        from plugins.broadcast import run_broadcast_worker
+        supervisor.spawn(
+            run_broadcast_worker(self), key="worker:broadcast", owner="bot"
+        )
+        logger.info("✅ Durable broadcast worker started.")
+
+        from plugins.realtime_indexer import run_notification_worker
+        supervisor.spawn(
+            run_notification_worker(self),
+            key="worker:announcement-outbox",
+            owner="bot",
+        )
+        logger.info("✅ Durable notification worker started.")
+
     async def stop(self, *args, **kwargs):
-        for task in self.background_tasks:
-            task.cancel()
-        if self.background_tasks:
-            await asyncio.gather(*self.background_tasks, return_exceptions=True)
-            self.background_tasks.clear()
+        await asyncio.to_thread(_remove_ready_marker)
+        await supervisor.shutdown(drain_timeout=10, cancel_timeout=10)
+        await close_tmdb_client()
         await super().stop(*args, **kwargs)
         await db.close()
+        _lock_file.close()
         logger.info("🛑 Bot stopped.")
 
 

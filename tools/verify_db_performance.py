@@ -1,42 +1,9 @@
 """
 tools/verify_db_performance.py
 
-Standalone, Pyrogram-isolated verification script for the database changes
-in database/db.py (cache mechanics, aggregation, centralized registry, and
-the $natural -> _id search-sort switch).
-
-Why this exists: this host's Python 3.14 install raises
-    RuntimeError: There is no current event loop in thread 'MainThread'
-on a bare `import pyrogram` (Pyrogram's sync.py assumes
-asyncio.get_event_loop() will implicitly create one, which newer Python no
-longer does). That makes bot.py and effectively every plugins/*.py module
-unimportable here. `database/db.py` itself has zero Pyrogram dependency at
-module level EXCEPT one local import buried inside get_files_by_language():
-
-    async def get_files_by_language(self):
-        from plugins.filter import LANGUAGES
-        ...
-
-which would pull in the full (Pyrogram-heavy) plugins/filter.py as a side
-effect of calling that one method. This script pre-registers a lightweight
-stub for "plugins.filter" in sys.modules — exposing only the LANGUAGES
-constant, copied verbatim from plugins/filter.py — *before* database.db is
-imported, so that local import resolves from the stub instead of executing
-the real file. The rest of get_files_by_language() runs completely
-unmodified, exactly as production runs it.
-
-A sys.meta_path guard additionally hard-fails (raises immediately) if
-anything anywhere in the import graph ever tries to import `pyrogram` for
-real, so a violation of the "no Pyrogram" constraint is loud and immediate
-rather than a silent surprise.
-
-Note on scope: `plugins/health_monitor.py` (home of the real
-run_cache_reaper() background task) imports `pyrogram.errors` directly at
-module level, so it cannot be imported here either. Section 1's reaper
-check therefore exercises `_SearchCache.purge()` directly — the exact call
-run_cache_reaper() makes every 300 seconds in production — rather than
-spinning up the real coroutine (which would also require waiting out its
-sleep interval).
+Standalone read-only verification for database connectivity, indexes,
+search and bounded cache behavior. Run it from the project's Python 3.13
+environment so it exercises the same imports used by the bot.
 
 Usage:
     python tools/verify_db_performance.py
@@ -45,7 +12,6 @@ Usage:
 import os
 import sys
 import time
-import types
 import asyncio
 import logging
 
@@ -64,33 +30,12 @@ for _stream in (sys.stdout, sys.stderr):
 # sys.path, so `from database.db import db` resolves correctly.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# ── Pyrogram isolation guard — must be set up BEFORE importing database.db ──
-
-_filter_stub = types.ModuleType("plugins.filter")
-_filter_stub.LANGUAGES = [
+EXPECTED_LANGUAGES = [
     "Malayalam", "Tamil", "Telugu", "Hindi",
     "English", "Kannada", "Dual Audio", "Multi Audio"
 ]
-sys.modules["plugins.filter"] = _filter_stub
 
-
-class _PyrogramImportGuard:
-    """A sys.meta_path finder that hard-fails any attempt to import
-    pyrogram or a pyrogram submodule, so a violation of this script's core
-    constraint is an immediate, loud error instead of a silent surprise."""
-
-    def find_spec(self, name, path, target=None):
-        if name == "pyrogram" or name.startswith("pyrogram."):
-            raise RuntimeError(
-                f"BLOCKED: something tried to import '{name}'. "
-                f"tools/verify_db_performance.py must never load Pyrogram."
-            )
-        return None  # defer to the normal finders for everything else
-
-
-sys.meta_path.insert(0, _PyrogramImportGuard())
-
-from database.db import db, _SearchCache  # noqa: E402 — import must follow the guard setup above
+from database.db import db, _SearchCache  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("verify_db_performance")
@@ -211,7 +156,7 @@ async def test_aggregation_pipeline_health():
         results = await db.get_files_by_language()
         elapsed = time.time() - start
 
-        expected_keys = set(_filter_stub.LANGUAGES)
+        expected_keys = set(EXPECTED_LANGUAGES)
         got_keys = set(results.keys())
         record(
             section, "get_files_by_language() returns every expected language key",
@@ -286,20 +231,19 @@ async def test_search_traversal():
     else:
         record(section, "central registry configured", "FAIL")
 
-    # 3b. Confirm the exact _id-descending query shape get_search_results
-    # now uses (replacing $natural) runs cleanly per cluster and returns
-    # well-formed documents.
+    # 3b. Confirm the bounded natural-order compatibility query runs cleanly
+    # per cluster and returns well-formed documents.
     for i, col in enumerate(db.file_cols):
         try:
-            docs = await col.find({}).sort("_id", -1).limit(3).to_list(length=3)
+            docs = await col.find({}).sort("$natural", -1).limit(3).to_list(length=3)
             shape_ok = all(("file_id" in d and "file_name" in d) for d in docs) if docs else True
             record(
-                section, f"Cluster {i+1}: _id-descending probe query",
+                section, f"Cluster {i+1}: natural-order probe query",
                 _pf(shape_ok),
                 f"{len(docs)} doc(s) sampled"
             )
         except Exception as e:
-            record(section, f"Cluster {i+1}: _id-descending probe query", "FAIL", str(e)[:200])
+            record(section, f"Cluster {i+1}: natural-order probe query", "FAIL", str(e)[:200])
 
     # 3c. Run the real get_search_results() end-to-end with a mock query and
     # validate the returned payload shape/types.
@@ -322,7 +266,7 @@ async def test_search_traversal():
 # ── Main ──────────────────────────────────────────────────────────────────
 
 async def main():
-    logger.info("Pyrogram isolation guard active — any pyrogram import will abort immediately.")
+    logger.info("Running read-only database and search checks.")
     logger.info(f"Configured clusters: {len(db.file_cols)}")
 
     if db.file_cols:

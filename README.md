@@ -15,6 +15,8 @@ Fast Telegram movie and series search for the Malayalam Cinema Club.
 - Delivers cached Telegram files privately with durable auto-deletion.
 - Supports group-to-private search handoff, spell suggestions and series grouping.
 - Indexes storage channels in real time or through the resumable bulk indexer.
+- Shows live indexing speed, ETA and separate scanned, saved, existing and skipped counters.
+- Scans the existing library for exact and probable duplicates without deleting anything.
 - Provides a Telegram-native control center for files, groups, channels, access gates, analytics and health.
 - Tracks missing requests and automatically notifies users when matching files arrive.
 
@@ -22,11 +24,12 @@ Premium plans and web streaming are deliberately outside this project's current 
 
 ## Reliability design
 
-- `file_registry` provides cross-cluster `file_id` uniqueness and is kept in sync by every delete, purge and reset path.
+- `file_registry` prevents duplicate Telegram file IDs across clusters. New files also use Telegram's stable content identity when available.
 - Bulk writes distinguish complete success, partial success, duplicates and genuine retryable failures.
 - The primary MongoDB cluster is required at startup; optional clusters degrade independently.
 - Search sessions are bounded and expire automatically.
 - Message deletions use a persistent MongoDB queue, so restarts do not cancel them.
+- Scheduled broadcasts and per-recipient checkpoints are persisted, so delivery resumes after restarts.
 - Background task crashes and cluster failures are reported to the configured log channel.
 - The self-updater stages and compiles the complete target commit before applying it, with rollback on an apply failure.
 
@@ -81,7 +84,25 @@ docker compose logs -f bot
 | `ADMIN_ID` | One or more comma-separated numeric admin IDs |
 | `DATABASE_URI` | Required primary MongoDB cluster |
 
-`DATABASE_URI_2` through `DATABASE_URI_5` are optional. Channel IDs, community links and the TMDB key are documented in `.env.example`; most presentation and access settings can then be managed live through `/admin`.
+`DATABASE_URI_2` through `DATABASE_URI_5` are optional. Channel IDs,
+community links and the TMDB API Read Access Token (`TMDB_BEARER_TOKEN`) are
+documented in `.env.example`; most presentation and access settings can then
+be managed live through `/admin`.
+
+All non-loopback MongoDB connections must use certificate-validated TLS. Prefer
+`mongodb+srv://...`; a standard `mongodb://...` remote URI must include
+`tls=true`. The bundled public CA store is used by default, or set
+`MONGODB_TLS_CA_FILE` to a readable private CA bundle. Plaintext MongoDB is
+accepted only for loopback development endpoints. The
+`ALLOW_INSECURE_MONGODB_FOR_DEVELOPMENT=true` override bypasses this startup
+check and must never be enabled against production data.
+
+Ordinary configuration backups redact all private Telegram invite links. To
+make a deliberate secret-bearing backup, set a 16+ character
+`CONFIG_EXPORT_PASSPHRASE` and use **Encrypted Secret Backup** in `/admin`.
+The result uses scrypt and AES-256-GCM. Decrypt it offline with
+`python tools/decrypt_config_backup.py BACKUP OUTPUT`; the tool refuses to
+overwrite an existing plaintext file.
 
 ## Main commands
 
@@ -108,19 +129,19 @@ docker compose logs -f bot
 ## Development and verification
 
 ```bash
-pip install -r requirements-dev.txt
-python -m compileall -q .
-ruff check .
-python -m pytest -q
-pip-audit -r requirements.txt --progress-spinner off
+python tools/quality.py
 ```
 
-The GitHub Actions workflow runs these checks on every push and pull request.
+This one command installs the exact pinned development requirements, compiles
+the source, runs Ruff and the complete test suite, and audits runtime
+dependencies. The GitHub Actions workflow runs the same gate in a clean Python
+3.13 environment on every push and pull request.
 
 ## Important operational notes
 
-- Search still uses MongoDB regex traversal. For very large libraries, the next major performance project should be Atlas Search or an equivalent text index with measured relevance and latency.
-- Scheduled broadcasts are kept in process and are cancelled by a restart; ordinary delivered-file deletion is durable.
+- New rows use indexed title tokens; older libraries automatically keep the compatible reference-bot search, with bounded RapidFuzz typo correction. No large database rewrite is required for an update.
+- Duplicate cleanup is report-only in this release. Exact copies and probable matches are shown separately, and language, quality, codec, size, season and episode variants are preserved.
+- Broadcast source messages must remain available in the administrator chat until a scheduled job completes.
 - Use only media you are legally authorized to distribute and follow Telegram and hosting-provider rules.
 
 ## License

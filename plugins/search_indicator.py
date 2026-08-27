@@ -4,6 +4,7 @@ import asyncio
 import logging
 
 from pyrogram.enums import ParseMode
+from plugins.telegram_retry import INTERACTIVE_RETRY, telegram_call
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,14 @@ async def _resolve_search_sticker(client):
         return _sticker_file_id
 
     stickers = await asyncio.wait_for(
-        client.get_stickers(_SEARCH_STICKER_SET), timeout=6
+        telegram_call(
+            lambda: client.get_stickers(_SEARCH_STICKER_SET),
+            route="search_indicator_resolve",
+            policy=INTERACTIVE_RETRY,
+            retry_safe=True,
+            idempotency_key="search-sticker-set",
+        ),
+        timeout=10,
     )
     sticker = _select_search_sticker(stickers)
     if not sticker:
@@ -45,7 +53,14 @@ async def show_search_indicator(client, chat_id):
     try:
         sticker_id = await _resolve_search_sticker(client)
         message = await asyncio.wait_for(
-            client.send_sticker(chat_id=chat_id, sticker=sticker_id), timeout=5
+            telegram_call(
+                lambda: client.send_sticker(chat_id=chat_id, sticker=sticker_id),
+                route="search_indicator_send",
+                policy=INTERACTIVE_RETRY,
+                retry_safe=True,
+                idempotency_key=f"indicator:{chat_id}",
+            ),
+            timeout=10,
         )
         if not message or not getattr(message, "sticker", None):
             if message:
@@ -57,10 +72,16 @@ async def show_search_indicator(client, chat_id):
         return message
     except Exception as exc:
         logger.warning("Animated search sticker unavailable; using text: %s", exc)
-        return await client.send_message(
-            chat_id,
-            "🔎 <b>Searching your library…</b>\n<i>Finding the best matches</i>",
-            parse_mode=ParseMode.HTML,
+        return await telegram_call(
+            lambda: client.send_message(
+                chat_id,
+                "🔎 <b>Searching your library…</b>\n<i>Finding the best matches</i>",
+                parse_mode=ParseMode.HTML,
+            ),
+            route="search_indicator_fallback",
+            policy=INTERACTIVE_RETRY,
+            retry_safe=True,
+            idempotency_key=f"indicator-fallback:{chat_id}",
         )
 
 

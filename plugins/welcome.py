@@ -6,7 +6,7 @@ from pyrogram.types import (
 )
 from pyrogram.enums import ChatMemberStatus, ParseMode
 from database.db import db
-from utils import _no_preview
+from utils import _no_preview, html_user_mention
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -53,7 +53,7 @@ async def welcome_new_member(client: Client, update: ChatMemberUpdated):
     markup = InlineKeyboardMarkup(buttons)
 
     welcome_text = (
-        f"👋 Welcome, {new.user.mention}!\n\n"
+        f"👋 Welcome, {html_user_mention(new.user)}!\n\n"
         f"<blockquote>"
         f"Type any movie or series name here to search.\n"
         f"Files are sent directly to your PM.\n\n"

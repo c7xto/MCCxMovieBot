@@ -6,21 +6,37 @@ import time
 from dotenv import load_dotenv
 from pyrogram import ContinuePropagation, StopPropagation
 from pyrogram import Client, filters
-from pyrogram.errors import FloodWait
 from pyrogram.enums import ParseMode
 from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton,
     CallbackQuery
 )
-from database.db import db
+from database.db import db, validate_config_restore
 from plugins.state import get_state as _get_state_fn, set_state as _set_state_fn, clear_state as _clear_state_fn
-from utils import ADMIN_ID, _no_preview, HELP_STEPS_EN, HELP_FOOTER_EN
+from plugins.verification_channels import (
+    ChannelConfigurationError,
+    resolve_request_fsub_channel,
+)
+from plugins.telegram_retry import BACKGROUND_RETRY, telegram_call
+from plugins.config_backup import encrypt_config_export
+from plugins.callbacks import answer_callback_safely
+from utils import (
+    ADMIN_ID,
+    _no_preview,
+    HELP_STEPS_EN,
+    HELP_FOOTER_EN,
+    _html,
+    report_internal_error,
+)
 
 # load_dotenv() here so ADMIN_ID is populated before module-level filter decorators run
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 _reset_confirmations = {}
+_restore_confirmations = {}
+MAX_CONFIG_BACKUP_BYTES = 64 * 1024
+CONFIG_RESTORE_CONFIRM_SECONDS = 120
 
 # Reusable "Back to Panel" button — avoids repeating it everywhere
 _BACK_BTN = InlineKeyboardMarkup([
@@ -36,6 +52,27 @@ def _set_state(admin_id, state):
 
 def _clear_state(admin_id):
     _clear_state_fn(admin_id)
+
+
+def _parse_config_backup(raw: bytes) -> dict:
+    parsed = json.loads(raw)
+    return validate_config_restore(parsed)
+
+
+def _format_config_value(value, limit=120):
+    rendered = json.dumps(value, ensure_ascii=False, default=str)
+    return rendered if len(rendered) <= limit else f"{rendered[:limit - 3]}..."
+
+
+def _format_restore_diff(current: dict, changes: dict) -> str:
+    lines = ["Config restore preview", ""]
+    for key in sorted(changes):
+        lines.append(
+            f"{key}: {_format_config_value(current.get(key))} -> "
+            f"{_format_config_value(changes[key])}"
+        )
+    lines.extend(["", "Apply these changes?"])
+    return "\n".join(lines)
 
 
 async def get_admin_menu_data():
@@ -105,8 +142,9 @@ _CATEGORY_MENUS = {
         ("📣 Announcement Channel",     "edit_updatechid"),
         ("⏱ Auto-Delete",              "edit_autodeletetime"),
         ("⬇ Export Backup",            "admin_export_config"),
+        ("🔒 Encrypted Secret Backup",  "admin_export_secrets"),
         ("⬆ Restore Backup",           "admin_restore_config"),
-        ("🔄 Safe Update",              "upd_start"),
+        ("🚀 Deployment Guide",         "upd_start"),
     ]),
     "health": ("🩺 **Health & System**", [
         ("📊 Analytics",                "admin_stats"),
@@ -123,6 +161,7 @@ _CATEGORY_BACK_BTN = InlineKeyboardMarkup([
 
 @Client.on_callback_query(filters.regex(r"^admin_cat_(library|appearance|users|settings|health)$") & filters.user(ADMIN_ID))
 async def show_category_menu(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback)
     key = callback.data.split("_", 2)[2]
     title, items = _CATEGORY_MENUS[key]
 
@@ -139,7 +178,6 @@ async def show_category_menu(client: Client, callback: CallbackQuery):
         await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
     except Exception:
         await callback.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
-    await callback.answer()
 
 
 # ── DASHBOARD ────────────────────────────────────────────────────────────────
@@ -154,6 +192,7 @@ async def admin_panel(client: Client, message: Message):
 
 @Client.on_callback_query(filters.regex(r"^back_to_admin$") & filters.user(ADMIN_ID))
 async def back_to_admin(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback)
     text, markup = await get_admin_menu_data()
     try:
         await callback.message.edit_text(
@@ -164,7 +203,6 @@ async def back_to_admin(client: Client, callback: CallbackQuery):
         await callback.message.reply_text(
             text=text, reply_markup=markup, **_no_preview()
         )
-    await callback.answer()
 
 
 # ── STATS ─────────────────────────────────────────────────────────────────────
@@ -172,8 +210,8 @@ async def back_to_admin(client: Client, callback: CallbackQuery):
 @Client.on_callback_query(filters.regex(r"^admin_stats$") & filters.user(ADMIN_ID))
 async def show_stats(client: Client, callback: CallbackQuery):
     """Unified analytics — users, files, clusters, language breakdown, top groups."""
+    await answer_callback_safely(callback, "Loading analytics…")
     await callback.message.edit_text("⏳ **Loading analytics...**")
-    await callback.answer()
 
     total_users, total_banned, total_files, db_sizes, total_groups = await db.get_bot_stats()
 
@@ -454,11 +492,11 @@ async def req_fsub_add_prompt(client: Client, callback: CallbackQuery):
     _set_state(callback.from_user.id, "req_fsub_add")
     await callback.message.reply_text(
         "➕ **Add a Req FSub Channel**\n\n"
-        "Send the channel in any format:\n"
-        "• `https://t.me/+xxxxxxx` — private invite link ✅\n"
+        "The bot must already be a channel admin. Use:\n"
         "• `https://t.me/username` — public channel link\n"
         "• `@username` — public username\n"
-        "• `-1001234567890` — numeric channel ID\n\n"
+        "• `-1001234567890 https://t.me/+xxxxxxx` — private ID and invite\n\n"
+        "A private invite URL by itself cannot be verified and is rejected.\n\n"
         "_/cancel to abort._"
     )
     await callback.answer()
@@ -626,9 +664,13 @@ async def catch_admin_input(client: Client, message: Message):
                 f"Any movie uploaded there will now be auto-indexed.",
                 reply_markup=_BACK_BTN
             )
-        except Exception as e:
+        except Exception as error:
+            reference = report_internal_error(
+                logger, "admin_add_db_channel", error
+            )
             await message.reply_text(
-                f"❌ **Failed!** Make sure I am an Admin in that channel.\nError: `{e}`",
+                "❌ **Failed!** Make sure I am an Admin in that channel.\n"
+                f"Reference: `{reference}`",
                 reply_markup=_BACK_BTN
             )
 
@@ -723,8 +765,9 @@ async def catch_admin_input(client: Client, message: Message):
 
             if not is_admin:
                 await message.reply_text(
-                    f"❌ **Bot is not Admin in** `{ch_title}`.\n\n"
-                    f"Make the bot an Admin first, then add it again.",
+                    f"❌ <b>Bot is not Admin in</b> <code>{_html(ch_title)}</code>.\n\n"
+                    "Make the bot an Admin first, then add it again.",
+                    parse_mode=ParseMode.HTML,
                     reply_markup=_BACK_BTN
                 )
                 _clear_state(admin_id)
@@ -736,20 +779,25 @@ async def catch_admin_input(client: Client, message: Message):
                 await db.update_fsub_channel_link(ch_id, link_to_store)
 
             await message.reply_text(
-                f"✅ **FSub Channel Added!**\n\n"
-                f"📢 **{ch_title}**\n"
-                f"🆔 `{ch_id}`\n"
-                f"🔗 `{link_to_store or 'No link (set manually)'}`\n\n"
-                f"Users must join this channel to use the bot.",
+                "✅ <b>FSub Channel Added!</b>\n\n"
+                f"📢 <b>{_html(ch_title)}</b>\n"
+                f"🆔 <code>{ch_id}</code>\n"
+                f"🔗 <code>{_html(link_to_store or 'No link (set manually)')}</code>\n\n"
+                "Users must join this channel to use the bot.",
+                parse_mode=ParseMode.HTML,
                 reply_markup=_BACK_BTN
             )
 
         except StopPropagation:
             raise
-        except Exception as e:
+        except Exception as error:
+            reference = report_internal_error(
+                logger, "admin_add_fsub", error
+            )
             await message.reply_text(
-                f"❌ **Could not resolve channel.**\n\n`{e}`\n\n"
-                f"Make sure the bot is a member/admin in that channel.",
+                "❌ **Could not resolve channel.**\n\n"
+                "Make sure the bot is a member/admin in that channel.\n"
+                f"Reference: `{reference}`",
                 reply_markup=_BACK_BTN
             )
 
@@ -824,8 +872,9 @@ async def catch_admin_input(client: Client, message: Message):
 
             if not is_admin:
                 await message.reply_text(
-                    f"❌ **Bot is not Admin in** `{ch_title}`.\n\n"
-                    f"Make the bot an Admin first, then add it again.",
+                    f"❌ <b>Bot is not Admin in</b> <code>{_html(ch_title)}</code>.\n\n"
+                    "Make the bot an Admin first, then add it again.",
+                    parse_mode=ParseMode.HTML,
                     reply_markup=_BACK_BTN
                 )
                 _clear_state(admin_id)
@@ -836,19 +885,24 @@ async def catch_admin_input(client: Client, message: Message):
                 await db.update_two_stage_channel_link(ch_id, link_to_store)
 
             await message.reply_text(
-                f"✅ **Two-Stage Channel {slot} Set!**\n\n"
-                f"📢 **{ch_title}**\n"
-                f"🆔 `{ch_id}`\n"
-                f"🔗 `{link_to_store or 'No link (set manually)'}`",
+                f"✅ <b>Two-Stage Channel {slot} Set!</b>\n\n"
+                f"📢 <b>{_html(ch_title)}</b>\n"
+                f"🆔 <code>{ch_id}</code>\n"
+                f"🔗 <code>{_html(link_to_store or 'No link (set manually)')}</code>",
+                parse_mode=ParseMode.HTML,
                 reply_markup=_BACK_BTN
             )
 
         except StopPropagation:
             raise
-        except Exception as e:
+        except Exception as error:
+            reference = report_internal_error(
+                logger, "admin_set_two_stage", error
+            )
             await message.reply_text(
-                f"❌ **Could not resolve channel.**\n\n`{e}`\n\n"
-                f"Make sure the bot is a member/admin in that channel.",
+                "❌ **Could not resolve channel.**\n\n"
+                "Make sure the bot is a member/admin in that channel.\n"
+                f"Reference: `{reference}`",
                 reply_markup=_BACK_BTN
             )
 
@@ -914,10 +968,14 @@ async def catch_admin_input(client: Client, message: Message):
                 "❌ **Invalid format!** Log Channel ID must be a number like `-100123456789`.",
                 reply_markup=_BACK_BTN
             )
-        except Exception as e:
+        except Exception as error:
+            reference = report_internal_error(
+                logger, "admin_set_log_channel", error
+            )
             await message.reply_text(
-                f"❌ **Cannot access that channel!**\n"
-                f"Make sure the bot is an **Admin** in `{raw}` first.\nError: `{e}`",
+                "❌ **Cannot access that channel!**\n"
+                "Make sure the bot is an **Admin** there first.\n"
+                f"Reference: `{reference}`",
                 reply_markup=_BACK_BTN
             )
 
@@ -938,57 +996,44 @@ async def catch_admin_input(client: Client, message: Message):
                 "❌ **Invalid format!** Update Channel ID must be a number like `-100123456789`.",
                 reply_markup=_BACK_BTN
             )
-        except Exception as e:
+        except Exception as error:
+            reference = report_internal_error(
+                logger, "admin_set_update_channel", error
+            )
             await message.reply_text(
-                f"❌ **Cannot access that channel!**\n"
-                f"Make sure the bot is an **Admin** in `{raw}` first.\nError: `{e}`",
+                "❌ **Cannot access that channel!**\n"
+                "Make sure the bot is an **Admin** there first.\n"
+                f"Reference: `{reference}`",
                 reply_markup=_BACK_BTN
             )
 
     elif state == "req_fsub_add":
-        import re as _re
         raw = message.text.strip()
-
-        # Private invite link — https://t.me/+xxxx — store as-is, use as the link
-        if raw.startswith("https://t.me/+"):
-            ok, msg_r = await db.add_req_fsub_channel(raw)
-            if ok:
-                await message.reply_text(
-                    f"✅ Private channel link added to Req FSub pool.\n"
-                    f"🔗 `{raw}`\n\n"
-                    f"Users will see this as the join link.",
-                    reply_markup=_BACK_BTN
-                )
-            else:
-                await message.reply_text(f"❌ Failed: {msg_r}", reply_markup=_BACK_BTN)
-
-        # Public https://t.me/username
-        elif raw.startswith("https://t.me/"):
-            uname  = raw.rstrip("/").split("/")[-1]
-            ch_val = f"@{uname}"
-            ok, msg_r = await db.add_req_fsub_channel(ch_val)
-            if ok:
-                await message.reply_text(
-                    f"✅ `{ch_val}` added to Req FSub pool.",
-                    reply_markup=_BACK_BTN
-                )
-            else:
-                await message.reply_text(f"❌ Failed: {msg_r}", reply_markup=_BACK_BTN)
-
-        # @username or numeric ID
-        else:
-            try:
-                ch_val = int(raw)
-            except ValueError:
-                ch_val = raw
-            ok, msg_r = await db.add_req_fsub_channel(ch_val)
-            if ok:
-                await message.reply_text(
-                    f"✅ `{ch_val}` added to Req FSub pool.",
-                    reply_markup=_BACK_BTN
-                )
-            else:
-                await message.reply_text(f"❌ Failed: {msg_r}", reply_markup=_BACK_BTN)
+        try:
+            verified = await resolve_request_fsub_channel(client, raw)
+            ok, msg_r = await db.add_req_fsub_channel(
+                verified.chat_id,
+                verified.link,
+                verified.title,
+            )
+            if not ok:
+                raise ChannelConfigurationError(msg_r)
+            await message.reply_text(
+                f"✅ **Verified Req FSub channel added**\n\n"
+                f"Channel: `{verified.chat_id}`\n"
+                f"Name: {verified.title}\n"
+                f"The numeric identity and join link are stored separately.",
+                reply_markup=_BACK_BTN,
+            )
+        except ChannelConfigurationError as exc:
+            reference = report_internal_error(
+                logger, "admin_add_request_fsub", exc
+            )
+            await message.reply_text(
+                "❌ **Channel not added.** Verify its numeric ID and ensure "
+                f"the bot is an administrator.\nReference: `{reference}`",
+                reply_markup=_BACK_BTN,
+            )
 
     elif state == "req_fsub_remove":
         raw = message.text.strip()
@@ -1115,9 +1160,11 @@ async def confirm_reset_cmd(client: Client, message: Message):
     status = await message.reply_text("☢️ **Nuking the database...**")
     try:
         await db.reset_database()
-    except Exception as e:
-        logger.exception("Database reset failed")
-        return await status.edit_text(f"❌ **Reset aborted or incomplete:** `{e}`")
+    except Exception as error:
+        reference = report_internal_error(logger, "admin_reset_database", error)
+        return await status.edit_text(
+            f"❌ **Reset aborted or incomplete.** Reference: `{reference}`"
+        )
     await status.edit_text("✅ **Database has been completely wiped.** You now have a clean slate.")
 
 
@@ -1220,20 +1267,19 @@ async def fsub_refresh_links(client: Client, callback: CallbackQuery):
             continue
 
         try:
-            new_link = await client.export_chat_invite_link(int(ch_str))
+            new_link = await telegram_call(
+                lambda: client.export_chat_invite_link(int(ch_str)),
+                route="admin_refresh_invite",
+                policy=BACKGROUND_RETRY,
+                retry_safe=True,
+                idempotency_key=f"refresh-invite:{ch_str}",
+            )
             await db.update_fsub_channel_link(ch_id, new_link)
             refreshed += 1
-        except FloodWait as e:
-            await asyncio.sleep(e.value)
-            try:
-                new_link = await client.export_chat_invite_link(int(ch_str))
-                await db.update_fsub_channel_link(ch_id, new_link)
-                refreshed += 1
-            except Exception as e2:
-                logger.warning(f"Could not refresh link for {ch_id} after FloodWait: {e2}")
-                skipped += 1
-        except Exception as e:
-            logger.warning(f"Could not refresh link for {ch_id}: {e}")
+        except Exception as error:
+            report_internal_error(
+                logger, "admin_refresh_invite", error, channel_id=ch_id
+            )
             skipped += 1
 
     markup = InlineKeyboardMarkup([
@@ -1336,8 +1382,37 @@ async def export_config(client: Client, callback: CallbackQuery):
     buf.name = "mccxbot_config_backup.json"
     await callback.message.reply_document(
         document=buf,
-        caption="📥 **MCCxBot Config Backup**\n\nStore this safely. "
-                "Use Restore Config to apply it."
+        caption="📥 **MCCxBot Config Backup**\n\nPrivate invite links are redacted. "
+                "Use Restore Config to apply the remaining settings."
+    )
+
+
+@Client.on_callback_query(
+    filters.regex(r"^admin_export_secrets$") & filters.user(ADMIN_ID)
+)
+async def export_encrypted_config(client: Client, callback: CallbackQuery):
+    passphrase = os.getenv("CONFIG_EXPORT_PASSPHRASE", "")
+    if len(passphrase) < 16:
+        await callback.answer(
+            "Set CONFIG_EXPORT_PASSPHRASE (16+ characters) and restart first.",
+            show_alert=True,
+        )
+        return
+    await callback.answer("Encrypting secret backup...", show_alert=False)
+    config_data = await db.export_config(include_private_invites=True)
+    encrypted = await asyncio.to_thread(
+        encrypt_config_export, config_data, passphrase
+    )
+    import io
+    buf = io.BytesIO(encrypted)
+    buf.name = "mccxbot_config_secrets.enc.json"
+    await callback.message.reply_document(
+        document=buf,
+        caption=(
+            "🔒 **Encrypted MCCxBot Secret Backup**\n\n"
+            "AES-256-GCM encrypted with CONFIG_EXPORT_PASSPHRASE. "
+            "Keep both the file and passphrase protected."
+        ),
     )
 
 
@@ -1365,34 +1440,110 @@ async def handle_config_restore_file(client: Client, message: Message):
         # Not a config restore — let the message propagate to other handlers (e.g. forward_indexer)
         raise ContinuePropagation
 
-    if not message.document.file_name.endswith(".json"):
+    file_name = message.document.file_name or ""
+    if not file_name.casefold().endswith(".json"):
         return await message.reply_text(
             "❌ Please send a `.json` file.",
             reply_markup=_BACK_BTN
         )
 
+    file_size = message.document.file_size
+    if file_size is None or file_size > MAX_CONFIG_BACKUP_BYTES:
+        return await message.reply_text(
+            f"Backup must report a size no larger than "
+            f"{MAX_CONFIG_BACKUP_BYTES // 1024} KiB.",
+            reply_markup=_BACK_BTN,
+        )
+
     _clear_state(message.from_user.id)
+    file_bytes = None
     try:
         file_bytes = await client.download_media(message.document, in_memory=True)
-        config_data = json.loads(file_bytes.getvalue().decode())
-        success = await db.restore_config(config_data)
-        if success:
-            await message.reply_text(
-                f"✅ **Config Restored!**\n\n"
-                f"Restored `{len(config_data)}` settings from backup.\n"
-                f"Protected fields (log channel, admin ID, DB channels) were not changed.",
-                reply_markup=_BACK_BTN
+        raw = file_bytes.getvalue()
+        if len(raw) > MAX_CONFIG_BACKUP_BYTES:
+            raise ValueError("downloaded backup exceeds the size limit")
+        config_data = await asyncio.to_thread(_parse_config_backup, raw)
+        if not config_data:
+            raise ValueError("backup contains no restorable settings")
+
+        current = await db.get_config()
+        changes = {
+            key: value
+            for key, value in config_data.items()
+            if current.get(key) != value
+        }
+        if not changes:
+            return await message.reply_text(
+                "No configuration changes were found in this backup.",
+                reply_markup=_BACK_BTN,
             )
-        else:
-            await message.reply_text(
-                "❌ No safe settings found to restore. File may be empty or invalid.",
-                reply_markup=_BACK_BTN
-            )
-    except Exception as e:
+
+        _restore_confirmations[message.from_user.id] = {
+            "expires_at": time.monotonic() + CONFIG_RESTORE_CONFIRM_SECONDS,
+            "changes": changes,
+        }
         await message.reply_text(
-            f"❌ Failed to parse backup file: `{e}`",
+            _format_restore_diff(current, changes),
+            parse_mode=ParseMode.DISABLED,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "Apply restore", callback_data="admin_restore_apply"
+                    ),
+                    InlineKeyboardButton(
+                        "Cancel", callback_data="admin_restore_cancel"
+                    ),
+                ]
+            ]),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        await message.reply_text(
+            f"Invalid config backup: {exc}",
             reply_markup=_BACK_BTN
         )
+    except Exception:
+        logger.exception("Config restore preview failed")
+        await message.reply_text(
+            "Config restore preview failed. No settings were changed.",
+            reply_markup=_BACK_BTN,
+        )
+    finally:
+        if file_bytes is not None:
+            file_bytes.close()
+
+
+@Client.on_callback_query(
+    filters.regex(r"^admin_restore_apply$") & filters.user(ADMIN_ID)
+)
+async def apply_config_restore(client: Client, callback: CallbackQuery):
+    pending = _restore_confirmations.pop(callback.from_user.id, None)
+    if not pending or time.monotonic() > pending["expires_at"]:
+        await callback.answer("Restore preview expired. Upload it again.", show_alert=True)
+        return
+
+    try:
+        success = await db.restore_config(pending["changes"])
+    except ValueError as exc:
+        await callback.answer(f"Restore rejected: {exc}", show_alert=True)
+        return
+    if not success:
+        await callback.answer("No safe settings were restored.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        f"Config restored: {len(pending['changes'])} setting(s) changed.\n"
+        "Protected fields were not changed.",
+        reply_markup=_BACK_BTN,
+    )
+    await callback.answer("Config restored")
+
+
+@Client.on_callback_query(
+    filters.regex(r"^admin_restore_cancel$") & filters.user(ADMIN_ID)
+)
+async def cancel_config_restore(client: Client, callback: CallbackQuery):
+    _restore_confirmations.pop(callback.from_user.id, None)
+    await callback.message.edit_text("Config restore cancelled.", reply_markup=_BACK_BTN)
+    await callback.answer()
 
 
 # ── CLOSE PANEL ───────────────────────────────────────────────────────────────

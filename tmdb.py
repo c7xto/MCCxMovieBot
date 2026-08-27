@@ -1,9 +1,9 @@
 import os
 import time
+import asyncio
 import aiohttp
 import logging
 from collections import OrderedDict
-from urllib.parse import quote
 from dotenv import load_dotenv
 
 # 1. Force load the .env file immediately so the key isn't blank
@@ -20,6 +20,65 @@ logger = logging.getLogger(__name__)
 _CACHE_MAXSIZE = 1000
 _CACHE_TTL     = 24 * 3600  # 24h
 _cache = OrderedDict()  # normalized_query -> (cached_at, result_or_None)
+_session = None
+_session_lock = asyncio.Lock()
+_legacy_key_warning_emitted = False
+
+
+def _bearer_token():
+    global _legacy_key_warning_emitted
+    token = os.getenv("TMDB_BEARER_TOKEN") or os.getenv("TMDB_API_READ_TOKEN")
+    if token:
+        return token
+    legacy = os.getenv("TMDB_API_KEY")
+    if legacy and not _legacy_key_warning_emitted:
+        logger.warning(
+            "TMDB_API_KEY is deprecated; set TMDB_BEARER_TOKEN to an API Read Access Token"
+        )
+        _legacy_key_warning_emitted = True
+    return legacy
+
+
+async def start_tmdb_client():
+    """Create the application-owned pooled HTTP session once."""
+    global _session
+    if _session is not None and not _session.closed:
+        return _session
+    async with _session_lock:
+        if _session is not None and not _session.closed:
+            return _session
+        token = _bearer_token()
+        if not token:
+            return None
+        connector = aiohttp.TCPConnector(
+            limit=10,
+            limit_per_host=5,
+            ttl_dns_cache=300,
+            enable_cleanup_closed=True,
+        )
+        timeout = aiohttp.ClientTimeout(
+            total=10,
+            connect=3,
+            sock_connect=3,
+            sock_read=7,
+        )
+        _session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+            },
+            raise_for_status=False,
+        )
+        return _session
+
+
+async def close_tmdb_client():
+    global _session
+    session, _session = _session, None
+    if session is not None and not session.closed:
+        await session.close()
 
 
 def _cache_get(key):
@@ -60,50 +119,49 @@ async def _fetch_movie_data(query):
     """Returns (ok, result). ok=False means the call failed (missing key,
     non-200, network error) and should not be cached; ok=True covers both
     a real match and a confirmed no-results response."""
-    TMDB_API_KEY = os.getenv("TMDB_API_KEY")
-
-    if not TMDB_API_KEY:
-        logger.warning("⚠️ TMDB Error: API Key is missing from .env!")
+    session = await start_tmdb_client()
+    if session is None:
+        logger.warning("⚠️ TMDB Error: bearer token is missing from .env!")
         return False, None
 
-    safe_query = quote(query)
-    url = f"https://api.themoviedb.org/3/search/multi?api_key={TMDB_API_KEY}&query={safe_query}"
+    url = "https://api.themoviedb.org/3/search/multi"
 
     try:
-        timeout = aiohttp.ClientTimeout(total=10)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url) as response:
-                if response.status != 200:
-                    logger.warning(f"⚠️ TMDB Error: API returned status {response.status}")
-                    return False, None
+        async with session.get(
+            url,
+            params={"query": query, "include_adult": "false"},
+        ) as response:
+            if response.status != 200:
+                logger.warning("⚠️ TMDB Error: API returned status %s", response.status)
+                return False, None
 
-                data = await response.json()
-                results = data.get("results", [])
+            data = await response.json()
+            results = data.get("results", [])
 
-                if not results:
-                    logger.debug(f"⚠️ TMDB Info: No results found for '{query}' on TMDB.")
-                    return True, None
+            if not results:
+                logger.debug("⚠️ TMDB Info: no results for query=%r", query)
+                return True, None
 
-                # Grab the first valid movie or TV show
-                for item in results:
-                    if item.get("media_type") in ["movie", "tv"]:
-                        title = item.get("title") or item.get("name")
-                        poster_path = item.get("poster_path")
-                        poster_url = f"https://image.tmdb.org/t/p/w500{poster_path}" if poster_path else None
+            # Grab the first valid movie or TV show
+            for item in results:
+                if item.get("media_type") in ["movie", "tv"]:
+                    title = item.get("title") or item.get("name")
+                    poster_path = item.get("poster_path")
+                    poster_url = f"https://image.tmdb.org/t/p/w500{poster_path}" if poster_path else None
 
-                        overview = item.get("overview", "")
-                        if len(overview) > 150:
-                            overview = overview[:147] + "..."
+                    overview = item.get("overview", "")
+                    if len(overview) > 150:
+                        overview = overview[:147] + "..."
 
-                        rating = item.get("vote_average", 0)
+                    rating = item.get("vote_average", 0)
 
-                        return True, {
-                            "title": title,
-                            "poster": poster_url,
-                            "overview": overview,
-                            "rating": round(rating, 1)
-                        }
+                    return True, {
+                        "title": title,
+                        "poster": poster_url,
+                        "overview": overview,
+                        "rating": round(rating, 1)
+                    }
         return True, None
-    except Exception as e:
-        logger.warning(f"⚠️ TMDB Network Error: {e}")
+    except Exception as error:
+        logger.warning("⚠️ TMDB Network Error: %s", type(error).__name__)
         return False, None

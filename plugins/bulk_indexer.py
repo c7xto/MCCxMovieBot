@@ -1,251 +1,308 @@
 import os
 import re
 import time
+import json
 import asyncio
 import logging
+from pathlib import Path
 from dotenv import load_dotenv
 from pyrogram import Client, filters
 from pyrogram import ContinuePropagation, StopPropagation
-from pyrogram.errors import FloodWait, MessageNotModified
+from pyrogram.enums import ParseMode
+from pyrogram.errors import MessageNotModified
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from database.db import db, AllClustersFullError, normalize_file_name
-from utils import ADMIN_ID
+from utils import ADMIN_ID, html_user_mention, report_internal_error
 
 load_dotenv()
 
 # Import our unified smart logger!
 from plugins.filter import send_smart_log
-from plugins.health_monitor import _log_task_crash
+from plugins.callbacks import answer_callback_safely
+from plugins.index_progress import IndexProgress
+from plugins.retry import retry_with_backoff
+from plugins.telegram_retry import BACKGROUND_RETRY, INTERACTIVE_RETRY, telegram_call
+from plugins.task_supervisor import TaskConflict, supervisor
 
 logger = logging.getLogger(__name__)
+_active_indexes = {}
+
+
+def _spawn_index_log(coroutine, chat_id, label):
+    try:
+        supervisor.spawn(
+            coroutine,
+            key=f"log:index:{chat_id}:{label}:{time.monotonic_ns()}",
+            owner="bulk_indexer",
+            drain_on_shutdown=True,
+        )
+    except TaskConflict:
+        logger.info("Indexer log skipped during shutdown label=%s", label)
+_LOCAL_INDEX_FAILURES = (
+    Path(__file__).resolve().parents[1] / "runtime" / "index_failures.jsonl"
+)
+
+
+def _append_local_index_failure(record: dict):
+    _LOCAL_INDEX_FAILURES.parent.mkdir(parents=True, exist_ok=True)
+    with _LOCAL_INDEX_FAILURES.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+async def _record_failed_range(chat_id, start_id, end_id, stage, error, attempts):
+    """Persist a dead-letter record, with runtime-volume fallback."""
+    try:
+        await db.record_index_failure(
+            chat_id, start_id, end_id, stage, error, attempts
+        )
+        return
+    except Exception as persistence_error:
+        logger.error(
+            "Mongo dead-letter write failed for %s:%s-%s: %s",
+            chat_id,
+            start_id,
+            end_id,
+            type(persistence_error).__name__,
+        )
+    await asyncio.to_thread(
+        _append_local_index_failure,
+        {
+            "chat_id": chat_id,
+            "start_id": start_id,
+            "end_id": end_id,
+            "stage": stage,
+            "error_type": type(error).__name__,
+            "attempts": attempts,
+            "timestamp": time.time(),
+        },
+    )
 
 # --- GLOBAL STATE DICTIONARY ---
 
-def get_progress_bar(percentage, length=12):
-    filled = int((percentage / 100) * length)
-    return '🟩' * filled + '⬜️' * (length - filled)
+def _index_controls(chat_id: int, state: str = "running"):
+    first = (
+        InlineKeyboardButton("▶️ Resume", callback_data=f"resume_idx#{chat_id}")
+        if state == "paused"
+        else InlineKeyboardButton("⏸ Pause", callback_data=f"pause_idx#{chat_id}")
+    )
+    return InlineKeyboardMarkup([[
+        first,
+        InlineKeyboardButton("⏹ Safe stop", callback_data=f"stop_idx#{chat_id}"),
+    ]])
 
-def get_readable_time(seconds):
-    m, s = divmod(seconds, 60)
-    h, m = divmod(m, 60)
-    if h > 0: return f"{int(h)}h {int(m)}m {int(s)}s"
-    elif m > 0: return f"{int(m)}m {int(s)}s"
-    return f"{int(s)}s"
+
+async def _edit_live_status(chat_id: int, state: str):
+    active = _active_indexes.get(chat_id)
+    if not active:
+        return
+    progress, status_message = active
+    markup = None if state in {"stopped", "complete"} else _index_controls(chat_id, state)
+    try:
+        await telegram_call(
+            lambda: status_message.edit_text(
+                progress.render(state), reply_markup=markup
+            ),
+            route="bulk_index_progress",
+            policy=INTERACTIVE_RETRY,
+            retry_safe=True,
+            idempotency_key=f"index-progress:{chat_id}:{state}:{progress.checkpoint}",
+        )
+    except MessageNotModified:
+        pass
 
 # --- THE BACKGROUND WORKER ---
 async def run_indexer(client: Client, status_message: Message, chat_id: int, last_msg_id: int, start_id: int):
+    current_id = max(1, int(start_id))
+    batch_size = 50
+    progress = IndexProgress(current_id, last_msg_id)
+    _active_indexes[chat_id] = (progress, status_message)
     await db.set_index_task(chat_id, "running")
-    current_id = start_id
-    batch_size = 50 # Safe size to prevent API limits
+    await _edit_live_status(chat_id, "running")
+    next_ui_update = time.monotonic() + 3.0
 
-    saved_files, duplicates, deleted_empty = 0, 0, 0
-    start_time = time.time()
-    loops = 0
+    def note_retry(exc, attempt, delay):
+        progress.retries += 1
+        logger.warning(
+            "Indexer retry channel=%s range=%s-%s attempt=%s delay=%.2fs error=%s",
+            chat_id, current_id, end_id, attempt, delay, type(exc).__name__,
+        )
 
-    # Adaptive backoff between batches — start fast, only slow down after an
-    # actual FloodWait (rather than a fixed 3s pause regardless of how close
-    # to a flood limit we actually are), then ease back toward the minimum
-    # once a stretch of batches has gone through clean.
-    MIN_BATCH_SLEEP = 0.5
-    MAX_BATCH_SLEEP = 10.0
-    batch_sleep = MIN_BATCH_SLEEP
-    clean_streak = 0
+    try:
+        while current_id <= last_msg_id:
+            state = await db.get_index_task(chat_id)
+            if state == "stopped":
+                await _edit_live_status(chat_id, "stopped")
+                _spawn_index_log(
+                    send_smart_log(
+                        client,
+                        f"⏹ **#IndexStopped**\n\n"
+                        f"📦 **Channel:** `{chat_id}`\n"
+                        f"✅ **Saved:** `{progress.saved:,}`\n"
+                        f"♻️ **Existing:** `{progress.duplicates:,}`\n"
+                        f"💾 **Checkpoint:** `{progress.checkpoint:,}`",
+                    ),
+                    chat_id,
+                    "stopped",
+                )
+                return
+            if state == "paused":
+                await asyncio.sleep(1.5)
+                continue
 
-    while current_id <= last_msg_id:
-        # 1. Check the Control State
-        state = await db.get_index_task(chat_id)
-        if state == "stopped":
-            await status_message.edit_text("⏹ **Indexing Stopped manually by Admin.**")
-            elapsed = get_readable_time(time.time() - start_time)
-            asyncio.create_task(send_smart_log(client,
-                f"⏹ **#IndexStopped**\n\n"
-                f"📦 **Channel:** `{chat_id}`\n"
-                f"✨ **Saved:** `{saved_files}`\n"
-                f"⚠️ **Duplicates:** `{duplicates}`\n"
-                f"⏱ **Ran for:** `{elapsed}`\n"
-                f"_(Stopped manually by admin)_"
-            ))
-            break
-        if state == "paused":
-            await asyncio.sleep(2)
-            continue # Loop silently until resumed
-
-        end_id = min(current_id + batch_size - 1, last_msg_id)
-        message_ids = list(range(current_id, end_id + 1))
-        batch_files = []
-
-        try:
-            messages = await client.get_messages(chat_id, message_ids)
-            
-            if not isinstance(messages, list):
-                messages = [messages]
-
-            for msg in messages:
-                if getattr(msg, "empty", False) or not msg:
-                    deleted_empty += 1
-                    continue
-
-                media = msg.document or msg.video
-                if media and hasattr(media, "file_id"):
-                    raw_name = getattr(media, "file_name", "")
-                    if not raw_name: continue
-
-                    # 🧹 Regex Name Purifier — shared with save_file() so a
-                    # file indexed here and one indexed via the realtime
-                    # single-file path always end up normalized the same way.
-                    clean_name = normalize_file_name(raw_name)
-
+            end_id = min(current_id + batch_size - 1, last_msg_id)
+            message_ids = list(range(current_id, end_id + 1))
+            batch_files = []
+            try:
+                messages = await telegram_call(
+                    lambda: client.get_messages(chat_id, message_ids),
+                    route="bulk_index_messages",
+                    policy=BACKGROUND_RETRY,
+                    retry_safe=True,
+                    idempotency_key=f"index-read:{chat_id}:{current_id}:{end_id}",
+                )
+                if not isinstance(messages, list):
+                    messages = [messages]
+                for msg in messages:
+                    if not msg or getattr(msg, "empty", False):
+                        continue
+                    media = msg.document or msg.video or msg.audio
+                    raw_name = getattr(media, "file_name", "") if media else ""
+                    if not media or not getattr(media, "file_id", "") or not raw_name:
+                        continue
                     batch_files.append({
                         "file_id": media.file_id,
-                        "file_name": clean_name,
+                        "file_unique_id": getattr(media, "file_unique_id", ""),
+                        "file_name": normalize_file_name(raw_name),
                         "file_size": getattr(media, "file_size", 0),
-                        "mime_type": getattr(media, "mime_type", "")
+                        "mime_type": getattr(media, "mime_type", ""),
+                        "source_chat_id": chat_id,
+                        "source_message_id": getattr(msg, "id", None),
+                        "indexed_at": time.time(),
                     })
-
-        except FloodWait as e:
-            # Telegram itself just told us to slow down — obey the mandatory
-            # wait, then raise our steady-state pace too so we don't march
-            # straight back into the next one.
-            batch_sleep = min(MAX_BATCH_SLEEP, batch_sleep * 2)
-            clean_streak = 0
-            await asyncio.sleep(e.value)
-            continue
-
-
-        except Exception as e:
-            # --- 1. UPDATE THE USER IN THE CHAT ---
-            try:
-                await status_message.edit_text(
-                    f"❌ **Indexing Failed!**\n\n"
-                    f"**Reason:** Telegram blocked access or a fatal error occurred.\n"
-                    f"**Fix:** Please ensure the bot is an **Admin** in the Database Channel with 'Read Messages' permission."
+            except Exception as error:
+                reference = report_internal_error(
+                    logger, "bulk_indexer_read", error, channel_id=chat_id
                 )
-            except Exception:
-                pass
-
-            # --- FEATURE 5: SYSTEM ERRORS LOG (Optimized) ---
-            logger.error(f"❌ Indexer Blocked! Error: {e}")
-            
-            error_log = (
-                f"⚠️ **#SystemError** (Indexer)\n\n"
-                f"📦 **Channel:** `{chat_id}`\n"
-                f"🛑 **Error:** `{e}`\n\n"
-                f"*(Please check bot Admin permissions in this channel)*"
-            )
-            asyncio.create_task(send_smart_log(client, error_log))
-            
-            # We still send a direct PM to the Admin just in case they miss the log!
-            for admin_id in ADMIN_ID:
-                try:
-                    await client.send_message(
-                        admin_id,
-                        f"❌ **Indexer Crashed!**\n\nI cannot read the Database Channel (`{chat_id}`). Please make sure I am an **Administrator** with permission to read message history!\n\n**Error Details:** `{e}`"
-                    )
-                except Exception:
-                    pass
-                
-            # Clear the task state so it isn't stuck "running" internally
-            await db.clear_index_task(chat_id)
-                
-            return    
-
-        # 2. Bulk Execute & Save Progress
-        if batch_files:
-            try:
-                new_saves, dups = await db.save_files_bulk(batch_files)
-                saved_files += new_saves
-                duplicates += dups
-            except AllClustersFullError as e:
-                # Every configured cluster is at its 450MB safety margin —
-                # halt instead of silently reporting a false "complete".
-                duplicates += e.duplicates
-                await db.clear_index_task(chat_id)
-                next_slot = len(db.file_cols) + 1
-                try:
-                    await status_message.edit_text(
-                        f"🛑 **Indexing Stopped — Database Full!**\n\n"
-                        f"All `{len(db.file_cols)}` configured cluster(s) have hit their 450MB safety margin — "
-                        f"`{e.unsaved_count}` file(s) in this batch could not be stored anywhere.\n"
-                        f"**Fix:** Add a new cluster as `DATABASE_URI_{next_slot}` in your environment variables "
-                        f"and restart the bot. Then resume indexing.\n\n"
-                        f"✅ Saved so far: `{saved_files}` files"
-                    )
-                except Exception:
-                    pass
-                asyncio.create_task(send_smart_log(client,
-                    f"🛑 **#DatabaseFull**\n\nBulk indexer stopped — every cluster is at capacity.\n"
-                    f"Add `DATABASE_URI_{next_slot}` to env vars and restart.\n"
-                    f"Files saved before stopping: `{saved_files}`\n"
-                    f"Files lost this batch: `{e.unsaved_count}`"
-                ))
+                await _record_failed_range(
+                    chat_id, current_id, end_id, "telegram_read", error, 1
+                )
+                await db.set_index_task(chat_id, "paused")
+                await status_message.edit_text(
+                    f"❌ **Indexer paused safely**\n\n"
+                    f"Telegram could not read messages `{current_id:,}-{end_id:,}`.\n"
+                    f"Nothing in this range was marked complete.\n"
+                    f"Check the bot's channel access, then tap Start again.\n\n"
+                    f"Reference: `{reference}`"
+                )
                 return
-            except Exception as e:
-                logger.warning(f"Batch save error (non-fatal): {e}")
 
-        await db.set_index_progress(chat_id, end_id)
-
-        # 3. Throttle UI Updates
-        current_id += batch_size
-        loops += 1
-
-        if loops % 5 == 0 or current_id > last_msg_id:
-            percentage = min((current_id / last_msg_id) * 100, 100)
-            elapsed_time = time.time() - start_time
-            msgs_per_sec = (current_id - start_id) / elapsed_time if elapsed_time > 0 else 1
-            eta_seconds = (last_msg_id - current_id) / msgs_per_sec if msgs_per_sec > 0 else 0
-
-            markup = InlineKeyboardMarkup([
-                [InlineKeyboardButton("⏸ Pause", callback_data=f"pause_idx#{chat_id}"),
-                 InlineKeyboardButton("⏹ Stop", callback_data=f"stop_idx#{chat_id}")]
-            ])
-
-            text = (
-                f"⚡ **Super-Indexer — Running**\n"
-                f"{get_progress_bar(percentage)} `{percentage:.1f}%`\n\n"
-                f"📈 **Progress:** `{current_id} / {last_msg_id}`\n"
-                f"⏱ **Elapsed:** `{get_readable_time(elapsed_time)}` | ⏳ **ETA:** `{get_readable_time(eta_seconds)}`\n"
-                f"🚀 **Speed:** `{int(msgs_per_sec)} msgs/sec`\n\n"
-                f"✅ **Cleaned & Saved:** `{saved_files}` | ⚠️ **Dups:** `{duplicates}`"
-            )
+            new_saves = dups = 0
             try:
-                await status_message.edit_text(text, reply_markup=markup)
-            except MessageNotModified:
-                pass
-            except FloodWait as e:
-                await asyncio.sleep(e.value)
+                if batch_files:
+                    new_saves, dups = await retry_with_backoff(
+                        lambda: db.save_files_bulk(batch_files),
+                        attempts=4,
+                        base_delay=0.75,
+                        max_delay=6.0,
+                        jitter=0.5,
+                        should_retry=lambda exc: not isinstance(
+                            exc, AllClustersFullError
+                        ),
+                        on_retry=note_retry,
+                    )
+            except AllClustersFullError as error:
+                progress.duplicates += error.duplicates
+                await _record_failed_range(
+                    chat_id, current_id, end_id, "cluster_capacity", error, 1
+                )
+                await db.set_index_task(chat_id, "paused")
+                next_slot = len(db.file_cols) + 1
+                await status_message.edit_text(
+                    f"🛑 **Indexer paused • Database full**\n\n"
+                    f"`{error.unsaved_count}` files in messages "
+                    f"`{current_id:,}-{end_id:,}` were not saved.\n"
+                    f"The checkpoint was not moved. Add `DATABASE_URI_{next_slot}`, "
+                    f"restart, then tap Start to retry safely."
+                )
+                return
+            except Exception as error:
+                await _record_failed_range(
+                    chat_id, current_id, end_id, "batch_save", error, 4
+                )
+                await db.set_index_task(chat_id, "paused")
+                await status_message.edit_text(
+                    f"❌ **Indexer paused safely**\n\n"
+                    f"Database saving failed after retries for messages "
+                    f"`{current_id:,}-{end_id:,}`.\n"
+                    f"The checkpoint was **not advanced**, so Start will retry this range."
+                )
+                return
 
-        # Ease back toward the minimum pace after a clean run of batches —
-        # gradual, not instant, so we don't immediately re-trigger the
-        # FloodWait that just pushed batch_sleep up.
-        clean_streak += 1
-        if clean_streak >= 10 and batch_sleep > MIN_BATCH_SLEEP:
-            batch_sleep = max(MIN_BATCH_SLEEP, batch_sleep * 0.75)
-            clean_streak = 0
+            try:
+                await retry_with_backoff(
+                    lambda: db.set_index_progress(chat_id, end_id),
+                    attempts=3,
+                    base_delay=0.5,
+                    max_delay=3.0,
+                    jitter=0.25,
+                    on_retry=note_retry,
+                )
+            except Exception as error:
+                await _record_failed_range(
+                    chat_id, current_id, end_id, "checkpoint", error, 3
+                )
+                await db.set_index_task(chat_id, "paused")
+                await status_message.edit_text(
+                    f"❌ **Checkpoint not confirmed**\n\n"
+                    f"Messages `{current_id:,}-{end_id:,}` may already be saved. "
+                    f"The worker stopped so this range can be replayed safely."
+                )
+                return
 
-        await asyncio.sleep(batch_sleep)
+            try:
+                await db.resolve_index_failure(chat_id, current_id, end_id)
+            except Exception as error:
+                logger.warning(
+                    "Could not clear resolved index failure %s-%s: %s",
+                    current_id, end_id, type(error).__name__,
+                )
 
-    # 4. Finish Execution
-    if await db.get_index_task(chat_id) == "running":
-        total_time = time.time() - start_time
+            progress.record_batch(
+                end_id=end_id,
+                media=len(batch_files),
+                saved=new_saves,
+                duplicates=dups,
+                skipped=len(message_ids) - len(batch_files),
+            )
+            current_id = end_id + 1
+            if time.monotonic() >= next_ui_update or current_id > last_msg_id:
+                await _edit_live_status(chat_id, "running")
+                next_ui_update = time.monotonic() + 3.0
+            await asyncio.sleep(0.35)
+
         await db.clear_index_task(chat_id)
-        await status_message.edit_text(
-            f"🎉 **SUPER-INDEX COMPLETE!**\n\n"
-            f"⏱ **Total Time:** `{get_readable_time(total_time)}`\n"
-            f"✨ Saved: `{saved_files}`\n"
-            f"⚠️ Duplicates: `{duplicates}`\n"
-            f"🗑 Junk Ignored: `{deleted_empty}`"
-        )
-        # Smart index notification — sends full summary to log channel
+        await _edit_live_status(chat_id, "complete")
         total_in_db = await db.get_total_files()
-        asyncio.create_task(send_smart_log(client,
-            f"📦 **#IndexComplete**\n\n"
-            f"📺 **Channel:** `{chat_id}`\n"
-            f"✨ **Files Saved:** `{saved_files}`\n"
-            f"⚠️ **Duplicates Skipped:** `{duplicates}`\n"
-            f"🗑 **Junk Ignored:** `{deleted_empty}`\n"
-            f"⏱ **Time Taken:** `{get_readable_time(total_time)}`\n"
-            f"📁 **Total Files in DB Now:** `{total_in_db:,}`"
-        ))
+        _spawn_index_log(
+            send_smart_log(
+                client,
+                f"📦 **#IndexComplete**\n\n"
+                f"📺 **Channel:** `{chat_id}`\n"
+                f"✅ **Files saved:** `{progress.saved:,}`\n"
+                f"♻️ **Already indexed:** `{progress.duplicates:,}`\n"
+                f"⏭ **Skipped:** `{progress.skipped:,}`\n"
+                f"📁 **Library total:** `{total_in_db:,}`",
+            ),
+            chat_id,
+            "complete",
+        )
+    except asyncio.CancelledError:
+        await db.set_index_task(chat_id, "paused")
+        raise
+    finally:
+        _active_indexes.pop(chat_id, None)
 
 
 # --- UI HANDLERS & COMMANDS ---
@@ -278,7 +335,7 @@ async def forward_indexer(client: Client, message: Message):
         if chat_id and not last_msg_id:
             last_msg_id = message.id
     except Exception as detect_err:
-        logger.warning(f"Forward detection error: {detect_err}")
+        report_internal_error(logger, "forward_detection", detect_err)
 
     if not chat_id or not last_msg_id:
         return await message.reply_text("⚠️ Could not detect the channel ID. Please forward directly from a channel.", reply_parameters=None)
@@ -287,18 +344,25 @@ async def forward_indexer(client: Client, message: Message):
     try:
         # Ask Telegram if we have access to this channel BEFORE showing the menu
         await client.get_chat(chat_id)
-    except Exception as e:
+    except Exception as error:
+        reference = report_internal_error(
+            logger, "bulk_index_preflight", error, channel_id=chat_id
+        )
         return await message.reply_text(
             f"❌ **Indexing Blocked!**\n\n"
             f"I cannot read messages from `{chat_id}`.\n"
-            f"**Error:** `{e}`\n\n"
+            f"**Reference:** `{reference}`\n\n"
             f"⚠️ **Fix:** Make sure you add me as an **Administrator** to the channel first!",
             reply_parameters=None
         )
     # ------------------------
 
     saved_progress = await db.get_index_progress(chat_id)
-    resume_text = f"🔄 **Resuming from message {saved_progress}**\n" if saved_progress > 0 else ""
+    next_message = saved_progress + 1 if saved_progress > 0 else 1
+    resume_text = (
+        f"🔄 **Next message:** `{next_message:,}`\n"
+        if saved_progress > 0 else ""
+    )
 
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton("🚀 Start Super-Index", callback_data=f"bulkindex#{chat_id}#{last_msg_id}")],
@@ -307,11 +371,11 @@ async def forward_indexer(client: Client, message: Message):
     ])
 
     await message.reply_text(
-        f"⚡ **MCCxBot Super-Indexer Ready**\n\n"
-        f"📦 **Target Channel ID:** `{chat_id}`\n"
-        f"🎯 **Total Messages:** `{last_msg_id}`\n"
+        f"⚡ **Fast Indexer Ready**\n\n"
+        f"📦 **Channel:** `{chat_id}`\n"
+        f"🎯 **Last message:** `{last_msg_id:,}`\n"
         f"{resume_text}\n"
-        f"Ready to run in Stealth Mode?",
+        f"Progress is saved after every batch. You can pause, restart or stop safely.",
         reply_markup=markup,
         reply_parameters=None
     )
@@ -324,33 +388,55 @@ async def start_bulk_index(client: Client, callback: CallbackQuery):
         chat_id = int(chat_id_str)
         last_msg_id = int(last_msg_id_str)
     except (ValueError, IndexError):
-        return await callback.answer("❌ Malformed callback data.", show_alert=True)
+        return await answer_callback_safely(
+            callback, "❌ Malformed callback data.", show_alert=True
+        )
+
+    await answer_callback_safely(callback, "⏳ Starting indexer…")
 
     # Fetch state from MongoDB instead of the deleted RAM dictionary
     state = await db.get_index_task(chat_id)
     if state == "running":
-        return await callback.answer("⚠️ Indexer is already running for this channel!", show_alert=True)
+        return await callback.message.edit_text(
+            "⚠️ **This channel is already being indexed.**"
+        )
 
-    start_id = await db.get_index_progress(chat_id)
-    if start_id == 0: start_id = 1
+    saved_progress = await db.get_index_progress(chat_id)
+    start_id = max(1, saved_progress + 1)
+    if start_id > last_msg_id:
+        return await callback.message.edit_text(
+            "✅ **Nothing new to index.**\n\n"
+            f"The saved checkpoint is already at message `{saved_progress:,}`."
+        )
 
     status_msg = await callback.message.edit_text("⏳ **Spinning up background worker...**")
     
     # --- FEATURE 4: INDEXING REQUESTS LOG ---
     log_text = (
-        f"🚀 **#IndexRequest**\n\n"
-        f"👤 **Admin:** {callback.from_user.mention}\n"
-        f"📦 **Target Channel:** `{chat_id}`\n"
-        f"🎯 **Total Messages:** `{last_msg_id}`\n"
-        f"🔄 **Starting From:** `{start_id}`"
+        "🚀 <b>#IndexRequest</b>\n\n"
+        f"👤 <b>Admin:</b> {html_user_mention(callback.from_user)}\n"
+        f"📦 <b>Target Channel:</b> <code>{chat_id}</code>\n"
+        f"🎯 <b>Total Messages:</b> <code>{last_msg_id}</code>\n"
+        f"🔄 <b>Starting From:</b> <code>{start_id}</code>"
     )
-    asyncio.create_task(send_smart_log(client, log_text))
+    _spawn_index_log(
+        send_smart_log(client, log_text, parse_mode=ParseMode.HTML),
+        chat_id,
+        "requested",
+    )
     # ----------------------------------------
     
     # Offload the massive task to the background
-    task = asyncio.create_task(run_indexer(client, status_msg, chat_id, last_msg_id, start_id))
-    task.add_done_callback(lambda t: _log_task_crash(t, client, f"run_indexer(chat={chat_id})"))
-    await callback.answer()
+    try:
+        supervisor.spawn(
+            run_indexer(client, status_msg, chat_id, last_msg_id, start_id),
+            key=f"index:{chat_id}",
+            owner=f"admin:{callback.from_user.id}",
+            resources=("movie-catalog", f"index-channel:{chat_id}"),
+            drain_on_shutdown=True,
+        )
+    except TaskConflict as exc:
+        await status_msg.edit_text(f"⚠️ **Indexer not started:** `{exc}`")
 
 
 @Client.on_callback_query(filters.regex(r"^resetidx#") & filters.user(ADMIN_ID))
@@ -361,17 +447,28 @@ async def reset_and_index(client: Client, callback: CallbackQuery):
         chat_id = int(chat_id_str)
         last_msg_id = int(last_msg_id_str)
     except (ValueError, IndexError):
-        return await callback.answer("❌ Malformed callback.", show_alert=True)
+        return await answer_callback_safely(
+            callback, "❌ Malformed callback.", show_alert=True
+        )
 
+    await answer_callback_safely(callback, "🔄 Resetting progress…")
     await db.clear_index_progress(chat_id)
     status_msg = await callback.message.edit_text("⏳ **Progress reset. Starting from message 1...**")
-    task = asyncio.create_task(run_indexer(client, status_msg, chat_id, last_msg_id, 1))
-    task.add_done_callback(lambda t: _log_task_crash(t, client, f"run_indexer(chat={chat_id})"))
-    asyncio.create_task(send_smart_log(client,
+    try:
+        supervisor.spawn(
+            run_indexer(client, status_msg, chat_id, last_msg_id, 1),
+            key=f"index:{chat_id}",
+            owner=f"admin:{callback.from_user.id}",
+            resources=("movie-catalog", f"index-channel:{chat_id}"),
+            drain_on_shutdown=True,
+        )
+    except TaskConflict as exc:
+        await status_msg.edit_text(f"⚠️ **Indexer not started:** `{exc}`")
+        return
+    _spawn_index_log(send_smart_log(client,
         f"🔄 **#IndexReset**\n\n📦 Channel: `{chat_id}`\n"
         f"🎯 Total: `{last_msg_id}`\nStarting fresh from message 1."
-    ))
-    await callback.answer()
+    ), chat_id, "reset")
 
 
 # --- CONTROL BUTTON CALLBACKS ---
@@ -380,39 +477,38 @@ async def pause_index(client: Client, callback: CallbackQuery):
     try:
         chat_id = int(callback.data.split("#")[1])
     except (ValueError, IndexError):
-        return await callback.answer("❌ Malformed callback.", show_alert=True)
+        return await answer_callback_safely(
+            callback, "❌ Malformed callback.", show_alert=True
+        )
+    await answer_callback_safely(callback, "Indexer paused ⏸")
     await db.set_index_task(chat_id, "paused")
-    
-    markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("▶️ Resume", callback_data=f"resume_idx#{chat_id}"),
-         InlineKeyboardButton("⏹ Stop", callback_data=f"stop_idx#{chat_id}")]
-    ])
-    await callback.message.edit_reply_markup(reply_markup=markup)
-    await callback.answer("Indexer Paused ⏸")
+    await _edit_live_status(chat_id, "paused")
 
 @Client.on_callback_query(filters.regex(r"^resume_idx#") & filters.user(ADMIN_ID))
 async def resume_index(client: Client, callback: CallbackQuery):
     try:
         chat_id = int(callback.data.split("#")[1])
     except (ValueError, IndexError):
-        return await callback.answer("❌ Malformed callback.", show_alert=True)
+        return await answer_callback_safely(
+            callback, "❌ Malformed callback.", show_alert=True
+        )
+    await answer_callback_safely(callback, "Indexer resumed ▶️")
     await db.set_index_task(chat_id, "running")
-    
-    markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⏸ Pause", callback_data=f"pause_idx#{chat_id}"),
-         InlineKeyboardButton("⏹ Stop", callback_data=f"stop_idx#{chat_id}")]
-    ])
-    await callback.message.edit_reply_markup(reply_markup=markup)
-    await callback.answer("Indexer Resumed ▶️")
+    await _edit_live_status(chat_id, "running")
 
 @Client.on_callback_query(filters.regex(r"^stop_idx#") & filters.user(ADMIN_ID))
 async def stop_index(client: Client, callback: CallbackQuery):
     try:
         chat_id = int(callback.data.split("#")[1])
     except (ValueError, IndexError):
-        return await callback.answer("❌ Malformed callback.", show_alert=True)
+        return await answer_callback_safely(
+            callback, "❌ Malformed callback.", show_alert=True
+        )
+    await answer_callback_safely(
+        callback, "Stopping after the current batch…", show_alert=True
+    )
     await db.set_index_task(chat_id, "stopped")
-    await callback.answer("Stopping Indexer... ⏹", show_alert=True)
+    await _edit_live_status(chat_id, "stopping")
 
 # No close_data handler in this file — the canonical one lives in admin.py.
 # Having it here too caused Pyrogram to register it twice, leading to

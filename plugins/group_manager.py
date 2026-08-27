@@ -7,7 +7,7 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, 
 from pyrogram.enums import ParseMode
 from database.db import db
 from plugins.state import get_state, set_state, clear_state
-from utils import ADMIN_ID
+from utils import ADMIN_ID, _html
 
 load_dotenv()
 
@@ -363,17 +363,23 @@ async def gm_input_handler(client: Client, message: Message):
 
         if not matched:
             await message.reply_text(
-                f"❌ No groups found matching `{query}`.",
+                f"❌ No groups found matching <code>{_html(query)}</code>.",
+                parse_mode=ParseMode.HTML,
                 reply_markup=_BACK_BTN
             )
             return
 
-        text = f"🔍 **Found {len(matched)} group(s):**\n\n"
+        text = f"🔍 <b>Found {len(matched)} group(s):</b>\n\n"
         for g in matched[:10]:
             status = "🚫" if g.get("banned") else ("✅" if g.get("whitelisted") else "⚪")
-            text += f"{status} `{g['_id']}` — {g.get('title', '?')[:30]}\n"
+            text += (
+                f"{status} <code>{g['_id']}</code> — "
+                f"{_html(g.get('title', '?')[:30])}\n"
+            )
 
-        await message.reply_text(text, reply_markup=_BACK_BTN)
+        await message.reply_text(
+            text, reply_markup=_BACK_BTN, parse_mode=ParseMode.HTML
+        )
 
     elif state.startswith("gm_autodel#"):
         try:

@@ -2,8 +2,8 @@ import os
 import time
 import asyncio
 import logging
+import secrets
 from dotenv import load_dotenv
-from pyrogram.errors import UserNotParticipant
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 try:
     from pyrogram.types import LinkPreviewOptions
@@ -13,6 +13,12 @@ except ImportError:
     def _no_preview(): return {"disable_web_page_preview": True}
 from pyrogram.enums import ParseMode
 from database.db import db
+from plugins.log_safety import redact_log_secrets
+from verification import (
+    VerificationResult,
+    VerificationStatus,
+    check_channel_membership,
+)
 
 load_dotenv()
 
@@ -24,6 +30,33 @@ def _html(text) -> str:
     Single shared definition — every plugin that builds HTML captions
     imports this instead of redefining it locally."""
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def report_internal_error(log, event: str, error: Exception, **context) -> str:
+    """Log a redacted structured error and return a public correlation code."""
+    reference = f"{event.upper().replace('_', '-')[:20]}-{secrets.token_hex(3).upper()}"
+    safe_context = {
+        key: redact_log_secrets(value) for key, value in context.items()
+    }
+    log.error(
+        "event=%s reference=%s error_type=%s error=%s context=%s",
+        event,
+        reference,
+        type(error).__name__,
+        redact_log_secrets(error),
+        safe_context,
+    )
+    return reference
+
+
+def public_error_message(reference: str) -> str:
+    return f"The operation could not be completed. Reference: {reference}"
+
+
+def html_user_mention(user) -> str:
+    user_id = int(getattr(user, "id", 0))
+    name = _html(getattr(user, "first_name", None) or "User")
+    return f'<a href="tg://user?id={user_id}">{name}</a>'
 
 
 def callback_data(prefix: str, value, max_bytes: int = 64) -> str:
@@ -106,40 +139,45 @@ def _parse_fsub_entry(entry):
         return str(entry), "join"
 
 
-async def is_subscribed_by_id(client, user_id: int) -> bool:
-    """Core Main-FSub membership check against every configured channel,
-    by user_id directly — the reusable half of is_subscribed() below, and
-    also used by req_fsub.py's unified verification-gates checker so both
-    entry points share one exact set of pass/fail semantics. Deny only on
-    KICKED/BANNED/LEFT/UserNotParticipant; fail-open on any other error
-    (documented tradeoff — see BOT_BLUEPRINT.md's fail-open FSub note)."""
-    config = await db.get_config()
+async def get_subscription_status_by_id(
+    client, user_id: int, config: dict | None = None
+) -> VerificationResult:
+    """Return a tri-state aggregate for every configured Main-FSub channel."""
+    if config is None:
+        try:
+            config = await db.get_config()
+        except Exception as exc:
+            logger.warning(
+                "verification_indeterminate gate=main_fsub error_type=%s",
+                type(exc).__name__,
+            )
+            return VerificationResult.indeterminate("config_unavailable")
+
     fsub_channels = config.get("fsub_channels", [])
+    if not isinstance(fsub_channels, list):
+        return VerificationResult.indeterminate("invalid_fsub_configuration")
     if not fsub_channels:
-        return True
+        return VerificationResult.allow("main_fsub_disabled")
 
     for entry in fsub_channels:
         channel_id, _ = _parse_fsub_entry(entry)
         if not channel_id:
-            continue
-        try:
-            ch = int(channel_id) if str(channel_id).lstrip('-').isdigit() else str(channel_id)
-            member = await client.get_chat_member(ch, user_id)
-            if member.status.name in ["KICKED", "BANNED", "LEFT"]:
-                return False
-        except UserNotParticipant:
-            return False
-        except Exception as e:
-            logger.warning(f"FSub check error on channel {channel_id}: {e}")
-            continue
+            return VerificationResult.indeterminate("missing_main_fsub_channel_id")
+        result = await check_channel_membership(client, channel_id, user_id)
+        if result.status is not VerificationStatus.PASS:
+            return result
+    return VerificationResult.allow("all_main_fsub_channels_joined")
 
-    return True
+
+async def is_subscribed_by_id(client, user_id: int) -> bool:
+    """Compatibility boolean that fails closed unless membership is proven."""
+    return (await get_subscription_status_by_id(client, user_id)).passed
 
 
 async def is_subscribed(client, message_or_callback):
     """Checks if the user has joined all FSub channels."""
     if not message_or_callback.from_user:
-        return True  # anonymous admin — let through
+        return False
     return await is_subscribed_by_id(client, message_or_callback.from_user.id)
 
 

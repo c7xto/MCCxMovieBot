@@ -13,7 +13,8 @@ from database.db import db
 from tmdb import get_movie_data
 from pyrogram.errors import FloodWait, InputUserDeactivated, UserIsBlocked
 from plugins.filter import send_smart_log
-from plugins.health_monitor import _log_task_crash
+from plugins.telegram_retry import BACKGROUND_RETRY, telegram_call
+from plugins.task_supervisor import TaskConflict, supervisor
 from utils import _html
 
 # load_dotenv() needed so DATABASE_CHANNEL_ID env fallback works correctly
@@ -26,33 +27,52 @@ RECENT_POSTS = OrderedDict()
 _RECENT_POSTS_MAX = 1000
 POST_COOLDOWN = 300
 
-# ── POST QUEUE ────────────────────────────────────────────────────────────────
-# A global asyncio queue so rapid bulk-indexing of many files doesn't fire
-# 50 Telegram messages at once and trigger a FloodWait on the update channel.
-# Posts drain at one every 3 seconds regardless of how many arrive.
-_post_queue: asyncio.Queue = asyncio.Queue()
-_queue_worker_started = False
-
-
-async def _post_queue_worker(client: Client):
-    """Drains the post queue at a safe rate of 1 post per 3 seconds."""
+# ── DURABLE POST QUEUE ────────────────────────────────────────────────────────
+async def run_notification_worker(client: Client):
+    """Claims durable announcements at a safe rate of 1 post per 3 seconds."""
     while True:
+        job = None
         try:
-            filename = await _post_queue.get()
-            await _do_post(client, filename)
-            _post_queue.task_done()
+            job = await db.claim_due_notification()
+            if not job:
+                await asyncio.sleep(3)
+                continue
+            payload = job.get("payload", {})
+            file_name = payload.get("file_name") or job.get("file_name", "")
+            if job.get("kind", "announcement") == "request_fulfillment":
+                await _fulfill_matching_requests(client, file_name)
+            else:
+                await _do_post(client, file_name)
+            await db.complete_announcement(job["_id"], job.get("revision"))
+        except asyncio.CancelledError:
+            raise
+        except FloodWait as exc:
+            if job:
+                await db.retry_announcement(
+                    job["_id"],
+                    max(5, exc.value) + random.uniform(0.0, 2.0),
+                    job.get("revision"),
+                )
         except Exception as e:
-            logger.error(f"Post queue worker error: {e}")
+            logger.error("Post queue worker error: %s", e)
+            if job:
+                delay = min(3600, 30 * (2 ** min(job.get("attempts", 1), 7)))
+                await db.retry_announcement(
+                    job["_id"], delay, job.get("revision")
+                )
         await asyncio.sleep(3)
 
 
 async def _ensure_queue_worker(client: Client):
     """Starts the queue worker once on first use."""
-    global _queue_worker_started
-    if not _queue_worker_started:
-        _queue_worker_started = True
-        worker_task = asyncio.create_task(_post_queue_worker(client))
-        worker_task.add_done_callback(lambda t: _log_task_crash(t, client, "post_queue_worker"))
+    try:
+        supervisor.spawn(
+            run_notification_worker(client),
+            key="worker:announcement-outbox",
+            owner="realtime_indexer",
+        )
+    except TaskConflict:
+        pass
 
 
 # ── FILE INFO PARSER ──────────────────────────────────────────────────────────
@@ -134,12 +154,6 @@ async def _do_post(client: Client, filename: str):
     if current_time - last_posted < POST_COOLDOWN:
         return
 
-    if title_key in RECENT_POSTS:
-        RECENT_POSTS.move_to_end(title_key)
-    elif len(RECENT_POSTS) >= _RECENT_POSTS_MAX:
-        RECENT_POSTS.popitem(last=False)  # evict least-recently-used
-    RECENT_POSTS[title_key] = current_time
-
     tmdb_data = await get_movie_data(clean_title)
     display_title = tmdb_data["title"] if tmdb_data else clean_title.title()
 
@@ -170,24 +184,39 @@ async def _do_post(client: Client, filename: str):
 
     markup = InlineKeyboardMarkup(buttons)
 
-    try:
-        if tmdb_data and tmdb_data.get("poster"):
-            await client.send_photo(
+    if tmdb_data and tmdb_data.get("poster"):
+        await telegram_call(
+            lambda: client.send_photo(
                 chat_id=update_channel,
                 photo=tmdb_data["poster"],
                 caption=caption,
                 reply_markup=markup,
-                parse_mode=ParseMode.HTML
-            )
-        else:
-            await client.send_message(
+                parse_mode=ParseMode.HTML,
+            ),
+            route="update_channel_photo",
+            policy=BACKGROUND_RETRY,
+            retry_safe=True,
+            idempotency_key=f"announcement:{title_key}",
+        )
+    else:
+        await telegram_call(
+            lambda: client.send_message(
                 chat_id=update_channel,
                 text=caption,
                 reply_markup=markup,
-                parse_mode=ParseMode.HTML
-            )
-    except Exception as e:
-        logger.error(f"Failed to auto-post '{clean_title}': {e}")
+                parse_mode=ParseMode.HTML,
+            ),
+            route="update_channel_text",
+            policy=BACKGROUND_RETRY,
+            retry_safe=True,
+            idempotency_key=f"announcement:{title_key}",
+        )
+
+    if title_key in RECENT_POSTS:
+        RECENT_POSTS.move_to_end(title_key)
+    elif len(RECENT_POSTS) >= _RECENT_POSTS_MAX:
+        RECENT_POSTS.popitem(last=False)
+    RECENT_POSTS[title_key] = current_time
 
 
 # ── NEW FILE HANDLER ──────────────────────────────────────────────────────────
@@ -216,11 +245,17 @@ async def index_new_files(client: Client, message: Message):
     log_channel = config.get("log_channel", 0)
     if log_channel and success:
         try:
-            await client.send_message(
-                log_channel,
-                f"✅ **Successfully Indexed**\n\n"
-                f"🎬 **File:** `{media.file_name}`\n"
-                f"💿 **Size:** `{media.file_size / (1024 * 1024):.2f} MB`"
+            await telegram_call(
+                lambda: client.send_message(
+                    log_channel,
+                    f"✅ **Successfully Indexed**\n\n"
+                    f"🎬 **File:** `{media.file_name}`\n"
+                    f"💿 **Size:** `{media.file_size / (1024 * 1024):.2f} MB`",
+                ),
+                route="realtime_index_log",
+                policy=BACKGROUND_RETRY,
+                retry_safe=True,
+                idempotency_key=f"index-log:{media.file_id}",
             )
         except Exception:
             pass
@@ -228,26 +263,33 @@ async def index_new_files(client: Client, message: Message):
         # Real-time ingestion has no other failure path — without this alert
         # every new upload silently vanishes from the index the moment all
         # clusters hit their 450MB safety margin.
-        asyncio.create_task(send_smart_log(client,
-            f"🛑 **#DatabaseFull**\n\n"
-            f"Real-time indexing failed — every configured cluster is at its 450MB safety margin.\n"
-            f"🎬 **File:** `{media.file_name}`\n"
-            f"**Fix:** Add a new `DATABASE_URI` cluster and restart the bot.\n\n"
-            f"⚠️ This file was **not indexed** and will not appear in search."
-        ))
+        try:
+            supervisor.spawn(
+                send_smart_log(
+                    client,
+                    f"🛑 **#DatabaseFull**\n\n"
+                    f"Real-time indexing failed — every configured cluster is at "
+                    f"its 450MB safety margin.\n"
+                    f"🎬 **File:** `{media.file_name}`\n"
+                    f"**Fix:** Add a new `DATABASE_URI` cluster and restart the bot.\n\n"
+                    f"⚠️ This file was **not indexed** and will not appear in search."
+                ),
+                key=f"log:realtime-full:{media.file_id}",
+                owner="realtime_indexer",
+                drain_on_shutdown=True,
+            )
+        except TaskConflict:
+            logger.info("Realtime capacity log skipped during shutdown")
 
     if success:
         # Ensure queue worker is running
         await _ensure_queue_worker(client)
-        # Fire-and-forget: delay then enqueue so handler returns immediately
-        async def _delayed_enqueue(fname):
-            await asyncio.sleep(random.uniform(1.0, 3.0))
-            await _post_queue.put(fname)
-        asyncio.create_task(_delayed_enqueue(media.file_name))
-
-        # Auto request fulfillment — check if any pending requests match this file
-        # Runs in background so it never delays indexing
-        asyncio.create_task(_fulfill_matching_requests(client, media.file_name))
+        await db.enqueue_announcement(
+            media.file_name, delay_seconds=random.uniform(1.0, 3.0)
+        )
+        await db.enqueue_request_fulfillment(
+            media.file_name, delay_seconds=random.uniform(1.0, 3.0)
+        )
 
 
 async def _fulfill_matching_requests(client, file_name: str):
@@ -257,21 +299,19 @@ async def _fulfill_matching_requests(client, file_name: str):
     This runs entirely in the background — any failure is silent and safe.
     """
     try:
-        matches = await db.find_matching_requests(file_name)
-        if not matches:
-            return
-
         safe_name = re.sub(r'[^a-zA-Z0-9]', '_', file_name)[:45]
-
-        for match in matches:
+        matched = False
+        transient_failure = None
+        async for match in db.iter_matching_requests(file_name):
+            matched = True
             user_id = match["user_id"]
             movie_name = match["movie_name"]
             try:
                 notify_text = (
-                    f"🎉 **Great News!**\n\n"
-                    f"The movie you requested — **{movie_name}** — "
-                    f"has just been uploaded to our database!\n\n"
-                    f"👇 Tap below to fetch it instantly."
+                    "🎉 <b>Great News!</b>\n\n"
+                    f"The movie you requested — <b>{_html(movie_name)}</b> — "
+                    "has just been uploaded to our database!\n\n"
+                    "👇 Tap below to fetch it instantly."
                 )
                 markup = InlineKeyboardMarkup([
                     [InlineKeyboardButton(
@@ -279,18 +319,37 @@ async def _fulfill_matching_requests(client, file_name: str):
                         url=f"https://t.me/{client.me.username}?start=search_{safe_name}"
                     )]
                 ])
-                await client.send_message(
-                    chat_id=user_id,
-                    text=notify_text,
-                    reply_markup=markup
+                await telegram_call(
+                    lambda: client.send_message(
+                        chat_id=user_id,
+                        text=notify_text,
+                        reply_markup=markup,
+                        parse_mode=ParseMode.HTML,
+                    ),
+                    route="request_auto_fulfillment",
+                    policy=BACKGROUND_RETRY,
+                    retry_safe=True,
+                    idempotency_key=f"request:{user_id}:{movie_name.casefold()}",
                 )
                 await db.delete_pending_request(user_id, movie_name)
-                logger.info(f"Auto-fulfilled request for user {user_id}: {movie_name}")
+                logger.info(
+                    "Auto-fulfilled request user_id=%s movie=%r", user_id, movie_name
+                )
             except (InputUserDeactivated, UserIsBlocked):
                 await db.delete_user(user_id)
                 await db.delete_pending_request(user_id, movie_name)
                 logger.info(f"User {user_id} blocked/deactivated — cleaned up")
+            except FloodWait:
+                raise
             except Exception as e:
                 logger.warning(f"Could not notify user {user_id} for request '{movie_name}': {e}")
+                transient_failure = e
+        if not matched:
+            return
+        if transient_failure is not None:
+            raise RuntimeError("One or more request notifications failed") from transient_failure
+    except FloodWait:
+        raise
     except Exception as e:
         logger.warning(f"Request fulfillment check failed for '{file_name}': {e}")
+        raise
