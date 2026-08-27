@@ -21,14 +21,9 @@ def _verify_environment():
     or any database cluster connection is attempted.
 
     Runs two checks:
-      1. Python 3.14 asyncio event loop patch — Python 3.14 removed the
-         implicit loop-creation fallback that asyncio.get_event_loop() used
-         to rely on, so calling it on a fresh thread with no running loop
-         now raises RuntimeError instead of silently creating one. Pyrogram
-         calls get_event_loop() at import time, so on 3.14 `import pyrogram`
-         crashes unless a loop has already been registered first. This is
-         empirically confirmed against this host's Python 3.14 install, not
-         assumed.
+      1. Python 3.13+ asyncio event loop patch — register a loop before
+         importing Pyrogram without calling the deprecated synchronous
+         asyncio.get_event_loop() fallback.
       2. Cryptographic / CA bundle sanity — certifi.where() must resolve to
          a real, non-empty CA bundle file, since database/db.py uses it as
          tlsCAFile for secured MongoDB cluster connections. A missing or
@@ -40,16 +35,17 @@ def _verify_environment():
     """
     logger.info("🔎 Verifying startup environment (event loop + TLS/CA bundle)...")
 
-    # 1. Python 3.14 asyncio event loop patch — must happen before `import
-    # pyrogram` anywhere below.
+    # 1. Python 3.13+ asyncio event loop patch — must happen before `import
+    # pyrogram` anywhere below. get_running_loop() is warning-free when no
+    # loop has been registered yet, unlike get_event_loop() on Python 3.13.
     try:
         try:
-            asyncio.get_event_loop()
+            asyncio.get_running_loop()
         except RuntimeError:
             asyncio.set_event_loop(asyncio.new_event_loop())
         logger.info("  ✅ asyncio event loop — OK")
     except Exception as e:
-        logger.error(f"  ❌ Failed to patch the asyncio event loop for Python 3.14: {e}")
+        logger.error(f"  ❌ Failed to prepare the asyncio event loop: {e}")
         sys.exit(1)
 
     # 2. Cryptographic & CA bundle sanity check.
@@ -140,14 +136,19 @@ class AutoFilterBot(Client):
             max_concurrent_transmissions=3
         )
 
-    async def start(self, *args, **kwargs):
+    async def start(self, *args, use_qr=False, except_ids=None, **kwargs):
         """Start through Kurigram while preserving its runtime options.
 
-        ``Client.run()`` forwards keyword arguments such as ``use_qr`` and
-        ``except_ids`` to ``start()``.  Accepting and forwarding them keeps
-        this override compatible with current Kurigram releases.
+        Kurigram 2.2.25 forwards ``use_qr`` and ``except_ids`` from run() to
+        start(). Keep them explicit so an outdated deployed entry file is
+        immediately visible and future keyword options still pass through.
         """
-        await super().start(*args, **kwargs)
+        await super().start(
+            *args,
+            use_qr=use_qr,
+            except_ids=except_ids if except_ids is not None else [],
+            **kwargs,
+        )
         me = await self.get_me()
         logger.info(f"🚀 Bot started as @{me.username}")
 
@@ -212,13 +213,13 @@ class AutoFilterBot(Client):
         self.background_tasks.append(deletion_task)
         logger.info("✅ Durable deletion worker started.")
 
-    async def stop(self, *args):
+    async def stop(self, *args, **kwargs):
         for task in self.background_tasks:
             task.cancel()
         if self.background_tasks:
             await asyncio.gather(*self.background_tasks, return_exceptions=True)
             self.background_tasks.clear()
-        await super().stop()
+        await super().stop(*args, **kwargs)
         await db.close()
         logger.info("🛑 Bot stopped.")
 
