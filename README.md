@@ -15,6 +15,7 @@ Fast Telegram movie and series search for the Malayalam Cinema Club.
 - Delivers cached Telegram files privately with durable auto-deletion.
 - Supports group-to-private search handoff, spell suggestions and series grouping.
 - Indexes storage channels in real time or through the resumable bulk indexer.
+- Can give each new upload a clean branded filename before it becomes searchable.
 - Shows live indexing speed, ETA and separate scanned, saved, existing and skipped counters.
 - Scans the existing library for exact and probable duplicates without deleting anything.
 - Provides a Telegram-native control center for files, groups, channels, access gates, analytics and health.
@@ -88,6 +89,27 @@ docker compose logs -f bot
 community links and the TMDB API Read Access Token (`TMDB_BEARER_TOKEN`) are
 documented in `.env.example`; most presentation and access settings can then
 be managed live through `/admin`.
+
+## File branding
+
+Open `/admin` → **Appearance** → **File Branding** to set this up.
+
+1. Create a private Telegram channel for the renamed copies.
+2. Add the bot there as an administrator.
+3. Enter that channel's numeric ID under **Set Cache Channel**.
+4. Set the short brand text you want at the end of each filename.
+5. Check **Filename Preview**, then enable branding.
+
+For every new source-channel upload, the bot downloads the file once, removes
+promotional links and messy separators from its name, uploads the renamed copy
+to the private channel, and verifies it before switching delivery. Users then
+receive the renamed Telegram copy instantly from cache. The source message is
+never deleted. If all rename retries fail, the original is restored for search
+instead of losing the file.
+
+This setting applies only to new real-time uploads. It does not re-upload the
+existing library. The host needs enough temporary disk space for the largest
+file being processed, and only one file is processed at a time.
 
 All non-loopback MongoDB connections must use certificate-validated TLS. Prefer
 `mongodb+srv://...`; a standard `mongodb://...` remote URI must include

@@ -6,18 +6,19 @@ from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.enums import ParseMode
 from database.db import db
-from plugins.state import get_state, set_state, clear_state
+from plugins.state import get_state, get_state_context, set_state, clear_state
 from plugins.task_supervisor import TaskConflict, supervisor
 from plugins.callbacks import answer_callback_safely
+from plugins.ui_helpers import begin_prompt, cancel_button, finish_prompt, restore_prompt
 from utils import ADMIN_ID, _html, report_internal_error
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-_BACK_BTN = InlineKeyboardMarkup([
-    [InlineKeyboardButton("‹ File Manager", callback_data="file_manager_menu")]
-])
+_BACK_BTN = InlineKeyboardMarkup(
+    [[InlineKeyboardButton("‹ File Manager", callback_data="file_manager_menu")]]
+)
 
 # In-memory cache for duplicate scan results, keyed by admin user_id so
 # concurrent admin sessions don't overwrite each other's scan results.
@@ -26,21 +27,29 @@ _cached_dupes = {}
 
 # ── FILE MANAGER MENU ─────────────────────────────────────────────────────────
 
+
 @Client.on_callback_query(filters.regex(r"^file_manager_menu$") & filters.user(ADMIN_ID))
 async def file_manager_menu(client: Client, callback: CallbackQuery):
+    clear_state(callback.from_user.id)
     await answer_callback_safely(callback)
     total_files = await db.get_total_files()
-    markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔎 Find Files", callback_data="fm_search"),
-         InlineKeyboardButton("🧬 Duplicates", callback_data="fm_duplicates")],
-        [InlineKeyboardButton("🧹 Pattern Cleanup", callback_data="fm_bulkdelete"),
-         InlineKeyboardButton("⚡ CAM Cleanup", callback_data="fm_quickpurgecam")],
-        [InlineKeyboardButton("📋 Missing Requests", callback_data="fm_missing")],
-        [InlineKeyboardButton("‹ Control Center", callback_data="back_to_admin")]
-    ])
+    markup = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🔎 Find Files", callback_data="fm_search"),
+                InlineKeyboardButton("🧬 Duplicates", callback_data="fm_duplicates"),
+            ],
+            [
+                InlineKeyboardButton("🧹 Pattern Cleanup", callback_data="fm_bulkdelete"),
+                InlineKeyboardButton("⚡ CAM Cleanup", callback_data="fm_quickpurgecam"),
+            ],
+            [InlineKeyboardButton("📋 Missing Requests", callback_data="fm_missing")],
+            [InlineKeyboardButton("‹ Control Center", callback_data="back_to_admin")],
+        ]
+    )
     text = (
-        "🗂 **File Manager**\n"
-        f"━━━━━━━━━━━━━━━━━━\n📚 `{total_files:,}` indexed files\n"
+        "🗂 **File Manager**\n\n"
+        f"📚 `{total_files:,}` indexed files\n"
         "Search, repair and clean your library safely."
     )
     try:
@@ -51,13 +60,14 @@ async def file_manager_menu(client: Client, callback: CallbackQuery):
 
 # ── SEARCH & DELETE ───────────────────────────────────────────────────────────
 
+
 @Client.on_callback_query(filters.regex(r"^fm_search$") & filters.user(ADMIN_ID))
 async def fm_search_prompt(client: Client, callback: CallbackQuery):
-    set_state(callback.from_user.id, "fm_search")
-    await callback.message.reply_text(
-        "🔍 **File Search**\n\nSend me the movie/file name to search.\n*Type /cancel to abort.*"
+    await begin_prompt(
+        callback,
+        "fm_search",
+        "🔍 **File Search**\n\nSend the movie or file name to search.",
     )
-    await callback.answer()
 
 
 @Client.on_message(filters.command("filesearch") & filters.private & filters.user(ADMIN_ID))
@@ -79,7 +89,7 @@ async def _do_file_search(client, message_obj, query):
         await status.edit_text(
             f"❌ No files found for <code>{_html(query)}</code>.",
             parse_mode=ParseMode.HTML,
-            reply_markup=_BACK_BTN
+            reply_markup=_BACK_BTN,
         )
         return
 
@@ -92,10 +102,14 @@ async def _do_file_search(client, message_obj, query):
         name = file_doc.get("file_name", "Unknown")
         obj_id = str(file_doc["_id"])
 
-        markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🗑 Delete", callback_data=f"fm_del#{obj_id}"),
-             InlineKeyboardButton("✏ Rename", callback_data=f"fm_rename#{obj_id}")]
-        ])
+        markup = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("🗑 Delete", callback_data=f"fm_del#{obj_id}"),
+                    InlineKeyboardButton("✏ Rename", callback_data=f"fm_rename#{obj_id}"),
+                ]
+            ]
+        )
 
         await message_obj.reply_text(
             f"📄 <code>{_html(name)}</code>\n"
@@ -111,45 +125,42 @@ async def fm_delete_file(client: Client, callback: CallbackQuery):
     obj_id = callback.data.split("#")[1]
     deleted = await db.delete_file_by_obj_id(obj_id)
     if deleted:
-        await callback.answer("✅ File deleted from database.", show_alert=True)
+        await answer_callback_safely(callback, "✅ File deleted from database.", show_alert=True)
         await callback.message.delete()
     else:
-        await callback.answer("❌ File not found — may already be deleted.", show_alert=True)
+        await answer_callback_safely(callback, "❌ File not found — may already be deleted.", show_alert=True)
 
 
 # ── RENAME ────────────────────────────────────────────────────────────────────
 
+
 @Client.on_callback_query(filters.regex(r"^fm_rename#") & filters.user(ADMIN_ID))
 async def fm_rename_prompt(client: Client, callback: CallbackQuery):
     obj_id = callback.data.split("#")[1]
-    set_state(callback.from_user.id, f"fm_rename#{obj_id}")
-    await callback.message.reply_text(
-        f"✏️ **Rename File**\n\n"
-        f"File ID: `{obj_id}`\n\n"
-        f"Send me the new file name.\n*Type /cancel to abort.*"
+    await begin_prompt(
+        callback,
+        f"fm_rename#{obj_id}",
+        f"✏️ **Rename File**\n\nFile ID: `{obj_id}`\n\nSend the new searchable file name.",
     )
-    await callback.answer()
 
 
 @Client.on_callback_query(filters.regex(r"^fm_editname$") & filters.user(ADMIN_ID))
 async def fm_editname_prompt(client: Client, callback: CallbackQuery):
-    set_state(callback.from_user.id, "fm_editname_id")
-    await callback.message.reply_text(
-        "✏️ **Edit File Name**\n\n"
-        "Send me the **File Object ID** (the long hex string from a file search result).\n"
-        "*Type /cancel to abort.*"
+    await begin_prompt(
+        callback,
+        "fm_editname_id",
+        "✏️ **Edit File Name**\n\nSend the **File Object ID** from a file search result.",
     )
-    await callback.answer()
 
 
 # ── FIND DUPLICATES ───────────────────────────────────────────────────────────
+
 
 @Client.on_callback_query(filters.regex(r"^fm_duplicates$") & filters.user(ADMIN_ID))
 async def fm_duplicates(client: Client, callback: CallbackQuery):
     await answer_callback_safely(callback, "🔎 Starting safe scan…")
     await callback.message.edit_text(
-        "🧬 **Duplicate Report • Starting**\n\n"
-        "This is a report-only scan. Nothing will be deleted."
+        "🧬 **Duplicate Report • Starting**\n\nThis is a report-only scan. Nothing will be deleted."
     )
 
     # Run in background so it doesn't timeout
@@ -171,13 +182,12 @@ async def fm_dupes_page(client: Client, callback: CallbackQuery):
     try:
         page = int(callback.data.split("#")[1])
     except (ValueError, IndexError):
-        return await callback.answer("❌ Malformed callback.", show_alert=True)
-    await callback.answer()
+        return await answer_callback_safely(callback, "❌ Malformed callback.", show_alert=True)
+    await answer_callback_safely(callback)
     report = _cached_dupes.get(callback.from_user.id)
     if not report:
         await callback.message.edit_text(
-            "⚠️ Scan results expired. Please re-run duplicate scan.",
-            reply_markup=_BACK_BTN
+            "⚠️ Scan results expired. Please re-run duplicate scan.", reply_markup=_BACK_BTN
         )
         return
     await _show_dupes_page(callback, report, page=page)
@@ -185,7 +195,8 @@ async def fm_dupes_page(client: Client, callback: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^fm_dupe_review#") & filters.user(ADMIN_ID))
 async def fm_review_duplicate_group(client: Client, callback: CallbackQuery):
-    await callback.answer(
+    await answer_callback_safely(
+        callback,
         "Yellow matches are never deleted because metadata alone is not proof.",
         show_alert=True,
     )
@@ -193,7 +204,8 @@ async def fm_review_duplicate_group(client: Client, callback: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^fm_dupe_delete#") & filters.user(ADMIN_ID))
 async def fm_delete_duplicate_group(client: Client, callback: CallbackQuery):
-    await callback.answer(
+    await answer_callback_safely(
+        callback,
         "Use verified exact cleanup. Yellow matches remain protected.",
         show_alert=True,
     )
@@ -225,19 +237,21 @@ async def fm_verified_cleanup_prompt(client: Client, callback: CallbackQuery):
         "✅ Telegram channel files and messages will not be touched.\n"
         "🔒 Yellow metadata-only matches will not be touched.\n\n"
         "Continue with the strict cleanup?",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(
-                f"✅ Remove {exact_extras:,} exact copies",
-                callback_data="fm_dupes_cleanup_confirm",
-            )],
-            [InlineKeyboardButton("‹ Cancel", callback_data="file_manager_menu")],
-        ]),
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        f"✅ Remove {exact_extras:,} exact copies",
+                        callback_data="fm_dupes_cleanup_confirm",
+                    )
+                ],
+                [InlineKeyboardButton("‹ Cancel", callback_data="file_manager_menu")],
+            ]
+        ),
     )
 
 
-@Client.on_callback_query(
-    filters.regex(r"^fm_dupes_cleanup_confirm$") & filters.user(ADMIN_ID)
-)
+@Client.on_callback_query(filters.regex(r"^fm_dupes_cleanup_confirm$") & filters.user(ADMIN_ID))
 async def fm_verified_cleanup_confirm(client: Client, callback: CallbackQuery):
     await answer_callback_safely(callback, "🧹 Starting verified cleanup…")
     status = await callback.message.edit_text(
@@ -325,9 +339,7 @@ async def _run_duplicate_scan(client, status_msg, admin_id):
         scanned = int(progress.get("scanned", 0))
         total = max(scanned, int(progress.get("total", 0)))
         overall_scanned = int(progress.get("overall_scanned", scanned))
-        overall_total = max(
-            overall_scanned, int(progress.get("overall_total", total))
-        )
+        overall_total = max(overall_scanned, int(progress.get("overall_total", total)))
         elapsed = max(0.1, float(progress.get("elapsed", 0.1)))
         phase_elapsed = max(0.1, float(progress.get("phase_elapsed", elapsed)))
         speed = scanned / phase_elapsed
@@ -372,7 +384,7 @@ async def _run_duplicate_scan(client, status_msg, admin_id):
                 f"📨 Scanned: `{summary['scanned']:,}` files\n"
                 f"🧬 No exact or probable duplicates found.\n\n"
                 f"🔒 No files were changed.",
-                reply_markup=_BACK_BTN
+                reply_markup=_BACK_BTN,
             )
             return
 
@@ -382,9 +394,7 @@ async def _run_duplicate_scan(client, status_msg, admin_id):
     except RuntimeError as error:
         if "host storage is full" in str(error).casefold():
             await status_msg.edit_text(
-                "❌ **Duplicate Report Paused**\n\n"
-                f"{error}\n\n"
-                "🔒 Nothing was deleted or changed.",
+                f"❌ **Duplicate Report Paused**\n\n{error}\n\n🔒 Nothing was deleted or changed.",
                 reply_markup=_BACK_BTN,
             )
             return
@@ -396,8 +406,7 @@ async def _run_duplicate_scan(client, status_msg, admin_id):
     except Exception as error:
         reference = report_internal_error(logger, "duplicate_scan", error)
         await status_msg.edit_text(
-            f"❌ Duplicate scan failed. Reference: `{reference}`",
-            reply_markup=_BACK_BTN
+            f"❌ Duplicate scan failed. Reference: `{reference}`", reply_markup=_BACK_BTN
         )
 
 
@@ -413,7 +422,7 @@ async def _show_dupes_page(msg_or_callback, report, page=0):
 
     total_pages = max(1, (total + per_page - 1) // per_page)
     text = (
-        f"🧬 **Duplicate Report • Page {page+1}/{total_pages}**\n\n"
+        f"🧬 **Duplicate Report • Page {page + 1}/{total_pages}**\n\n"
         f"📨 Scanned: `{summary['scanned']:,}` files\n"
         f"🟢 Telegram-verified: `{summary['exact_groups']:,}` groups • "
         f"`{summary['exact_extras']:,}` extra copies\n"
@@ -426,11 +435,11 @@ async def _show_dupes_page(msg_or_callback, report, page=0):
 
     buttons = []
     for dupe in page_dupes:
-        name = dupe['name'][:35]
-        count = dupe['count']
-        dtype = dupe.get('type', 'exact')
+        name = dupe["name"][:35]
+        count = dupe["count"]
+        dtype = dupe.get("type", "exact")
         type_icon = "🟢" if dtype == "exact" else "🟡"
-        size_mb = dupe.get('size', 0) / (1024 * 1024)
+        size_mb = dupe.get("size", 0) / (1024 * 1024)
         size_str = f"{size_mb:.0f}MB" if size_mb > 0 else ""
         label = "copies" if dtype == "exact" else "possible matches"
         text += f"{type_icon} `{name[:30]}` — {count} {label}  {size_str}\n"
@@ -440,22 +449,28 @@ async def _show_dupes_page(msg_or_callback, report, page=0):
     # Pagination
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("◀️ Prev", callback_data=f"fm_dupes_page#{page-1}"))
+        nav.append(InlineKeyboardButton("◀️ Prev", callback_data=f"fm_dupes_page#{page - 1}"))
     if end < total:
-        nav.append(InlineKeyboardButton("Next ▶️", callback_data=f"fm_dupes_page#{page+1}"))
+        nav.append(InlineKeyboardButton("Next ▶️", callback_data=f"fm_dupes_page#{page + 1}"))
     if nav:
         buttons.append(nav)
 
     if int(summary.get("exact_extras", 0)) > 0:
-        buttons.append([InlineKeyboardButton(
-            f"🧹 Remove {summary['exact_extras']:,} verified copies",
-            callback_data="fm_dupes_cleanup",
-        )])
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"🧹 Remove {summary['exact_extras']:,} verified copies",
+                    callback_data="fm_dupes_cleanup",
+                )
+            ]
+        )
 
-    buttons.append([InlineKeyboardButton("🔙 Back to File Manager", callback_data="file_manager_menu")])
+    buttons.append(
+        [InlineKeyboardButton("‹ File Manager", callback_data="file_manager_menu")]
+    )
 
     try:
-        if hasattr(msg_or_callback, 'edit_text'):
+        if hasattr(msg_or_callback, "edit_text"):
             await msg_or_callback.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
         else:
             await msg_or_callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
@@ -465,17 +480,17 @@ async def _show_dupes_page(msg_or_callback, report, page=0):
 
 @Client.on_callback_query(filters.regex(r"^fm_delete_all_dupes$") & filters.user(ADMIN_ID))
 async def fm_review_all_duplicates(client: Client, callback: CallbackQuery):
-    await callback.answer(
+    await answer_callback_safely(
+        callback,
         "Deletion is disabled in report-only mode. No files were changed.",
         show_alert=True,
     )
 
 
-@Client.on_callback_query(
-    filters.regex(r"^fm_delete_all_dupes_confirm$") & filters.user(ADMIN_ID)
-)
+@Client.on_callback_query(filters.regex(r"^fm_delete_all_dupes_confirm$") & filters.user(ADMIN_ID))
 async def fm_delete_all_dupes(client: Client, callback: CallbackQuery):
-    await callback.answer(
+    await answer_callback_safely(
+        callback,
         "Deletion is disabled in report-only mode. No files were changed.",
         show_alert=True,
     )
@@ -483,16 +498,16 @@ async def fm_delete_all_dupes(client: Client, callback: CallbackQuery):
 
 # ── BULK DELETE BY PATTERN ────────────────────────────────────────────────────
 
+
 @Client.on_callback_query(filters.regex(r"^fm_quickpurgecam$") & filters.user(ADMIN_ID))
 async def fm_quickpurge_cam(client: Client, callback: CallbackQuery):
     """One-tap CAM/PreDVD purge — replaces the old /purge_cams command."""
     pattern = r"cam|predvd|hdcam|tsrip|1xbet"
-    await callback.answer()
+    await answer_callback_safely(callback)
     count = await db.count_by_pattern(pattern)
     if count == 0:
         await callback.message.edit_text(
-            "✅ No CAM/PreDVD files found. Database is clean.",
-            reply_markup=_BACK_BTN
+            "✅ No CAM/PreDVD files found. Database is clean.", reply_markup=_BACK_BTN
         )
         return
     await callback.message.edit_text(
@@ -500,56 +515,60 @@ async def fm_quickpurge_cam(client: Client, callback: CallbackQuery):
         f"Found: **{count:,}** low-quality files\n"
         f"Pattern: `CAM | PreDVD | HDCAM | TSRip | 1xBet`\n\n"
         f"Confirm delete?",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"🗑 Delete {count:,} files", callback_data=f"fm_bulkconfirm#{pattern}"),
-             InlineKeyboardButton("❌ Cancel", callback_data="file_manager_menu")]
-        ])
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        f"🗑 Delete {count:,} files", callback_data=f"fm_bulkconfirm#{pattern}"
+                    ),
+                    InlineKeyboardButton("❌ Cancel", callback_data="file_manager_menu"),
+                ]
+            ]
+        ),
     )
 
 
 @Client.on_callback_query(filters.regex(r"^fm_bulkdelete$") & filters.user(ADMIN_ID))
 async def fm_bulkdelete_prompt(client: Client, callback: CallbackQuery):
-    set_state(callback.from_user.id, "fm_bulkdelete")
-    await callback.message.reply_text(
+    await begin_prompt(
+        callback,
+        "fm_bulkdelete",
         "🗑 **Bulk Delete by Pattern**\n\n"
         "Send me a keyword or pattern to match file names.\n\n"
         "**Examples:**\n"
         "`HDCAM` — deletes all files with HDCAM in name\n"
         "`480p Tamil` — deletes all 480p Tamil files\n\n"
-        "⚠️ You will see a **preview count** before anything is deleted.\n"
-        "*Type /cancel to abort.*"
+        "⚠️ You will see a **preview count** before anything is deleted.",
     )
-    await callback.answer()
 
 
 @Client.on_callback_query(filters.regex(r"^fm_bulkconfirm#") & filters.user(ADMIN_ID))
 async def fm_bulk_confirm(client: Client, callback: CallbackQuery):
     pattern = callback.data.split("#")[1]
     status = await callback.message.edit_text(f"🗑 Deleting files matching `{pattern}`...")
-    await callback.answer()
+    await answer_callback_safely(callback)
 
     deleted = await db.purge_by_pattern(pattern)
     await status.edit_text(
-        f"✅ **Bulk Delete Complete!**\n\n"
-        f"🗑 Deleted: `{deleted}` files matching `{pattern}`",
-        reply_markup=_BACK_BTN
+        f"✅ **Bulk Delete Complete!**\n\n🗑 Deleted: `{deleted}` files matching `{pattern}`",
+        reply_markup=_BACK_BTN,
     )
 
 
 # ── CLUSTER MIGRATION ─────────────────────────────────────────────────────────
 
+
 @Client.on_callback_query(filters.regex(r"^fm_migrate$") & filters.user(ADMIN_ID))
 async def fm_migrate_prompt(client: Client, callback: CallbackQuery):
-    set_state(callback.from_user.id, "fm_migrate")
-    await callback.message.reply_text(
+    await begin_prompt(
+        callback,
+        "fm_migrate",
         "📦 **Cluster Migration**\n\n"
         "Send me the source and destination cluster numbers on one line.\n\n"
         "**Format:** `from_cluster to_cluster`\n"
         "**Example:** `1 2` (moves all files from Cluster 1 → Cluster 2)\n\n"
-        "⚠️ Destination cluster must have enough free space.\n"
-        "*Type /cancel to abort.*"
+        "⚠️ Destination cluster must have enough free space.",
     )
-    await callback.answer()
 
 
 @Client.on_callback_query(filters.regex(r"^fm_migrate_confirm#") & filters.user(ADMIN_ID))
@@ -558,18 +577,16 @@ async def fm_migrate_confirm(client: Client, callback: CallbackQuery):
     from_idx = int(parts[1]) - 1
     to_idx = int(parts[2]) - 1
     status = await callback.message.edit_text(
-        f"📦 **Migrating Cluster {from_idx+1} → Cluster {to_idx+1}...**\n\n"
-        f"_(This runs in background — you'll be notified when done)_"
+        f"📦 **Migrating Cluster {from_idx + 1} → Cluster {to_idx + 1}...**\n\n"
+        "This runs in the background. You will be notified when it finishes."
     )
-    await callback.answer()
+    await answer_callback_safely(callback)
     try:
         supervisor.spawn(
             _run_migration(client, status, from_idx, to_idx),
             key=f"maintenance:migration:{from_idx}:{to_idx}",
             owner=f"admin:{callback.from_user.id}",
-            resources=(
-                "movie-catalog", f"cluster:{from_idx}", f"cluster:{to_idx}"
-            ),
+            resources=("movie-catalog", f"cluster:{from_idx}", f"cluster:{to_idx}"),
             drain_on_shutdown=True,
         )
     except TaskConflict as exc:
@@ -581,40 +598,44 @@ async def _run_migration(client, status_msg, from_idx, to_idx):
         migrated, skipped = await db.migrate_cluster(from_idx, to_idx)
         if skipped == -1:
             await status_msg.edit_text(
-                f"❌ **Migration Failed!**\n\nCluster {to_idx+1} is full (>450MB). "
+                f"❌ **Migration Failed!**\n\nCluster {to_idx + 1} is full (>450MB). "
                 f"Choose a cluster with more free space.",
-                reply_markup=_BACK_BTN
+                reply_markup=_BACK_BTN,
             )
         else:
             await status_msg.edit_text(
                 f"✅ **Migration Complete!**\n\n"
                 f"📦 Moved: `{migrated}` files\n"
                 f"⚠️ Skipped: `{skipped}` (duplicates or errors)\n\n"
-                f"Cluster {from_idx+1} → Cluster {to_idx+1}",
-                reply_markup=_BACK_BTN
+                f"Cluster {from_idx + 1} → Cluster {to_idx + 1}",
+                reply_markup=_BACK_BTN,
             )
     except Exception as error:
         reference = report_internal_error(logger, "file_migration", error)
-        await status_msg.edit_text(
-            f"❌ Migration error. Reference: `{reference}`", reply_markup=_BACK_BTN
-        )
+        await status_msg.edit_text(f"❌ Migration error. Reference: `{reference}`", reply_markup=_BACK_BTN)
 
 
 # ── FILES BY LANGUAGE ─────────────────────────────────────────────────────────
 
+
 @Client.on_callback_query(filters.regex(r"^fm_bylang$") & filters.user(ADMIN_ID))
 async def fm_by_language(client: Client, callback: CallbackQuery):
     await callback.message.edit_text("📊 **Counting files by language...**")
-    await callback.answer()
+    await answer_callback_safely(callback)
 
     try:
         lang_counts = await db.get_files_by_language()
         total = sum(lang_counts.values())
 
         lang_emojis = {
-            "Malayalam": "🌴", "Tamil": "🎭", "Telugu": "⭐",
-            "Hindi": "🇮🇳", "English": "🌍", "Kannada": "🏵",
-            "Dual Audio": "🎧", "Multi Audio": "🎵"
+            "Malayalam": "🌴",
+            "Tamil": "🎭",
+            "Telugu": "⭐",
+            "Hindi": "🇮🇳",
+            "English": "🌍",
+            "Kannada": "🏵",
+            "Dual Audio": "🎧",
+            "Multi Audio": "🎵",
         }
 
         text = "📊 **Files by Language**\n\n"
@@ -640,17 +661,17 @@ async def fm_by_language(client: Client, callback: CallbackQuery):
 
 # ── TOP MISSING FILES ─────────────────────────────────────────────────────────
 
+
 @Client.on_callback_query(filters.regex(r"^fm_missing$") & filters.user(ADMIN_ID))
 async def fm_missing_files(client: Client, callback: CallbackQuery):
     await callback.message.edit_text("📋 **Fetching top missing searches...**")
-    await callback.answer()
+    await answer_callback_safely(callback)
 
     try:
         missed = await db.get_top_missed(limit=15)
         if not missed:
             await callback.message.edit_text(
-                "📋 **Top Missing Files**\n\nNo missed searches recorded yet.",
-                reply_markup=_BACK_BTN
+                "📋 **Top Missing Files**\n\nNo missed searches recorded yet.", reply_markup=_BACK_BTN
             )
             return
 
@@ -659,14 +680,17 @@ async def fm_missing_files(client: Client, callback: CallbackQuery):
         for i, entry in enumerate(missed, 1):
             title = entry.get("original", entry["_id"])
             text += f"{i}. <code>{_html(title)}</code> — <b>{entry['count']}x</b>\n"
-            buttons.append([
-                InlineKeyboardButton(
-                    f"✅ Mark Fulfilled — {title[:20]}",
-                    callback_data=f"fm_clear_missed#{entry['_id']}"
-                )
-            ])
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        f"✅ Mark Fulfilled — {title[:20]}", callback_data=f"fm_clear_missed#{entry['_id']}"
+                    )
+                ]
+            )
 
-        buttons.append([InlineKeyboardButton("🔙 Back", callback_data="file_manager_menu")])
+        buttons.append(
+            [InlineKeyboardButton("‹ File Manager", callback_data="file_manager_menu")]
+        )
         await callback.message.edit_text(
             text,
             reply_markup=InlineKeyboardMarkup(buttons),
@@ -684,7 +708,7 @@ async def fm_missing_files(client: Client, callback: CallbackQuery):
 async def fm_clear_missed(client: Client, callback: CallbackQuery):
     query_id = callback.data.split("#")[1]
     await db.clear_missed_search(query_id)
-    await callback.answer("✅ Removed from missing list.", show_alert=False)
+    await answer_callback_safely(callback, "✅ Removed from missing list.", show_alert=False)
     # Refresh the list
     await fm_missing_files(client, callback)
 
@@ -696,12 +720,14 @@ async def fm_clear_missed(client: Client, callback: CallbackQuery):
 
 from pyrogram import ContinuePropagation, StopPropagation
 
+
 @Client.on_message(
-    filters.private & filters.text & filters.user(ADMIN_ID) &
-    ~filters.command(["start", "admin", "ban", "unban", "reset_db",
-                      "broadcast", "filesearch", "cancel"]),
+    filters.private
+    & filters.text
+    & filters.user(ADMIN_ID)
+    & ~filters.command(["start", "admin", "ban", "unban", "reset_db", "broadcast", "filesearch", "cancel"]),
     group=-1,  # must win the race against filter.py's auto_filter — see admin.py's
-               # matching catch_admin_input handler for the full explanation.
+    # matching catch_admin_input handler for the full explanation.
 )
 async def fm_input_handler(client: Client, message: Message):
     admin_id = message.from_user.id
@@ -711,75 +737,108 @@ async def fm_input_handler(client: Client, message: Message):
         raise ContinuePropagation
 
     if message.text.lower() in ("/cancel", "cancel"):
-        clear_state(admin_id)
-        await message.reply_text(
-            "🚫 **Cancelled.**",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back to File Manager", callback_data="file_manager_menu")]
-            ])
-        )
+        await restore_prompt(client, admin_id, fallback_message=message)
         raise StopPropagation
 
     # fm_search
     if state == "fm_search":
-        clear_state(admin_id)
+        await restore_prompt(client, admin_id, fallback_message=message)
         await _do_file_search(client, message, message.text.strip())
 
     # fm_bulkdelete — show dry-run preview first
     elif state == "fm_bulkdelete":
-        clear_state(admin_id)
         pattern = message.text.strip()
         count = await db.count_by_pattern(pattern)
         if count == 0:
-            await message.reply_text(
+            await finish_prompt(
+                client,
+                admin_id,
                 f"ℹ️ No files match `{pattern}`. Nothing to delete.",
-                reply_markup=_BACK_BTN
+                back_callback="file_manager_menu",
+                back_label="‹ File Manager",
+                fallback_message=message,
             )
-            return
-        await message.reply_text(
+            raise StopPropagation
+        await finish_prompt(
+            client,
+            admin_id,
             f"⚠️ **Dry Run Preview**\n\n"
             f"Pattern: `{pattern}`\n"
             f"Files that would be deleted: **{count:,}**\n\n"
             f"Confirm?",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"🗑 Delete {count:,} files", callback_data=f"fm_bulkconfirm#{pattern}"),
-                 InlineKeyboardButton("❌ Cancel", callback_data="file_manager_menu")]
-            ])
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            f"🗑 Delete {count:,} files", callback_data=f"fm_bulkconfirm#{pattern}"
+                        ),
+                        InlineKeyboardButton("❌ Cancel", callback_data="file_manager_menu"),
+                    ]
+                ]
+            ),
+            back_callback="file_manager_menu",
+            back_label="‹ File Manager",
+            fallback_message=message,
         )
 
     # fm_migrate — parse "from to" format
     elif state == "fm_migrate":
-        clear_state(admin_id)
         parts = message.text.strip().split()
         if len(parts) != 2 or not all(p.isdigit() for p in parts):
-            await message.reply_text(
+            await finish_prompt(
+                client,
+                admin_id,
                 "❌ Invalid format. Send two numbers like `1 2`.",
-                reply_markup=_BACK_BTN
+                back_callback="file_manager_menu",
+                back_label="‹ File Manager",
+                fallback_message=message,
             )
-            return
+            raise StopPropagation
         from_c, to_c = int(parts[0]), int(parts[1])
         total_clusters = len(db.file_cols)
         if not (1 <= from_c <= total_clusters) or not (1 <= to_c <= total_clusters):
-            await message.reply_text(
+            await finish_prompt(
+                client,
+                admin_id,
                 f"❌ Cluster numbers must be between 1 and {total_clusters}.",
-                reply_markup=_BACK_BTN
+                back_callback="file_manager_menu",
+                back_label="‹ File Manager",
+                fallback_message=message,
             )
-            return
+            raise StopPropagation
         if from_c == to_c:
-            await message.reply_text("❌ Source and destination cannot be the same.", reply_markup=_BACK_BTN)
-            return
+            await finish_prompt(
+                client,
+                admin_id,
+                "❌ Source and destination cannot be the same.",
+                back_callback="file_manager_menu",
+                back_label="‹ File Manager",
+                fallback_message=message,
+            )
+            raise StopPropagation
         # Check destination has space
         dest_size = await db.get_db_size(db.dbs[to_c - 1])
         src_count = await db.file_cols[from_c - 1].count_documents({})
-        await message.reply_text(
+        await finish_prompt(
+            client,
+            admin_id,
             f"📦 **Migration Preview**\n\n"
             f"From: Cluster {from_c} (`{src_count:,}` files)\n"
             f"To: Cluster {to_c} (`{dest_size:.1f} MB` used / 512 MB)\n\n"
             f"Confirm?",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Start Migration", callback_data=f"fm_migrate_confirm#{from_c}#{to_c}"),
-                 InlineKeyboardButton("❌ Cancel", callback_data="file_manager_menu")]
-            ])
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "✅ Start Migration", callback_data=f"fm_migrate_confirm#{from_c}#{to_c}"
+                        ),
+                        InlineKeyboardButton("❌ Cancel", callback_data="file_manager_menu"),
+                    ]
+                ]
+            ),
+            back_callback="file_manager_menu",
+            back_label="‹ File Manager",
+            fallback_message=message,
         )
 
     # fm_editname_id — first step: admin sent the file object ID
@@ -790,29 +849,41 @@ async def fm_input_handler(client: Client, message: Message):
             await message.reply_text(
                 "❌ That doesn't look like a valid File ID. "
                 "Get the ID from a `/filesearch` result.\n\n"
-                "*Try again or type /cancel.*"
+                "Try again or use the Cancel button."
             )
             return  # keep state alive
         set_state(admin_id, f"fm_rename#{obj_id}")
-        await message.reply_text(
-            f"✏️ File ID: `{obj_id}`\n\nNow send the **new file name**.\n*Type /cancel to abort.*"
-        )
+        context = get_state_context(admin_id)
+        if context and context.get("prompt_chat_id") and context.get("prompt_message_id"):
+            await client.edit_message_text(
+                context["prompt_chat_id"],
+                context["prompt_message_id"],
+                f"✏️ **Rename File**\n\nFile ID: `{obj_id}`\n\nSend the new searchable file name.",
+                reply_markup=cancel_button(),
+            )
 
     # fm_rename#<obj_id> — second step: admin sent new name
     elif state.startswith("fm_rename#"):
         obj_id = state.split("#")[1]
         new_name = message.text.strip()
-        clear_state(admin_id)
         success = await db.update_file_name(obj_id, new_name)
         if success:
-            await message.reply_text(
+            await finish_prompt(
+                client,
+                admin_id,
                 f"✅ **File Renamed!**\n\nNew name: `{new_name}`",
-                reply_markup=_BACK_BTN
+                back_callback="file_manager_menu",
+                back_label="‹ File Manager",
+                fallback_message=message,
             )
         else:
-            await message.reply_text(
+            await finish_prompt(
+                client,
+                admin_id,
                 "❌ File not found. It may have been deleted already.",
-                reply_markup=_BACK_BTN
+                back_callback="file_manager_menu",
+                back_label="‹ File Manager",
+                fallback_message=message,
             )
 
     else:

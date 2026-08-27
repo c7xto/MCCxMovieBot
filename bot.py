@@ -10,11 +10,9 @@ load_dotenv()
 
 # ── Logging setup — configured before anything else runs so the startup
 # verification block below has somewhere to log to.
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 from plugins.log_safety import install_log_redaction
+
 install_log_redaction()
 logger = logging.getLogger(__name__)
 
@@ -54,6 +52,7 @@ def _verify_environment():
     # 2. Cryptographic & CA bundle sanity check.
     try:
         import certifi
+
         ca_path = certifi.where()
         if not os.path.isfile(ca_path) or os.path.getsize(ca_path) == 0:
             raise RuntimeError(f"certifi CA bundle missing or empty at {ca_path}")
@@ -95,10 +94,11 @@ from plugins.process_lock import (
     acquire_process_lock,
     prepare_private_runtime_dir,
 )
+
 try:
-    SESSION_WORKDIR = prepare_private_runtime_dir(Path(
-        os.getenv("SESSION_WORKDIR") or PROJECT_ROOT / "runtime"
-    ))
+    SESSION_WORKDIR = prepare_private_runtime_dir(
+        Path(os.getenv("SESSION_WORKDIR") or PROJECT_ROOT / "runtime")
+    )
     _lock_file = acquire_process_lock(SESSION_WORKDIR)
 except AlreadyRunningError:
     logger.critical("Another MCCxBot instance is already running.")
@@ -111,7 +111,9 @@ from pyrogram import Client
 from database.db import db
 from database.index_policy import RequiredIndexError
 from plugins.health_monitor import (
-    run_health_monitor, run_cache_reaper, run_deletion_worker,
+    run_health_monitor,
+    run_cache_reaper,
+    run_deletion_worker,
 )
 from plugins.task_supervisor import supervisor
 from tmdb import close_tmdb_client, start_tmdb_client
@@ -125,8 +127,8 @@ logging.getLogger("pymongo").setLevel(logging.ERROR)
 logging.getLogger("asyncio").setLevel(logging.WARNING)
 logging.getLogger("aiohttp").setLevel(logging.WARNING)
 
-API_ID    = int(os.getenv("API_ID", 0))
-API_HASH  = os.getenv("API_HASH")
+API_ID = int(os.getenv("API_ID", 0))
+API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 READY_FILE = SESSION_WORKDIR / "ready"
 
@@ -179,12 +181,12 @@ class AutoFilterBot(Client):
             for i, db_instance in enumerate(db.dbs):
                 try:
                     await db_instance.command("ping")
-                    logger.info(f"  ✅ Cluster {i+1} — OK")
+                    logger.info(f"  ✅ Cluster {i + 1} — OK")
                 except Exception as e:
                     if i == 0:
                         await super().stop()
                         raise RuntimeError(f"Primary MongoDB cluster is unavailable: {e}") from e
-                    logger.warning(f"  ⚠️ Optional cluster {i+1} unavailable: {e}")
+                    logger.warning(f"  ⚠️ Optional cluster {i + 1} unavailable: {e}")
 
         logger.info("🔄 Migrating legacy control data → operations database...")
         await db.migrate_legacy_control_data()
@@ -240,34 +242,38 @@ class AutoFilterBot(Client):
         )
         logger.info("✅ Fuzzy-search catalog worker started.")
 
-        supervisor.spawn(
-            run_health_monitor(self), key="worker:health", owner="bot"
-        )
+        supervisor.spawn(run_health_monitor(self), key="worker:health", owner="bot")
         logger.info("✅ Health monitor started.")
 
-        supervisor.spawn(
-            run_cache_reaper(), key="worker:cache_reaper", owner="bot"
-        )
+        supervisor.spawn(run_cache_reaper(), key="worker:cache_reaper", owner="bot")
         logger.info("✅ Search-cache reaper started.")
 
-        supervisor.spawn(
-            run_deletion_worker(self), key="worker:deletion", owner="bot"
-        )
+        supervisor.spawn(run_deletion_worker(self), key="worker:deletion", owner="bot")
         logger.info("✅ Durable deletion worker started.")
 
         from plugins.broadcast import run_broadcast_worker
-        supervisor.spawn(
-            run_broadcast_worker(self), key="worker:broadcast", owner="bot"
-        )
+
+        supervisor.spawn(run_broadcast_worker(self), key="worker:broadcast", owner="bot")
         logger.info("✅ Durable broadcast worker started.")
 
         from plugins.realtime_indexer import run_notification_worker
+
         supervisor.spawn(
             run_notification_worker(self),
             key="worker:announcement-outbox",
             owner="bot",
         )
         logger.info("✅ Durable notification worker started.")
+
+        from plugins.file_branding import run_file_branding_worker
+
+        supervisor.spawn(
+            run_file_branding_worker(self),
+            key="worker:file_branding",
+            owner="bot",
+            resources=("branding-cache",),
+        )
+        logger.info("✅ Durable file-branding worker started.")
 
     async def stop(self, *args, **kwargs):
         await asyncio.to_thread(_remove_ready_marker)

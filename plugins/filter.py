@@ -8,16 +8,19 @@ from urllib.parse import quote
 from dotenv import load_dotenv
 from pyrogram.errors import (
     MessageNotModified,
-    FileIdInvalid, FileReferenceEmpty, FileReferenceExpired,
-    FileReferenceInvalid, MediaEmpty, MediaInvalid,
+    FileIdInvalid,
+    FileReferenceEmpty,
+    FileReferenceExpired,
+    FileReferenceInvalid,
+    MediaEmpty,
+    MediaInvalid,
 )
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
-from pyrogram.types import (
-    Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-)
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from database.db import db
 from plugins.access_policy import enforce_user_action
+from plugins.callbacks import answer_callback_safely
 from plugins.req_fsub import check_verification_gates
 from plugins.search_indicator import show_search_indicator, remove_search_indicator
 from plugins.workload import (
@@ -30,8 +33,13 @@ from plugins.workload import (
 from plugins.telegram_retry import DELIVERY_RETRY, INTERACTIVE_RETRY, telegram_call
 from plugins.task_supervisor import TaskConflict, supervisor
 from utils import (
-    get_subscription_status_by_id, send_fsub_message, _parse_fsub_entry,
-    _no_preview, _html, callback_data, html_user_mention,
+    get_subscription_status_by_id,
+    send_fsub_message,
+    _parse_fsub_entry,
+    _no_preview,
+    _html,
+    callback_data,
+    html_user_mention,
 )
 from verification import (
     VerificationResult,
@@ -46,17 +54,24 @@ logger = logging.getLogger(__name__)
 IGNORE_WORDS = {"hi", "hello", "bro", "pls", "plz", "bot", "help", "admin", "sir"}
 
 LANGUAGES = ["Malayalam", "Tamil", "Telugu", "Hindi", "English", "Kannada", "Dual Audio", "Multi Audio"]
-QUALITIES  = ["4K", "1080p", "720p", "480p", "HDRip", "WEB-DL", "WEBRip", "BluRay", "PreDVD", "CAM", "HD Rip"]
+QUALITIES = ["4K", "1080p", "720p", "480p", "HDRip", "WEB-DL", "WEBRip", "BluRay", "PreDVD", "CAM", "HD Rip"]
 
 LANG_EMOJI = {
-    "Malayalam": "🌴", "Tamil": "🎭", "Telugu": "⭐",
-    "Hindi": "🇮🇳", "English": "🌍", "Kannada": "🏵",
-    "Dual Audio": "🎧", "Multi Audio": "🎵", "Other": "🌐"
+    "Malayalam": "🌴",
+    "Tamil": "🎭",
+    "Telugu": "⭐",
+    "Hindi": "🇮🇳",
+    "English": "🌍",
+    "Kannada": "🏵",
+    "Dual Audio": "🎧",
+    "Multi Audio": "🎵",
+    "Other": "🌐",
 }
+
 
 async def send_smart_log(client, text, reply_markup=None, parse_mode=None):
     try:
-        config   = await db.get_config()
+        config = await db.get_config()
         log_chat = config.get("log_channel", 0)
         if log_chat:
             options = _no_preview()
@@ -76,14 +91,27 @@ async def send_smart_log(client, text, reply_markup=None, parse_mode=None):
 # every incoming search/result-render — clean_query() runs on every message
 # and extract_attributes() runs once per file on every page render.
 _STOP_WORD_RES = [
-    re.compile(p, re.IGNORECASE) for p in (
-        r'\bplease\b', r'\bsend\b', r'\bme\b', r'\bmovie\b',
-        r'\bseries\b', r'\bhd\b', r'\bprint\b', r'\bdownload\b', r'\blink\b',
-        r'\bbro\b', r'\bcan\b', r'\byou\b', r'\bprovide\b', r'\bi\b',
-        r'\bneed\b', r'\bwant\b'
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\bplease\b",
+        r"\bsend\b",
+        r"\bme\b",
+        r"\bmovie\b",
+        r"\bseries\b",
+        r"\bhd\b",
+        r"\bprint\b",
+        r"\bdownload\b",
+        r"\blink\b",
+        r"\bbro\b",
+        r"\bcan\b",
+        r"\byou\b",
+        r"\bprovide\b",
+        r"\bi\b",
+        r"\bneed\b",
+        r"\bwant\b",
     )
 ]
-_WS_RE = re.compile(r'\s+')
+_WS_RE = re.compile(r"\s+")
 
 
 def clean_query(query):
@@ -92,13 +120,13 @@ def clean_query(query):
     # like normal words, without carrying visual noise into result headings.
     q = re.sub(r"[_.\-–—]+", " ", query.lower())
     for pattern in _STOP_WORD_RES:
-        q = pattern.sub('', q)
-    return _WS_RE.sub(' ', q).strip()
+        q = pattern.sub("", q)
+    return _WS_RE.sub(" ", q).strip()
 
 
 def _attribute_regex(value: str):
-    parts = [re.escape(part) for part in re.split(r'[\s._\-–—]+', value) if part]
-    return re.compile(r'\b' + r'\s*'.join(parts) + r'\b', re.IGNORECASE)
+    parts = [re.escape(part) for part in re.split(r"[\s._\-–—]+", value) if part]
+    return re.compile(r"\b" + r"\s*".join(parts) + r"\b", re.IGNORECASE)
 
 
 _LANG_RES = [(language, _attribute_regex(language)) for language in LANGUAGES]
@@ -106,7 +134,7 @@ _QUAL_RES = [(quality, _attribute_regex(quality)) for quality in QUALITIES]
 
 
 def extract_attributes(filename):
-    normalized = re.sub(r'[._\-–—]+', ' ', filename)
+    normalized = re.sub(r"[._\-–—]+", " ", filename)
     lang = next((l for l, pat in _LANG_RES if pat.search(normalized)), "Other")
     qual = next((q for q, pat in _QUAL_RES if pat.search(normalized)), "Other")
     if qual.lower() == "hdrip":
@@ -115,12 +143,12 @@ def extract_attributes(filename):
 
 
 def _extract_codec(filename: str) -> str:
-    normalized = re.sub(r'[._\-–—]+', ' ', filename)
-    if re.search(r'\b(?:hevc|x265|h\s*265)\b', normalized, re.IGNORECASE):
+    normalized = re.sub(r"[._\-–—]+", " ", filename)
+    if re.search(r"\b(?:hevc|x265|h\s*265)\b", normalized, re.IGNORECASE):
         return "HEVC"
-    if re.search(r'\b(?:avc|x264|h\s*264)\b', normalized, re.IGNORECASE):
+    if re.search(r"\b(?:avc|x264|h\s*264)\b", normalized, re.IGNORECASE):
         return "H.264"
-    if re.search(r'\bav1\b', normalized, re.IGNORECASE):
+    if re.search(r"\bav1\b", normalized, re.IGNORECASE):
         return "AV1"
     return ""
 
@@ -128,16 +156,16 @@ def _extract_codec(filename: str) -> str:
 # ── Display-only title cleanup ───────────────────────────────────────────────
 # Never touches the stored file_name — purely how a filename is *rendered*
 # in a button label or delivered-file caption.
-_EXT_RE = re.compile(r'(?:\.|\b)(mkv|mp4|avi|mov|zip|srt)\s*$', re.IGNORECASE)
-_YEAR_RE = re.compile(r'^(19\d{2}|20\d{2})$')
-_PAREN_YEAR_RE = re.compile(r'[\(\[](\d{4})[\)\]]')
-_BRACKET_GROUP_RE = re.compile(r'[\[\(].*?[\]\)]')
-_TITLE_SEP_RE = re.compile(r'[._\-–—]+')
-_LISTING_SEP_RE = re.compile(r'[._\-–—#+|]+')
-_TITLE_WS_RE = re.compile(r'\s+')
-_STRAY_BRACKET_RE = re.compile(r'[\[\]\(\)\{\}]+')
+_EXT_RE = re.compile(r"(?:\.|\b)(mkv|mp4|avi|mov|zip|srt)\s*$", re.IGNORECASE)
+_YEAR_RE = re.compile(r"^(19\d{2}|20\d{2})$")
+_PAREN_YEAR_RE = re.compile(r"[\(\[](\d{4})[\)\]]")
+_BRACKET_GROUP_RE = re.compile(r"[\[\(].*?[\]\)]")
+_TITLE_SEP_RE = re.compile(r"[._\-–—]+")
+_LISTING_SEP_RE = re.compile(r"[._\-–—#+|]+")
+_TITLE_WS_RE = re.compile(r"\s+")
+_STRAY_BRACKET_RE = re.compile(r"[\[\]\(\)\{\}]+")
 _PROMO_RE = re.compile(
-    r'(?:https?://\S+|www\.\S+|(?:t|telegram)\.me/\S+|@[A-Za-z0-9_]+)',
+    r"(?:https?://\S+|www\.\S+|(?:t|telegram)\.me/\S+|@[A-Za-z0-9_]+)",
     re.IGNORECASE,
 )
 
@@ -145,24 +173,65 @@ _PROMO_RE = re.compile(
 # still need to be recognized as "metadata, not title" when walking backward
 # through a filename's tokens (see _display_title below).
 _JUNK_WORDS = {
-    "x264", "x265", "h264", "h265", "hevc", "avc", "aac", "aac2", "ac3",
-    "eac3", "ddp", "ddp5", "dd5", "esub", "esubs", "hsub", "hsubs", "10bit",
-    "hdcam", "tsrip", "dvdrip", "hq", "nf", "amzn", "brrip", "bdrip", "webrip",
-    "webdl", "bluray", "proper", "repack", "telly", "collective", "etrg", "yts",
-    "true", "vbr", "bigil", "ddh", "dd", "mkv", "mp4", "avi", "mov", "zip", "srt",
+    "x264",
+    "x265",
+    "h264",
+    "h265",
+    "hevc",
+    "avc",
+    "aac",
+    "aac2",
+    "ac3",
+    "eac3",
+    "ddp",
+    "ddp5",
+    "dd5",
+    "esub",
+    "esubs",
+    "hsub",
+    "hsubs",
+    "10bit",
+    "hdcam",
+    "tsrip",
+    "dvdrip",
+    "hq",
+    "nf",
+    "amzn",
+    "brrip",
+    "bdrip",
+    "webrip",
+    "webdl",
+    "bluray",
+    "proper",
+    "repack",
+    "telly",
+    "collective",
+    "etrg",
+    "yts",
+    "true",
+    "vbr",
+    "bigil",
+    "ddh",
+    "dd",
+    "mkv",
+    "mp4",
+    "avi",
+    "mov",
+    "zip",
+    "srt",
 }
 
 
 def _metadata_key(value: str) -> str:
-    return re.sub(r'[\s._\-–—]+', ' ', value.lower()).strip()
+    return re.sub(r"[\s._\-–—]+", " ", value.lower()).strip()
 
 
 _QUALITY_LOWER = {_metadata_key(q) for q in QUALITIES}
 _LANGUAGE_LOWER = {_metadata_key(l) for l in LANGUAGES}
 _TECH_TOKEN_RE = re.compile(
-    r'^(?:2160p|1080p|720p|480p|360p|\d+(?:\.\d+)?(?:mb|gb)|'
-    r'\d{3,4}k(?:bps)?|\d(?:\.\d)?ch|'
-    r'dd\+?\d*|ddp?\d(?:\.\d)?|aac\d?|ac3|eac3|h26[45]|x26[45]|hevc|avc|10bit)$',
+    r"^(?:2160p|1080p|720p|480p|360p|\d+(?:\.\d+)?(?:mb|gb)|"
+    r"\d{3,4}k(?:bps)?|\d(?:\.\d)?ch|"
+    r"dd\+?\d*|ddp?\d(?:\.\d)?|aac\d?|ac3|eac3|h26[45]|x26[45]|hevc|avc|10bit)$",
     re.IGNORECASE,
 )
 
@@ -205,8 +274,8 @@ def _display_title(filename: str) -> tuple:
     # Promotional handles and URLs are never useful to a user choosing a
     # file. Remove them before the extension so ``movie.mkv @channel`` also
     # loses its extension correctly.
-    name = _PROMO_RE.sub(' ', filename).strip()
-    name = _EXT_RE.sub('', name)
+    name = _PROMO_RE.sub(" ", filename).strip()
+    name = _EXT_RE.sub("", name)
 
     # A parenthesized/bracketed 4-digit year is unambiguous regardless of
     # what the rest of the title looks like (a numeric title like "300" or
@@ -217,12 +286,12 @@ def _display_title(filename: str) -> tuple:
     # Strip every complete bracket group (site tags like [TamilMV], the
     # year annotation just captured above, etc.) — replace with a space,
     # not empty, so two words butting up against a bracket don't fuse.
-    name = _BRACKET_GROUP_RE.sub(' ', name)
-    name = _STRAY_BRACKET_RE.sub(' ', name)
+    name = _BRACKET_GROUP_RE.sub(" ", name)
+    name = _STRAY_BRACKET_RE.sub(" ", name)
     # Normalize remaining separators to spaces before tokenizing —
     # underscore is a \w character, so naive \b-based regex matching would
     # silently fail against underscore-separated filenames otherwise.
-    norm = _TITLE_SEP_RE.sub(' ', name)
+    norm = _TITLE_SEP_RE.sub(" ", name)
     tokens = [t for t in _TITLE_WS_RE.split(norm) if t]
 
     i = len(tokens)
@@ -230,23 +299,23 @@ def _display_title(filename: str) -> tuple:
     metadata_consumed = False
     while i > 0:
         if i >= 2:
-            phrase = _metadata_key(f"{tokens[i-2]} {tokens[i-1]}")
+            phrase = _metadata_key(f"{tokens[i - 2]} {tokens[i - 1]}")
             if phrase in _QUALITY_LOWER or phrase in _LANGUAGE_LOWER:
                 i -= 2
                 metadata_consumed = True
                 continue
-            if re.fullmatch(r'h 26[45]', phrase):
+            if re.fullmatch(r"h 26[45]", phrase):
                 i -= 2
                 metadata_consumed = True
                 continue
             # Audio layouts are frequently written as ``DDP5.1`` and become
             # two tokens after separator cleanup. Consume the pair together
             # so the trailing ``1`` never leaks into the movie title.
-            if re.fullmatch(r'(?:ddp?|aac)\d+ \d+', phrase):
+            if re.fullmatch(r"(?:ddp?|aac)\d+ \d+", phrase):
                 i -= 2
                 metadata_consumed = True
                 continue
-        tok = tokens[i-1]
+        tok = tokens[i - 1]
         if _is_year_token(tok):
             if year_consumed:
                 break  # a 2nd year-shaped token further back is the title, not metadata
@@ -262,9 +331,9 @@ def _display_title(filename: str) -> tuple:
         # language metadata (for example ``K G F Chapter 1 2018 KGF Tamil``).
         # Remove only an all-uppercase duplicate after genuine metadata was
         # already consumed, keeping normal title words untouched.
-        compact = re.sub(r'[^A-Za-z0-9]', '', tok)
-        previous_tokens = tokens[:i - 1]
-        joined_head = ''.join(previous_tokens[:4]).lower()
+        compact = re.sub(r"[^A-Za-z0-9]", "", tok)
+        previous_tokens = tokens[: i - 1]
+        joined_head = "".join(previous_tokens[:4]).lower()
         if (
             metadata_consumed
             and 2 <= len(compact) <= 8
@@ -280,8 +349,8 @@ def _display_title(filename: str) -> tuple:
 
     title = " ".join(tokens[:i]).strip(" |")
     title = re.sub(
-        r'\b(?:[A-Z]\s+){1,}[A-Z]\b',
-        lambda match: match.group(0).replace(' ', ''),
+        r"\b(?:[A-Z]\s+){1,}[A-Z]\b",
+        lambda match: match.group(0).replace(" ", ""),
         title,
     )
     tail_tokens = tokens[i:]
@@ -343,7 +412,7 @@ def _fmt_size(file_doc):
 
 
 _EPISODE_TAG_RE = re.compile(
-    r'(?<![A-Za-z0-9])S\s*(\d{1,2})\s*E\s*(\d{1,3})(?![A-Za-z0-9])',
+    r"(?<![A-Za-z0-9])S\s*(\d{1,2})\s*E\s*(\d{1,3})(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 
@@ -389,7 +458,7 @@ def _series_identity(filename: str) -> tuple[str, str]:
     Margrave`` from looking like two unrelated titles.
     """
     marker = _SERIES_RE.search(filename)
-    prefix = filename[:marker.start()] if marker else filename
+    prefix = filename[: marker.start()] if marker else filename
     title, year = _display_title(prefix)
     if not title:
         title = "Series"
@@ -408,8 +477,7 @@ def _series_identity(filename: str) -> tuple[str, str]:
     return identity, marker_text
 
 
-def _compose_aligned_label(prefix: str, identity: str, metadata: list[str],
-                           max_length: int) -> str:
+def _compose_aligned_label(prefix: str, identity: str, metadata: list[str], max_length: int) -> str:
     """Keep the fixed fields visible and trim only the variable title."""
     suffix = "" if not metadata else " • " + " • ".join(metadata)
     available = max_length - len(prefix) - len(suffix) - 1
@@ -421,7 +489,7 @@ def _compose_aligned_label(prefix: str, identity: str, metadata: list[str],
     if available < 2:
         return f"{prefix} {identity}"[:max_length]
     if len(identity) > available:
-        identity = identity[:available - 1].rstrip() + "…"
+        identity = identity[: available - 1].rstrip() + "…"
     return f"{prefix} {identity}{suffix}"
 
 
@@ -435,35 +503,32 @@ def _flat_file_label(file_doc: dict, max_length: int = 64) -> str:
     else:
         title, year = _display_title(filename)
         identity = f"{title} ({year})" if year else title
-    return _compose_aligned_label(
-        prefix, identity or "Unnamed file", _smart_metadata(filename), max_length
-    )
+    return _compose_aligned_label(prefix, identity or "Unnamed file", _smart_metadata(filename), max_length)
 
 
-def _build_results_caption(query: str, total: int, page: int, total_pages: int,
-                           first_name: str = "") -> str:
+def _build_results_caption(query: str, total: int, page: int, total_pages: int, first_name: str = "") -> str:
     """Build the identical results heading used in DMs and groups."""
     lines = [f"🔎 <b>Results Found For {_html(query)}</b>"]
     if first_name:
         lines.append(f"👤 <b>{_html(first_name)}</b>")
-    lines.extend([
-        "",
-        f"📁 <b>Files:</b> {total}  •  📚 <b>Page:</b> {page + 1} / {total_pages}",
-    ])
+    lines.extend(
+        [
+            "",
+            f"📁 <b>Files:</b> {total}  •  📚 <b>Page:</b> {page + 1} / {total_pages}",
+        ]
+    )
     return "\n".join(lines)
 
 
 _SERIES_RE = re.compile(
-    r'(?<![A-Za-z0-9])(?:S(?:EASON)?[\s._-]*\d{1,2}|'
-    r'E(?:P(?:ISODE)?)?[\s._-]*\d{1,3})',
+    r"(?<![A-Za-z0-9])(?:S(?:EASON)?[\s._-]*\d{1,2}|"
+    r"E(?:P(?:ISODE)?)?[\s._-]*\d{1,3})",
     re.IGNORECASE,
 )
-_SEASON_NUM_RE = re.compile(
-    r'(?<![A-Za-z0-9])S(?:EASON)?[\s._-]*0*(\d{1,2})', re.IGNORECASE
-)
+_SEASON_NUM_RE = re.compile(r"(?<![A-Za-z0-9])S(?:EASON)?[\s._-]*0*(\d{1,2})", re.IGNORECASE)
 _EPISODE_NUM_RE = re.compile(
-    r'(?<![A-Za-z0-9])(?:S(?:EASON)?[\s._-]*\d{1,2}[\s._-]*)?'
-    r'E(?:P(?:ISODE)?)?[\s._-]*0*(\d{1,3})',
+    r"(?<![A-Za-z0-9])(?:S(?:EASON)?[\s._-]*\d{1,2}[\s._-]*)?"
+    r"E(?:P(?:ISODE)?)?[\s._-]*0*(\d{1,3})",
     re.IGNORECASE,
 )
 
@@ -480,7 +545,7 @@ def _series_sort_key(f):
     name = f.get("file_name", "")
     s = _SEASON_NUM_RE.search(name)
     e = _EPISODE_NUM_RE.search(name)
-    season  = int(s.group(1)) if s else (1 if e else 0)
+    season = int(s.group(1)) if s else (1 if e else 0)
     episode = int(e.group(1)) if e else 0
     size = int(f.get("file_size", 0) or 0)
     if s or e:
@@ -545,12 +610,8 @@ def _result_filter_row(session_id: str, data: dict):
     language = data.get("filter_language") or "Language"
     quality = data.get("filter_quality") or "Quality"
     return [
-        InlineKeyboardButton(
-            f"🌐 {language}", callback_data=f"filtermenu#{session_id}#language"
-        ),
-        InlineKeyboardButton(
-            f"🎞 {quality}", callback_data=f"filtermenu#{session_id}#quality"
-        ),
+        InlineKeyboardButton(f"🌐 {language}", callback_data=f"filtermenu#{session_id}#language"),
+        InlineKeyboardButton(f"🎞 {quality}", callback_data=f"filtermenu#{session_id}#quality"),
     ]
 
 
@@ -573,7 +634,7 @@ def _build_caption(config, file_data, delete_minutes, bot_username):
     if template:
         f_lang, f_qual = extract_attributes(raw_filename)
         codec = _extract_codec(raw_filename)
-        size_mb  = file_data.get("file_size", 0) / (1024 * 1024)
+        size_mb = file_data.get("file_size", 0) / (1024 * 1024)
         size_str = f"{size_mb / 1024:.2f}GB" if size_mb > 1024 else f"{size_mb:.0f}MB"
         try:
             return template.format(
@@ -584,20 +645,25 @@ def _build_caption(config, file_data, delete_minutes, bot_username):
                 codec=codec or "Unknown",
                 lang=f_lang or "Unknown",
                 username=bot_username,
-                delete_minutes=delete_minutes
+                delete_minutes=delete_minutes,
             )
         except (KeyError, ValueError):
             pass
 
     f_lang, f_qual = extract_attributes(raw_filename)
     codec = _extract_codec(raw_filename)
-    size_mb  = file_data.get("file_size", 0) / (1024 * 1024)
+    size_mb = file_data.get("file_size", 0) / (1024 * 1024)
     size_str = f"{size_mb / 1024:.2f} GB" if size_mb >= 1024 else f"{size_mb:.0f} MB"
 
     lang_emojis = {
-        "Malayalam": "🌴", "Tamil": "🎭", "Telugu": "⭐",
-        "Hindi": "🇮🇳", "English": "🌍", "Kannada": "🏵",
-        "Dual Audio": "🎧", "Multi Audio": "🎵"
+        "Malayalam": "🌴",
+        "Tamil": "🎭",
+        "Telugu": "⭐",
+        "Hindi": "🇮🇳",
+        "English": "🌍",
+        "Kannada": "🏵",
+        "Dual Audio": "🎧",
+        "Multi Audio": "🎵",
     }
     meta_parts = []
     if f_lang not in ["Other", ""]:
@@ -624,7 +690,7 @@ def _build_result_buttons(results: list, session_id: str, page: int, per_page: i
     total_pages = max(1, (total + per_page - 1) // per_page)
     page = max(0, min(page, total_pages - 1))
     start_idx = page * per_page
-    page_files = results[start_idx: start_idx + per_page]
+    page_files = results[start_idx : start_idx + per_page]
 
     buttons = []
     for f in page_files:
@@ -633,9 +699,9 @@ def _build_result_buttons(results: list, session_id: str, page: int, per_page: i
 
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("⬅ PREV", callback_data=f"page#{session_id}#{page-1}"))
+        nav.append(InlineKeyboardButton("⬅ PREV", callback_data=f"page#{session_id}#{page - 1}"))
     if page < total_pages - 1:
-        nav.append(InlineKeyboardButton("NEXT ➡", callback_data=f"page#{session_id}#{page+1}"))
+        nav.append(InlineKeyboardButton("NEXT ➡", callback_data=f"page#{session_id}#{page + 1}"))
     if nav:
         buttons.append(nav)
 
@@ -644,8 +710,7 @@ def _build_result_buttons(results: list, session_id: str, page: int, per_page: i
 
 # Keep the older public helper name used by tests/extensions, but route it to
 # the same flat builder so movie and series results cannot diverge again.
-def _build_movie_result_buttons(results: list, session_id: str, page: int,
-                                per_page: int = 10):
+def _build_movie_result_buttons(results: list, session_id: str, page: int, per_page: int = 10):
     return _build_result_buttons(results, session_id, page, per_page)
 
 
@@ -655,18 +720,18 @@ async def _render_results_view(client, message, session_id: str, page: int, data
     query = data["query"]
     total = len(results)
     buttons, page, total_pages = _build_result_buttons(results, session_id, page)
-    caption = _build_results_caption(
-        query, total, page, total_pages, data.get("first_name", "")
-    )
+    caption = _build_results_caption(query, total, page, total_pages, data.get("first_name", ""))
     markup = InlineKeyboardMarkup(buttons)
 
     # Results render as plain text only now — there's no TMDB poster to
     # upgrade a status message into a photo with. The media-message branch
     # is just a safe fallback for a session started just before this deploy.
     is_media_msg = bool(
-        getattr(message, "photo", None) or getattr(message, "video", None) or
-        getattr(message, "animation", None) or getattr(message, "document", None) or
-        getattr(message, "sticker", None)
+        getattr(message, "photo", None)
+        or getattr(message, "video", None)
+        or getattr(message, "animation", None)
+        or getattr(message, "document", None)
+        or getattr(message, "sticker", None)
     )
 
     try:
@@ -675,8 +740,7 @@ async def _render_results_view(client, message, session_id: str, page: int, data
             await message.delete()
             return await telegram_call(
                 lambda: client.send_message(
-                    chat_id, caption, reply_markup=markup,
-                    parse_mode=ParseMode.HTML, **_no_preview()
+                    chat_id, caption, reply_markup=markup, parse_mode=ParseMode.HTML, **_no_preview()
                 ),
                 route="private_search_results_send",
                 policy=INTERACTIVE_RETRY,
@@ -685,9 +749,7 @@ async def _render_results_view(client, message, session_id: str, page: int, data
             )
         else:
             await telegram_call(
-                lambda: message.edit_text(
-                    text=caption, reply_markup=markup, parse_mode=ParseMode.HTML
-                ),
+                lambda: message.edit_text(text=caption, reply_markup=markup, parse_mode=ParseMode.HTML),
                 route="private_search_results_edit",
                 policy=INTERACTIVE_RETRY,
                 retry_safe=True,
@@ -716,11 +778,26 @@ route_menu = show_results
 
 
 @Client.on_message(
-    filters.text & filters.private &
-    ~filters.command([
-        "start", "help", "admin", "broadcast", "ban", "unban", "reset_db", "update",
-        "request", "filesearch", "stats", "cancel", "reset_index_progress", "confirm_reset"
-    ])
+    filters.text
+    & filters.private
+    & ~filters.command(
+        [
+            "start",
+            "help",
+            "admin",
+            "broadcast",
+            "ban",
+            "unban",
+            "reset_db",
+            "update",
+            "request",
+            "filesearch",
+            "stats",
+            "cancel",
+            "reset_index_progress",
+            "confirm_reset",
+        ]
+    )
 )
 async def auto_filter(client: Client, message: Message, manual_query=None):
     user_id = message.from_user.id
@@ -732,9 +809,7 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
 
     subscription = await get_subscription_status_by_id(client, user_id, config)
     if subscription.status is VerificationStatus.INDETERMINATE:
-        return await message.reply_text(
-            verification_unavailable_message(subscription), reply_parameters=None
-        )
+        return await message.reply_text(verification_unavailable_message(subscription), reply_parameters=None)
     if subscription.status is VerificationStatus.DENY:
         await send_fsub_message(client, message)
         return
@@ -742,16 +817,17 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
     if manual_query:
         query = manual_query
     else:
-        raw   = message.text
+        raw = message.text
         query = clean_query(raw)
         if len(raw.strip()) < 3 or raw.strip().lower() in IGNORE_WORDS:
             main_group = config.get("main_group", "")
             return await message.reply_text(
                 f"<b>Type a movie or series name to search!</b>",
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("📝 Request Here", url=main_group)]]
-                ) if main_group else None,
-                reply_parameters=None, parse_mode=ParseMode.HTML
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📝 Request Here", url=main_group)]])
+                if main_group
+                else None,
+                reply_parameters=None,
+                parse_mode=ParseMode.HTML,
             )
 
     if not query:
@@ -804,16 +880,22 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
         for sug in suggestions:
             safe_sug = re.sub(r"[^a-zA-Z0-9]", "_", sug)[:40]
             suggestion_title, _ = _display_title(sug)
-            sug_row.append(InlineKeyboardButton(
-                f"💡 {suggestion_title[:20]}",
-                url=f"https://t.me/{client.me.username}?start=search_{safe_sug}"
-            ))
+            sug_row.append(
+                InlineKeyboardButton(
+                    f"💡 {suggestion_title[:20]}",
+                    url=f"https://t.me/{client.me.username}?start=search_{safe_sug}",
+                )
+            )
 
         sug_buttons = [sug_row] if sug_row else []
         sug_buttons += [
-            [InlineKeyboardButton("📝 Request This Movie", callback_data=callback_data("reqmovie#", safe_query)),
-             InlineKeyboardButton("🔎 Google", url=google_url)],
-            [InlineKeyboardButton("⌂ Back to Home", callback_data="start_home")]
+            [
+                InlineKeyboardButton(
+                    "📝 Request This Movie", callback_data=callback_data("reqmovie#", safe_query)
+                ),
+                InlineKeyboardButton("🔎 Google", url=google_url),
+            ],
+            [InlineKeyboardButton("⌂ Back to Home", callback_data="start_home")],
         ]
 
         no_results_msg = await message.reply_text(
@@ -823,7 +905,8 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
             f"language, or checking the spelling.</blockquote>\n"
             f"You can also request it and receive an update when it is added.",
             reply_markup=InlineKeyboardMarkup(sug_buttons),
-            parse_mode=ParseMode.HTML, **_no_preview()
+            parse_mode=ParseMode.HTML,
+            **_no_preview(),
         )
         # Previously left in chat forever — no cleanup path existed for a
         # PM no-results screen. Reuses the same auto-delete/ manual_query
@@ -837,13 +920,13 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
     session_id = secrets.token_urlsafe(9)
 
     session_data = {
-        "results":          _sort_results(results),
-        "query":            query,
-        "speed":            f"{time_taken:.3f}s",
-        "time":             time.time(),
+        "results": _sort_results(results),
+        "query": query,
+        "speed": f"{time_taken:.3f}s",
+        "time": time.time(),
         "auto_delete_time": int(config.get("auto_delete_time", 300)),
-        "user_id":          user_id,
-        "first_name":       message.from_user.first_name or "",
+        "user_id": user_id,
+        "first_name": message.from_user.first_name or "",
     }
     await db.save_search(session_id, session_data)
 
@@ -855,20 +938,22 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
 async def handle_pagination(client: Client, callback: CallbackQuery):
     if not (await enforce_user_action(callback, "search_navigation")).allowed:
         return
-    parts      = callback.data.split("#")
+    parts = callback.data.split("#")
     session_id = parts[1]
-    page       = int(parts[2])
+    page = int(parts[2])
 
     data = await db.get_search(session_id)
     if not data:
-        await callback.answer("⚠️ Session expired.", show_alert=True)
+        await answer_callback_safely(callback, "⚠️ Session expired.", show_alert=True)
         return
     if data.get("user_id") not in (None, callback.from_user.id):
-        await callback.answer("This search belongs to another user.", show_alert=True)
+        await answer_callback_safely(callback, "This search belongs to another user.", show_alert=True)
         return
 
-    await _render_results_view(client, callback.message, session_id, page, data, user_id=callback.from_user.id)
-    await callback.answer()
+    await _render_results_view(
+        client, callback.message, session_id, page, data, user_id=callback.from_user.id
+    )
+    await answer_callback_safely(callback)
 
 
 @Client.on_callback_query(filters.regex(r"^expandseries#"))
@@ -879,14 +964,14 @@ async def handle_expand_series(client: Client, callback: CallbackQuery):
 
     data = await db.get_search(session_id)
     if not data:
-        return await callback.answer("⚠️ Session expired.", show_alert=True)
+        return await answer_callback_safely(callback, "⚠️ Session expired.", show_alert=True)
     if data.get("user_id") not in (None, callback.from_user.id):
-        return await callback.answer("This search belongs to another user.", show_alert=True)
+        return await answer_callback_safely(callback, "This search belongs to another user.", show_alert=True)
 
     data["series_expanded"] = True
     await db.save_search(session_id, data)
 
-    await callback.answer()
+    await answer_callback_safely(callback)
     await _render_results_view(client, callback.message, session_id, 0, data, user_id=callback.from_user.id)
 
 
@@ -896,33 +981,37 @@ async def show_filter_menu(client: Client, callback: CallbackQuery):
         return
     _, session_id, kind = callback.data.split("#", 2)
     if kind not in {"language", "quality"}:
-        return await callback.answer("Invalid filter.", show_alert=True)
+        return await answer_callback_safely(callback, "Invalid filter.", show_alert=True)
 
     data = await db.get_search(session_id)
     if not data:
-        return await callback.answer("⚠️ Session expired.", show_alert=True)
+        return await answer_callback_safely(callback, "⚠️ Session expired.", show_alert=True)
     if data.get("user_id") not in (None, callback.from_user.id):
-        return await callback.answer("This search belongs to another user.", show_alert=True)
+        return await answer_callback_safely(callback, "This search belongs to another user.", show_alert=True)
 
     values = _available_filter_values(data["results"], kind)
     field = f"filter_{kind}"
     active = data.get(field)
     plural = "Languages" if kind == "language" else "Qualities"
-    buttons = [[InlineKeyboardButton(
-        f"{'✓ ' if not active else ''}All {plural}",
-        callback_data=f"applyfilter#{session_id}#{kind}#all",
-    )]]
+    buttons = [
+        [
+            InlineKeyboardButton(
+                f"{'✓ ' if not active else ''}All {plural}",
+                callback_data=f"applyfilter#{session_id}#{kind}#all",
+            )
+        ]
+    ]
     for index in range(0, len(values), 2):
         row = []
-        for value in values[index:index + 2]:
-            row.append(InlineKeyboardButton(
-                f"{'✓ ' if active == value else ''}{value}",
-                callback_data=f"applyfilter#{session_id}#{kind}#{value}",
-            ))
+        for value in values[index : index + 2]:
+            row.append(
+                InlineKeyboardButton(
+                    f"{'✓ ' if active == value else ''}{value}",
+                    callback_data=f"applyfilter#{session_id}#{kind}#{value}",
+                )
+            )
         buttons.append(row)
-    buttons.append([InlineKeyboardButton(
-        "‹ Back to Results", callback_data=f"page#{session_id}#0"
-    )])
+    buttons.append([InlineKeyboardButton("‹ Back to Results", callback_data=f"page#{session_id}#0")])
 
     icon = "🌐" if kind == "language" else "🎞"
     await callback.message.edit_text(
@@ -930,7 +1019,7 @@ async def show_filter_menu(client: Client, callback: CallbackQuery):
         reply_markup=InlineKeyboardMarkup(buttons),
         parse_mode=ParseMode.HTML,
     )
-    await callback.answer()
+    await answer_callback_safely(callback)
 
 
 @Client.on_callback_query(filters.regex(r"^applyfilter#"))
@@ -939,20 +1028,18 @@ async def apply_result_filter(client: Client, callback: CallbackQuery):
         return
     _, session_id, kind, value = callback.data.split("#", 3)
     if kind not in {"language", "quality"}:
-        return await callback.answer("Invalid filter.", show_alert=True)
+        return await answer_callback_safely(callback, "Invalid filter.", show_alert=True)
 
     data = await db.get_search(session_id)
     if not data:
-        return await callback.answer("⚠️ Session expired.", show_alert=True)
+        return await answer_callback_safely(callback, "⚠️ Session expired.", show_alert=True)
     if data.get("user_id") not in (None, callback.from_user.id):
-        return await callback.answer("This search belongs to another user.", show_alert=True)
+        return await answer_callback_safely(callback, "This search belongs to another user.", show_alert=True)
 
     data[f"filter_{kind}"] = None if value == "all" else value
     await db.save_search(session_id, data)
-    await _render_results_view(
-        client, callback.message, session_id, 0, data, user_id=callback.from_user.id
-    )
-    await callback.answer("Filter updated")
+    await _render_results_view(client, callback.message, session_id, 0, data, user_id=callback.from_user.id)
+    await answer_callback_safely(callback, "Filter updated")
 
 
 @Client.on_callback_query(filters.regex(r"^clearfilters#"))
@@ -962,22 +1049,20 @@ async def clear_result_filters(client: Client, callback: CallbackQuery):
     session_id = callback.data.split("#", 1)[1]
     data = await db.get_search(session_id)
     if not data:
-        return await callback.answer("⚠️ Session expired.", show_alert=True)
+        return await answer_callback_safely(callback, "⚠️ Session expired.", show_alert=True)
     if data.get("user_id") not in (None, callback.from_user.id):
-        return await callback.answer("This search belongs to another user.", show_alert=True)
+        return await answer_callback_safely(callback, "This search belongs to another user.", show_alert=True)
 
     data["filter_language"] = None
     data["filter_quality"] = None
     await db.save_search(session_id, data)
-    await _render_results_view(
-        client, callback.message, session_id, 0, data, user_id=callback.from_user.id
-    )
-    await callback.answer("Filters cleared")
+    await _render_results_view(client, callback.message, session_id, 0, data, user_id=callback.from_user.id)
+    await answer_callback_safely(callback, "Filters cleared")
 
 
 @Client.on_callback_query(filters.regex(r"^ignore$"))
 async def handle_ignore(client: Client, callback: CallbackQuery):
-    await callback.answer()
+    await answer_callback_safely(callback)
 
 
 @Client.on_callback_query(filters.regex(r"^sendfile#"))
@@ -988,7 +1073,7 @@ async def send_movie_file(client: Client, callback: CallbackQuery):
     file_data = await db.get_file(file_obj_id)
 
     if not file_data:
-        return await callback.answer("⚠️ File no longer available.", show_alert=True)
+        return await answer_callback_safely(callback, "⚠️ File no longer available.", show_alert=True)
 
     if not await check_verification_gates(client, callback, file_obj_id):
         return
@@ -1001,11 +1086,11 @@ async def send_movie_file(client: Client, callback: CallbackQuery):
     try:
         await guard.__aenter__()
     except WorkloadRejected as exc:
-        return await callback.answer(exc.public_message, show_alert=True)
+        return await answer_callback_safely(callback, exc.public_message, show_alert=True)
 
-    await callback.answer("📤 Sending file...", show_alert=False)
+    await answer_callback_safely(callback, "📤 Sending file...", show_alert=False)
 
-    config         = access.config
+    config = access.config
     delete_seconds = int(config.get("auto_delete_time", 300))
     delete_minutes = delete_seconds // 60
 
@@ -1014,9 +1099,7 @@ async def send_movie_file(client: Client, callback: CallbackQuery):
             lambda: client.send_cached_media(
                 chat_id=callback.message.chat.id,
                 file_id=file_data["file_id"],
-                caption=_build_caption(
-                    config, file_data, delete_minutes, client.me.username
-                ),
+                caption=_build_caption(config, file_data, delete_minutes, client.me.username),
                 parse_mode=ParseMode.HTML,
             ),
             route="file_delivery_callback",
@@ -1025,19 +1108,24 @@ async def send_movie_file(client: Client, callback: CallbackQuery):
             idempotency_key=f"{callback.from_user.id}:{file_obj_id}",
         )
         await _auto_delete_file(sent, file_data["file_name"], client.me.username, delete_seconds)
-    except (FileIdInvalid, FileReferenceEmpty, FileReferenceExpired,
-            FileReferenceInvalid, MediaEmpty, MediaInvalid) as e:
+    except (
+        FileIdInvalid,
+        FileReferenceEmpty,
+        FileReferenceExpired,
+        FileReferenceInvalid,
+        MediaEmpty,
+        MediaInvalid,
+    ) as e:
         await db.delete_file_by_id(file_data["file_id"])
         unavailable_title, unavailable_year = _display_title(file_data["file_name"])
         unavailable_name = (
-            f"{unavailable_title} ({unavailable_year})"
-            if unavailable_year else unavailable_title
+            f"{unavailable_title} ({unavailable_year})" if unavailable_year else unavailable_title
         )
         await callback.message.reply_text(
             f"❌ <b>File unavailable</b>\n\n"
             f"{_html(unavailable_name)} is no longer valid. "
             f"It was removed from the index; please search again.",
-            parse_mode=ParseMode.HTML
+            parse_mode=ParseMode.HTML,
         )
         logger.warning("Removed invalid cached file %s: %s", file_data["file_id"], e)
     except Exception as e:
@@ -1056,12 +1144,12 @@ async def _fsub_membership(client, channel_id, user_id) -> VerificationResult:
 async def check_fsub_callback(client: Client, callback: CallbackQuery):
     if not (await enforce_user_action(callback, "verification")).allowed:
         return
-    file_part       = callback.data.split("#")[1]
+    file_part = callback.data.split("#")[1]
     pending_file_id = file_part if file_part != "none" else None
 
-    config   = await db.get_config()
+    config = await db.get_config()
     channels = config.get("fsub_channels", [])
-    user_id  = callback.from_user.id
+    user_id = callback.from_user.id
 
     # Parse first, preserving each channel's original 1-based position (i)
     # in `channels` for the "Channel {i}" fallback name below, exactly as
@@ -1074,17 +1162,20 @@ async def check_fsub_callback(client: Client, callback: CallbackQuery):
 
     # Membership checks are independent Telegram API calls — run them
     # concurrently instead of one at a time.
-    membership_results = await asyncio.gather(
-        *[_fsub_membership(client, channel_id, user_id) for _, _, channel_id in valid],
-        return_exceptions=True
-    ) if valid else []
+    membership_results = (
+        await asyncio.gather(
+            *[_fsub_membership(client, channel_id, user_id) for _, _, channel_id in valid],
+            return_exceptions=True,
+        )
+        if valid
+        else []
+    )
 
     indeterminate = next(
         (
             result
             for result in membership_results
-            if isinstance(result, BaseException)
-            or result.status is VerificationStatus.INDETERMINATE
+            if isinstance(result, BaseException) or result.status is VerificationStatus.INDETERMINATE
         ),
         None,
     )
@@ -1095,8 +1186,8 @@ async def check_fsub_callback(client: Client, callback: CallbackQuery):
             else indeterminate
         )
         logger.warning("verification_indeterminate gate=legacy_fsub reason=%s", result.reason)
-        return await callback.answer(
-            verification_unavailable_message(result), show_alert=True
+        return await answer_callback_safely(
+            callback, verification_unavailable_message(result), show_alert=True
         )
 
     remaining = []
@@ -1107,7 +1198,7 @@ async def check_fsub_callback(client: Client, callback: CallbackQuery):
 
         # Same join-link resolution as utils.send_fsub_message.
         try:
-            ch_str      = str(channel_id).strip()
+            ch_str = str(channel_id).strip()
             stored_link = entry.get("link") if isinstance(entry, dict) else None
             if ch_str.startswith("@"):
                 link = f"https://t.me/{ch_str[1:]}"
@@ -1126,7 +1217,7 @@ async def check_fsub_callback(client: Client, callback: CallbackQuery):
             continue
 
         try:
-            chat    = await client.get_chat(int(ch_str) if ch_str.lstrip('-').isdigit() else ch_str)
+            chat = await client.get_chat(int(ch_str) if ch_str.lstrip("-").isdigit() else ch_str)
             ch_name = (getattr(chat, "title", None) or f"Channel {i}")[:30]
         except Exception:
             ch_name = f"Channel {i}"
@@ -1134,18 +1225,14 @@ async def check_fsub_callback(client: Client, callback: CallbackQuery):
 
     if link_error:
         logger.warning("verification_indeterminate gate=legacy_fsub reason=join_link")
-        return await callback.answer(
-            verification_unavailable_message(), show_alert=True
-        )
+        return await answer_callback_safely(callback, verification_unavailable_message(), show_alert=True)
 
     if remaining:
-        remaining.append([InlineKeyboardButton(
-            "✅ I've Joined — Check Now",
-            callback_data=f"check_fsub#{file_part}"
-        )])
-        await callback.answer(
-            f"❌ Still need to join {len(remaining)-1} channel(s).",
-            show_alert=True
+        remaining.append(
+            [InlineKeyboardButton("✅ I've Joined — Check Now", callback_data=f"check_fsub#{file_part}")]
+        )
+        await answer_callback_safely(
+            callback, f"❌ Still need to join {len(remaining) - 1} channel(s).", show_alert=True
         )
         try:
             await callback.message.edit_reply_markup(InlineKeyboardMarkup(remaining))
@@ -1156,7 +1243,7 @@ async def check_fsub_callback(client: Client, callback: CallbackQuery):
     access = await enforce_user_action(callback, "file_delivery")
     if not access.allowed:
         return
-    await callback.answer("✅ Verified! Sending your file...", show_alert=False)
+    await answer_callback_safely(callback, "✅ Verified! Sending your file...", show_alert=False)
     chat_id = callback.message.chat.id
     try:
         await callback.message.delete()
@@ -1176,7 +1263,7 @@ async def check_fsub_callback(client: Client, callback: CallbackQuery):
             await client.send_message(chat_id, exc.public_message)
             return
 
-        cfg            = access.config
+        cfg = access.config
         delete_seconds = int(cfg.get("auto_delete_time", 300))
         delete_minutes = delete_seconds // 60
 
@@ -1185,9 +1272,7 @@ async def check_fsub_callback(client: Client, callback: CallbackQuery):
                 lambda: client.send_cached_media(
                     chat_id=chat_id,
                     file_id=file_data["file_id"],
-                    caption=_build_caption(
-                        cfg, file_data, delete_minutes, client.me.username
-                    ),
+                    caption=_build_caption(cfg, file_data, delete_minutes, client.me.username),
                     parse_mode=ParseMode.HTML,
                 ),
                 route="file_delivery_legacy_fsub",
@@ -1196,8 +1281,14 @@ async def check_fsub_callback(client: Client, callback: CallbackQuery):
                 idempotency_key=f"{user_id}:{pending_file_id}",
             )
             await _auto_delete_file(sent, file_data["file_name"], client.me.username, delete_seconds)
-        except (FileIdInvalid, FileReferenceEmpty, FileReferenceExpired,
-                FileReferenceInvalid, MediaEmpty, MediaInvalid) as e:
+        except (
+            FileIdInvalid,
+            FileReferenceEmpty,
+            FileReferenceExpired,
+            FileReferenceInvalid,
+            MediaEmpty,
+            MediaInvalid,
+        ) as e:
             await db.delete_file_by_id(file_data["file_id"])
             await client.send_message(chat_id, "❌ File unavailable. Please search again.")
             logger.warning("Removed invalid cached file %s: %s", file_data["file_id"], e)
@@ -1211,5 +1302,5 @@ async def check_fsub_callback(client: Client, callback: CallbackQuery):
             chat_id,
             "✅ **Verification Successful!**\n\n"
             "<blockquote>You're all set! Type any movie name to search.</blockquote>",
-            parse_mode=ParseMode.HTML
+            parse_mode=ParseMode.HTML,
         )

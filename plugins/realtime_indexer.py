@@ -15,7 +15,7 @@ from pyrogram.errors import FloodWait, InputUserDeactivated, UserIsBlocked
 from plugins.filter import send_smart_log
 from plugins.telegram_retry import BACKGROUND_RETRY, telegram_call
 from plugins.task_supervisor import TaskConflict, supervisor
-from utils import _html
+from utils import _html, report_internal_error
 
 # load_dotenv() needed so DATABASE_CHANNEL_ID env fallback works correctly
 load_dotenv()
@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 RECENT_POSTS = OrderedDict()
 _RECENT_POSTS_MAX = 1000
 POST_COOLDOWN = 300
+
 
 # ── DURABLE POST QUEUE ────────────────────────────────────────────────────────
 async def run_notification_worker(client: Client):
@@ -57,9 +58,7 @@ async def run_notification_worker(client: Client):
             logger.error("Post queue worker error: %s", e)
             if job:
                 delay = min(3600, 30 * (2 ** min(job.get("attempts", 1), 7)))
-                await db.retry_announcement(
-                    job["_id"], delay, job.get("revision")
-                )
+                await db.retry_announcement(job["_id"], delay, job.get("revision"))
         await asyncio.sleep(3)
 
 
@@ -77,59 +76,76 @@ async def _ensure_queue_worker(client: Client):
 
 # ── FILE INFO PARSER ──────────────────────────────────────────────────────────
 
-def parse_file_info(filename):
-    filename = re.sub(r'\.(mkv|mp4|avi|mov|zip)$', '', filename, flags=re.IGNORECASE)
 
-    year_match = re.search(r'\b(19\d{2}|20\d{2})\b', filename)
+def parse_file_info(filename):
+    filename = re.sub(r"\.(mkv|mp4|avi|mov|zip)$", "", filename, flags=re.IGNORECASE)
+
+    year_match = re.search(r"\b(19\d{2}|20\d{2})\b", filename)
     year = year_match.group(1) if year_match else None
 
-    qualities = ["4K", "1080p", "720p", "480p", "HDRip", "WEB-DL", "WEBRip",
-                 "BluRay", "PreDVD", "CAM", "HD Rip"]
+    qualities = [
+        "4K",
+        "1080p",
+        "720p",
+        "480p",
+        "HDRip",
+        "WEB-DL",
+        "WEBRip",
+        "BluRay",
+        "PreDVD",
+        "CAM",
+        "HD Rip",
+    ]
     quality = next(
-        (q for q in qualities if re.search(
-            r'\b' + q.replace(' ', r'\s*') + r'\b', filename, re.IGNORECASE
-        )), None
+        (q for q in qualities if re.search(r"\b" + q.replace(" ", r"\s*") + r"\b", filename, re.IGNORECASE)),
+        None,
     )
     if quality and quality.lower() == "hdrip":
         quality = "HD Rip"
 
-    languages = ["Malayalam", "Tamil", "Telugu", "Hindi", "English",
-                 "Kannada", "Dual Audio", "Multi Audio"]
-    language = next(
-        (l for l in languages if re.search(r'\b' + l + r'\b', filename, re.IGNORECASE)),
-        None
-    )
+    languages = ["Malayalam", "Tamil", "Telugu", "Hindi", "English", "Kannada", "Dual Audio", "Multi Audio"]
+    language = next((l for l in languages if re.search(r"\b" + l + r"\b", filename, re.IGNORECASE)), None)
 
-    is_series = bool(re.search(
-        r'(S\d+|Season \d+|E\d+|Episode \d+)', filename, re.IGNORECASE
-    ))
+    is_series = bool(re.search(r"(S\d+|Season \d+|E\d+|Episode \d+)", filename, re.IGNORECASE))
 
     clean_title = filename
     if year:
         clean_title = clean_title.split(year)[0]
 
-    clean_title = re.sub(r'[._\-]', ' ', clean_title)
+    clean_title = re.sub(r"[._\-]", " ", clean_title)
 
-    junk = ['sample\\s*of', 'www', '1tamilmv', 'tamilblasters', 'moviezwap',
-            'tamilyogi', 'life', 'hq', 'esub', 'combined', '10bit', 'org']
+    junk = [
+        "sample\\s*of",
+        "www",
+        "1tamilmv",
+        "tamilblasters",
+        "moviezwap",
+        "tamilyogi",
+        "life",
+        "hq",
+        "esub",
+        "combined",
+        "10bit",
+        "org",
+    ]
     for j in junk:
-        clean_title = re.sub(fr'\b{j}\b', '', clean_title, flags=re.IGNORECASE)
+        clean_title = re.sub(rf"\b{j}\b", "", clean_title, flags=re.IGNORECASE)
 
     match = re.search(
-        r'\b(19\d{2}|20\d{2}|S\d{1,2}|Season \d+|1080p|720p|480p|4k|2160p)\b',
-        clean_title, re.IGNORECASE
+        r"\b(19\d{2}|20\d{2}|S\d{1,2}|Season \d+|1080p|720p|480p|4k|2160p)\b", clean_title, re.IGNORECASE
     )
     if match:
-        clean_title = clean_title[:match.start()]
+        clean_title = clean_title[: match.start()]
 
-    clean_title = re.sub(r'\[.*?\]|\(.*?\)', '', clean_title)
-    clean_title = re.sub(r'\s+', ' ', clean_title).strip()
-    clean_title = re.sub(r'^[^a-zA-Z0-9]+|[^a-zA-Z0-9]+$', '', clean_title)
+    clean_title = re.sub(r"\[.*?\]|\(.*?\)", "", clean_title)
+    clean_title = re.sub(r"\s+", " ", clean_title).strip()
+    clean_title = re.sub(r"^[^a-zA-Z0-9]+|[^a-zA-Z0-9]+$", "", clean_title)
 
     return clean_title, year, quality, language, is_series
 
 
 # ── ACTUAL POST LOGIC ─────────────────────────────────────────────────────────
+
 
 async def _do_post(client: Client, filename: str):
     """
@@ -172,8 +188,8 @@ async def _do_post(client: Client, filename: str):
         f"<blockquote>Tap the button below to get this file instantly.</blockquote>"
     )
 
-    safe_title = re.sub(r'[^a-zA-Z0-9\s\-]', ' ', display_title)
-    safe_query = re.sub(r'\s+', '_', safe_title.strip())[:45]
+    safe_title = re.sub(r"[^a-zA-Z0-9\s\-]", " ", display_title)
+    safe_query = re.sub(r"\s+", "_", safe_title.strip())[:45]
     bot_url = f"https://t.me/{client.me.username}?start=search_{safe_query}"
 
     btn_text = "📥 Get Series" if is_series else "📥 Get Movie"
@@ -221,16 +237,29 @@ async def _do_post(client: Client, filename: str):
 
 # ── NEW FILE HANDLER ──────────────────────────────────────────────────────────
 
+
 @Client.on_message(filters.channel & (filters.document | filters.video | filters.audio))
 async def index_new_files(client: Client, message: Message):
     # Always read db_channels from MongoDB so admin panel additions work instantly
     config = await db.get_config()
+    branding_channel = int(config.get("file_branding_channel_id", 0) or 0)
     db_channels = list(config.get("db_channels", []))
 
     # Also honour the .env DATABASE_CHANNEL_ID as a permanent fallback
     env_db = int(os.getenv("DATABASE_CHANNEL_ID", 0) or 0)
     if env_db and env_db not in db_channels:
         db_channels.append(env_db)
+
+    # Uploads created by the branding worker are already represented by the
+    # source row it switches. A conflicting configuration must still index the
+    # source safely, so only ignore a dedicated cache channel.
+    branding_channel_is_source = branding_channel in db_channels
+    if (
+        branding_channel
+        and message.chat.id == branding_channel
+        and not branding_channel_is_source
+    ):
+        return
 
     if message.chat.id not in db_channels:
         return
@@ -239,7 +268,15 @@ async def index_new_files(client: Client, message: Message):
     if not media or not hasattr(media, "file_name") or not media.file_name:
         return
 
-    success, return_msg = await db.save_file(media)
+    branding_requested = bool(
+        config.get("file_branding_enabled")
+        and branding_channel
+        and not branding_channel_is_source
+    )
+    success, return_msg = await db.save_file(
+        media,
+        branding_status="pending" if branding_requested else None,
+    )
 
     # Log to the channel stored in MongoDB — stays in sync with admin panel changes
     log_channel = config.get("log_channel", 0)
@@ -272,7 +309,7 @@ async def index_new_files(client: Client, message: Message):
                     f"its 450MB safety margin.\n"
                     f"🎬 **File:** `{media.file_name}`\n"
                     f"**Fix:** Add a new `DATABASE_URI` cluster and restart the bot.\n\n"
-                    f"⚠️ This file was **not indexed** and will not appear in search."
+                    f"⚠️ This file was **not indexed** and will not appear in search.",
                 ),
                 key=f"log:realtime-full:{media.file_id}",
                 owner="realtime_indexer",
@@ -282,14 +319,43 @@ async def index_new_files(client: Client, message: Message):
             logger.info("Realtime capacity log skipped during shutdown")
 
     if success:
-        # Ensure queue worker is running
-        await _ensure_queue_worker(client)
-        await db.enqueue_announcement(
-            media.file_name, delay_seconds=random.uniform(1.0, 3.0)
-        )
-        await db.enqueue_request_fulfillment(
-            media.file_name, delay_seconds=random.uniform(1.0, 3.0)
-        )
+        branding_queued = False
+        if branding_requested:
+            try:
+                await db.enqueue_file_branding(
+                    {
+                        "source_chat_id": message.chat.id,
+                        "source_message_id": message.id,
+                        "source_file_id": media.file_id,
+                        "source_unique_id": getattr(media, "file_unique_id", "") or "",
+                        "original_file_name": media.file_name,
+                        "file_size": getattr(media, "file_size", 0) or 0,
+                        "mime_type": getattr(media, "mime_type", "") or "",
+                    }
+                )
+                branding_queued = True
+            except Exception as error:
+                await db.set_file_branding_status(media.file_id, "fallback")
+                reference = report_internal_error(
+                    logger,
+                    "branding_enqueue",
+                    error,
+                    source_message_id=message.id,
+                )
+                await send_smart_log(
+                    client,
+                    "⚠️ **#FileBrandingQueue**\n\n"
+                    "The original file remains searchable and usable.\n"
+                    f"Reference: `{reference}`",
+                )
+
+        # Branded files are announced only after their replacement upload is
+        # verified. If branding is off or could not be queued, preserve the
+        # existing immediate-notification behavior.
+        if not branding_queued:
+            await _ensure_queue_worker(client)
+            await db.enqueue_announcement(media.file_name, delay_seconds=random.uniform(1.0, 3.0))
+            await db.enqueue_request_fulfillment(media.file_name, delay_seconds=random.uniform(1.0, 3.0))
 
 
 async def _fulfill_matching_requests(client, file_name: str):
@@ -299,7 +365,7 @@ async def _fulfill_matching_requests(client, file_name: str):
     This runs entirely in the background — any failure is silent and safe.
     """
     try:
-        safe_name = re.sub(r'[^a-zA-Z0-9]', '_', file_name)[:45]
+        safe_name = re.sub(r"[^a-zA-Z0-9]", "_", file_name)[:45]
         matched = False
         transient_failure = None
         async for match in db.iter_matching_requests(file_name):
@@ -313,12 +379,16 @@ async def _fulfill_matching_requests(client, file_name: str):
                     "has just been uploaded to our database!\n\n"
                     "👇 Tap below to fetch it instantly."
                 )
-                markup = InlineKeyboardMarkup([
-                    [InlineKeyboardButton(
-                        "🔍 Get It Now",
-                        url=f"https://t.me/{client.me.username}?start=search_{safe_name}"
-                    )]
-                ])
+                markup = InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "🔍 Get It Now",
+                                url=f"https://t.me/{client.me.username}?start=search_{safe_name}",
+                            )
+                        ]
+                    ]
+                )
                 await telegram_call(
                     lambda: client.send_message(
                         chat_id=user_id,
@@ -332,9 +402,7 @@ async def _fulfill_matching_requests(client, file_name: str):
                     idempotency_key=f"request:{user_id}:{movie_name.casefold()}",
                 )
                 await db.delete_pending_request(user_id, movie_name)
-                logger.info(
-                    "Auto-fulfilled request user_id=%s movie=%r", user_id, movie_name
-                )
+                logger.info("Auto-fulfilled request user_id=%s movie=%r", user_id, movie_name)
             except (InputUserDeactivated, UserIsBlocked):
                 await db.delete_user(user_id)
                 await db.delete_pending_request(user_id, movie_name)

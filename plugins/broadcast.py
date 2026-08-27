@@ -9,6 +9,7 @@ from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineK
 from pyrogram.errors import InputUserDeactivated, UserIsBlocked
 from database.db import db
 from utils import ADMIN_ID
+from plugins.callbacks import answer_callback_safely
 from plugins.telegram_retry import BROADCAST_RETRY, telegram_call
 
 load_dotenv()
@@ -34,9 +35,7 @@ _BROADCAST_COUNTER_FIELDS = {
 
 
 async def _checkpoint(job, audience, recipient_id, outcome):
-    saved = await db.checkpoint_broadcast(
-        job["_id"], job["lock_token"], audience, recipient_id, outcome
-    )
+    saved = await db.checkpoint_broadcast(job["_id"], job["lock_token"], audience, recipient_id, outcome)
     if not saved:
         raise RuntimeError("broadcast lease was lost while checkpointing")
     field = _BROADCAST_COUNTER_FIELDS[outcome]
@@ -62,7 +61,7 @@ def _broadcast_result_text(job):
     if job["target"] in ("users", "both"):
         lines += [
             f"👥 **Users Sent:** `{job.get('sent_users', 0)}`",
-            f"🚫 **Blocked/Deleted:** `{job.get('blocked_users', 0)}` _(Removed from DB)_",
+            f"🚫 **Blocked/Deleted:** `{job.get('blocked_users', 0)}` • Removed from database",
             f"⛔ **Skipped (Banned):** `{job.get('skipped_banned', 0)}`",
             f"❌ **Failed:** `{job.get('failed_users', 0)}`",
         ]
@@ -87,14 +86,10 @@ async def _run_broadcast_job(client, job):
                 await _checkpoint(job, "user", user_id, "skipped_banned")
                 continue
             try:
-                broadcast_message = await _copy_broadcast(
-                    client, job, user_id, "user"
-                )
+                broadcast_message = await _copy_broadcast(client, job, user_id, "user")
                 if job["do_pin"]:
                     try:
-                        await broadcast_message.pin(
-                            both_sides=True, disable_notification=True
-                        )
+                        await broadcast_message.pin(both_sides=True, disable_notification=True)
                     except Exception:
                         pass
                 if job["do_delete"]:
@@ -107,9 +102,7 @@ async def _run_broadcast_job(client, job):
                 outcome = "failed_user"
             await _checkpoint(job, "user", user_id, outcome)
             await asyncio.sleep(0.05)
-        if not await db.complete_broadcast_phase(
-            job["_id"], job["lock_token"], "users"
-        ):
+        if not await db.complete_broadcast_phase(job["_id"], job["lock_token"], "users"):
             raise RuntimeError("broadcast lease was lost after user phase")
         job["users_done"] = True
 
@@ -122,9 +115,7 @@ async def _run_broadcast_job(client, job):
                 outcome = "failed_group"
             await _checkpoint(job, "group", group_id, outcome)
             await asyncio.sleep(0.1)
-        if not await db.complete_broadcast_phase(
-            job["_id"], job["lock_token"], "groups"
-        ):
+        if not await db.complete_broadcast_phase(job["_id"], job["lock_token"], "groups"):
             raise RuntimeError("broadcast lease was lost after group phase")
         job["groups_done"] = True
 
@@ -160,19 +151,17 @@ async def run_broadcast_worker(client):
                 )
             else:
                 delay = min(3600, 30 * (2 ** min(attempts - 1, 7)))
-                await db.retry_broadcast(
-                    job["_id"], job["lock_token"], error, delay
-                )
+                await db.retry_broadcast(job["_id"], job["lock_token"], error, delay)
 
 
 @Client.on_callback_query(filters.regex(r"^bc_confirm$") & filters.user(ADMIN_ID))
 async def bc_confirm(client: Client, callback: CallbackQuery):
     pending = _pending_broadcasts.pop(callback.message.chat.id, None)
     if not pending:
-        await callback.answer("⚠️ Broadcast expired. Run /broadcast again.", show_alert=True)
+        await answer_callback_safely(callback, "⚠️ Broadcast expired. Run /broadcast again.", show_alert=True)
         return
     await callback.message.edit_reply_markup(None)
-    await callback.answer("✅ Broadcast queued!")
+    await answer_callback_safely(callback, "✅ Broadcast queued!")
     delay_seconds = pending["delay_seconds"]
     status_msg = await callback.message.reply_text("⏳ **Saving broadcast job...**")
     job_id = await db.enqueue_broadcast(
@@ -198,16 +187,14 @@ async def bc_confirm(client: Client, callback: CallbackQuery):
             f"Job: `{job_id}` — it will resume after a restart."
         )
     else:
-        await status_msg.edit_text(
-            f"⏳ **Broadcast queued and starting shortly.**\nJob: `{job_id}`"
-        )
+        await status_msg.edit_text(f"⏳ **Broadcast queued and starting shortly.**\nJob: `{job_id}`")
 
 
 @Client.on_callback_query(filters.regex(r"^bc_cancel$") & filters.user(ADMIN_ID))
 async def bc_cancel(client: Client, callback: CallbackQuery):
     _pending_broadcasts.pop(callback.message.chat.id, None)
     await callback.message.edit_text("❌ **Broadcast cancelled.**")
-    await callback.answer()
+    await answer_callback_safely(callback)
 
 
 @Client.on_message(filters.command("broadcast") & filters.private & filters.user(ADMIN_ID))
@@ -226,19 +213,19 @@ async def broadcast_handler(client: Client, message: Message):
             "`/broadcast -pin -del`\n"
             "`/broadcast -groups`\n"
             "`/broadcast -users -groups -schedule 2h`",
-            reply_parameters=None
+            reply_parameters=None,
         )
 
     flags = message.text.lower()
     do_pin = "-pin" in flags
     do_del = "-del" in flags
 
-    schedule_match = _re.search(r'-schedule\s+(\d+)([hm])', flags)
+    schedule_match = _re.search(r"-schedule\s+(\d+)([hm])", flags)
     delay_seconds = 0
     if schedule_match:
         amount = int(schedule_match.group(1))
         unit = schedule_match.group(2)
-        delay_seconds = amount * 3600 if unit == 'h' else amount * 60
+        delay_seconds = amount * 3600 if unit == "h" else amount * 60
 
     do_groups = "-groups" in flags
     do_users_flag = "-users" in flags
@@ -254,7 +241,9 @@ async def broadcast_handler(client: Client, message: Message):
     total = user_count + group_count
 
     est_seconds = total * 0.05
-    est_str = f"{int(est_seconds)}s" if est_seconds < 60 else f"{int(est_seconds // 60)}m {int(est_seconds % 60)}s"
+    est_str = (
+        f"{int(est_seconds)}s" if est_seconds < 60 else f"{int(est_seconds // 60)}m {int(est_seconds % 60)}s"
+    )
 
     if delay_seconds >= 3600:
         sched_str = f"⏰ Scheduled in: `{delay_seconds // 3600}h`"
@@ -274,15 +263,19 @@ async def broadcast_handler(client: Client, message: Message):
         sched_str,
         f"📌 Pin: `{'Yes' if do_pin else 'No'}`",
         f"🗑 Auto-delete 24h: `{'Yes' if do_del else 'No'}`",
-        "\nThis is what recipients will receive 👆"
+        "\nThis is what recipients will receive 👆",
     ]
 
     await message.reply_to_message.copy(chat_id=message.chat.id)
 
-    confirm_markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Confirm & Send", callback_data="bc_confirm"),
-         InlineKeyboardButton("❌ Cancel", callback_data="bc_cancel")]
-    ])
+    confirm_markup = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Confirm & Send", callback_data="bc_confirm"),
+                InlineKeyboardButton("❌ Cancel", callback_data="bc_cancel"),
+            ]
+        ]
+    )
     await message.reply_text("\n".join(preview_lines), reply_markup=confirm_markup, reply_parameters=None)
 
     _pending_broadcasts[message.chat.id] = {

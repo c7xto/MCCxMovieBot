@@ -29,6 +29,7 @@ from pyrogram.types import (
 )
 
 from database.db import db
+from plugins.callbacks import answer_callback_safely
 from plugins.task_supervisor import TaskConflict, supervisor
 from utils import ADMIN_ID, _html, report_internal_error
 
@@ -141,13 +142,9 @@ async def _get_commit(session: aiohttp.ClientSession, sha: str) -> dict:
     full_sha = str(commit.get("sha", ""))
     if not re.fullmatch(r"[0-9a-f]{40}", full_sha):
         raise RuntimeError("GitHub returned an invalid commit identity")
-    comparison = await _github_json(
-        session, f"compare/{GITHUB_BRANCH}...{full_sha}"
-    )
+    comparison = await _github_json(session, f"compare/{GITHUB_BRANCH}...{full_sha}")
     if comparison.get("status") not in {"identical", "behind"}:
-        raise RuntimeError(
-            f"Commit is not contained in the protected {GITHUB_BRANCH} branch"
-        )
+        raise RuntimeError(f"Commit is not contained in the protected {GITHUB_BRANCH} branch")
     return commit
 
 
@@ -155,11 +152,7 @@ async def _get_tree(session: aiohttp.ClientSession, sha: str) -> list[str]:
     data = await _github_json(session, f"git/trees/{sha}?recursive=1")
     if data.get("truncated"):
         raise RuntimeError("GitHub returned a truncated release tree")
-    paths = [
-        str(item.get("path", ""))
-        for item in data.get("tree", [])
-        if item.get("type") == "blob"
-    ]
+    paths = [str(item.get("path", "")) for item in data.get("tree", []) if item.get("type") == "blob"]
     if not paths or len(paths) > MAX_TREE_FILES:
         raise RuntimeError("Release tree size is outside the allowed range")
     validated = []
@@ -243,11 +236,7 @@ def _read_previous_manifest() -> set[str]:
         raw = json.loads(DEPLOYED_FILES.read_text(encoding="utf-8"))
         if not isinstance(raw, list):
             raise ValueError
-        return {
-            _safe_relative(value).as_posix()
-            for value in raw
-            if not _skip(str(value))
-        }
+        return {_safe_relative(value).as_posix() for value in raw if not _skip(str(value))}
     except (OSError, TypeError, ValueError, RuntimeError):
         logger.warning("Prior update manifest is invalid; stale cleanup disabled")
         return set()
@@ -302,34 +291,29 @@ async def _do_update(client: Client, status: Message, sha: str):
         return
     try:
         await status.edit_text("🔄 <b>1/4</b> Downloading the reviewed release…")
-        with tempfile.TemporaryDirectory(prefix="mccx-stage-") as stage_name, \
-             tempfile.TemporaryDirectory(prefix="mccx-backup-") as backup_name:
+        with (
+            tempfile.TemporaryDirectory(prefix="mccx-stage-") as stage_name,
+            tempfile.TemporaryDirectory(prefix="mccx-backup-") as backup_name,
+        ):
             stage_root = Path(stage_name).resolve()
             backup_root = Path(backup_name).resolve()
             paths = await _stage_release(sha, stage_root)
 
             await status.edit_text("🧪 <b>2/4</b> Checking Python files…")
-            compiled = await asyncio.to_thread(
-                compileall.compile_dir, str(stage_root), quiet=1, force=True
-            )
+            compiled = await asyncio.to_thread(compileall.compile_dir, str(stage_root), quiet=1, force=True)
             if not compiled:
                 raise RuntimeError("The staged release failed Python compilation")
 
             staged_requirements = _safe_target(stage_root, "requirements.txt")
             live_requirements = PROJECT_ROOT / "requirements.txt"
-            requirements_changed = (
-                staged_requirements.is_file()
-                and (
-                    not live_requirements.is_file()
-                    or staged_requirements.read_bytes() != live_requirements.read_bytes()
-                )
+            requirements_changed = staged_requirements.is_file() and (
+                not live_requirements.is_file()
+                or staged_requirements.read_bytes() != live_requirements.read_bytes()
             )
             if requirements_changed:
                 staged_lock = _safe_target(stage_root, "requirements.lock")
                 if not staged_lock.is_file():
-                    raise RuntimeError(
-                        "Dependencies changed but the release has no requirements.lock"
-                    )
+                    raise RuntimeError("Dependencies changed but the release has no requirements.lock")
                 await status.edit_text("📦 <b>3/4</b> Installing locked dependencies…")
                 ok, detail = await _install_lock(staged_lock)
                 if not ok:
@@ -379,8 +363,7 @@ async def _show_commit_review(message: Message, sha: str):
     except Exception as error:
         reference = report_internal_error(logger, "update_review", error)
         await message.reply_text(
-            "❌ <b>Commit could not be approved</b>\n\n"
-            f"Reference: <code>{reference}</code>",
+            f"❌ <b>Commit could not be approved</b>\n\nReference: <code>{reference}</code>",
             parse_mode=ParseMode.HTML,
             reply_parameters=None,
         )
@@ -390,18 +373,16 @@ async def _show_commit_review(message: Message, sha: str):
     info = commit.get("commit", {})
     author = (info.get("author") or {}).get("name", "Unknown")
     title = (info.get("message") or "Untitled commit").splitlines()[0][:180]
-    url = commit.get(
-        "html_url", f"https://github.com/{GITHUB_REPO}/commit/{full_sha}"
-    )
-    markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("View changes", url=url)],
+    url = commit.get("html_url", f"https://github.com/{GITHUB_REPO}/commit/{full_sha}")
+    markup = InlineKeyboardMarkup(
         [
-            InlineKeyboardButton(
-                "Confirm update", callback_data=f"upd_confirm#{full_sha}"
-            ),
-            InlineKeyboardButton("Cancel", callback_data="upd_cancel"),
-        ],
-    ])
+            [InlineKeyboardButton("View changes", url=url)],
+            [
+                InlineKeyboardButton("Confirm update", callback_data=f"upd_confirm#{full_sha}"),
+                InlineKeyboardButton("Cancel", callback_data="upd_cancel"),
+            ],
+        ]
+    )
     await message.reply_text(
         "🔄 <b>Review update</b>\n\n"
         f"Commit: <code>{full_sha}</code>\n"
@@ -431,27 +412,29 @@ async def cmd_update(_client: Client, message: Message):
 
 @Client.on_callback_query(filters.regex(r"^upd_start$") & filters.user(ADMIN_ID))
 async def cb_upd_start(_client: Client, callback: CallbackQuery):
-    await callback.answer()
+    await answer_callback_safely(callback)
     await callback.message.edit_text(
         "🔄 <b>Safe Bot Updater</b>\n\n"
         "Copy a commit SHA from GitHub, then send:\n"
         "<code>/update COMMIT_SHA</code>\n\n"
         "Only commits already included in the protected main branch are accepted.",
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton(
-                "Browse commits",
-                url=f"https://github.com/{GITHUB_REPO}/commits/{GITHUB_BRANCH}",
-            )
-        ]]),
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "Browse commits",
+                        url=f"https://github.com/{GITHUB_REPO}/commits/{GITHUB_BRANCH}",
+                    )
+                ]
+            ]
+        ),
     )
 
 
-@Client.on_callback_query(
-    filters.regex(r"^upd_confirm#[0-9a-f]{40}$") & filters.user(ADMIN_ID)
-)
+@Client.on_callback_query(filters.regex(r"^upd_confirm#[0-9a-f]{40}$") & filters.user(ADMIN_ID))
 async def cb_upd_confirm(client: Client, callback: CallbackQuery):
-    await callback.answer("Starting safe update…")
+    await answer_callback_safely(callback, "Starting safe update…")
     sha = callback.data.split("#", 1)[1]
     status = await callback.message.edit_text(
         f"🔄 Preparing <code>{sha[:12]}</code>…", parse_mode=ParseMode.HTML
@@ -470,7 +453,5 @@ async def cb_upd_confirm(client: Client, callback: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^upd_cancel$") & filters.user(ADMIN_ID))
 async def cb_upd_cancel(_client: Client, callback: CallbackQuery):
-    await callback.answer("Update cancelled")
-    await callback.message.edit_text(
-        "❌ <b>Update cancelled.</b>", parse_mode=ParseMode.HTML
-    )
+    await answer_callback_safely(callback, "Update cancelled")
+    await callback.message.edit_text("❌ <b>Update cancelled.</b>", parse_mode=ParseMode.HTML)

@@ -7,72 +7,80 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, 
 from pyrogram.enums import ParseMode
 from database.db import db
 from plugins.state import get_state, set_state, clear_state
+from plugins.callbacks import answer_callback_safely
+from plugins.ui_helpers import begin_prompt, finish_prompt, restore_prompt
 from utils import ADMIN_ID, _html
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-_BACK_BTN = InlineKeyboardMarkup([
-    [InlineKeyboardButton("‹ Group Manager", callback_data="group_manager_menu")]
-])
+_BACK_BTN = InlineKeyboardMarkup(
+    [[InlineKeyboardButton("‹ Group Manager", callback_data="group_manager_menu")]]
+)
 
 
 # ── GROUP MANAGER MENU ────────────────────────────────────────────────────────
 
+
 @Client.on_callback_query(filters.regex(r"^group_manager_menu$") & filters.user(ADMIN_ID))
 async def group_manager_menu(client: Client, callback: CallbackQuery):
+    clear_state(callback.from_user.id)
     config = await db.get_config()
     whitelist_mode = config.get("group_whitelist_mode", "blacklist")  # "whitelist" or "blacklist"
 
-    mode_label = "🔒 Whitelist Mode (only approved groups)" if whitelist_mode == "whitelist" \
+    mode_label = (
+        "🔒 Whitelist Mode (only approved groups)"
+        if whitelist_mode == "whitelist"
         else "🔓 Blacklist Mode (all groups except banned)"
-    toggle_label = "Switch to Blacklist Mode" if whitelist_mode == "whitelist" \
-        else "Switch to Whitelist Mode"
-
-    markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋 All Groups", callback_data="gm_list"),
-         InlineKeyboardButton("🔎 Find", callback_data="gm_find")],
-        [InlineKeyboardButton("🚫 Ban", callback_data="gm_ban_prompt"),
-         InlineKeyboardButton("✅ Unban", callback_data="gm_unban_prompt")],
-        [InlineKeyboardButton("⚙ Group Settings", callback_data="gm_settings_prompt"),
-         InlineKeyboardButton("📢 Broadcast", callback_data="gm_broadcast_prompt")],
-        [InlineKeyboardButton(f"🔄 {toggle_label}", callback_data="gm_toggle_mode")],
-        [InlineKeyboardButton("‹ Control Center", callback_data="back_to_admin")]
-    ])
-
-    text = (
-        f"🏘 **Group Manager**\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"{mode_label}\n"
-        f"Connected groups: `{await db.get_group_count():,}`"
     )
+    toggle_label = "Switch to Blacklist Mode" if whitelist_mode == "whitelist" else "Switch to Whitelist Mode"
+
+    markup = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📋 All Groups", callback_data="gm_list"),
+                InlineKeyboardButton("🔎 Find", callback_data="gm_find"),
+            ],
+            [
+                InlineKeyboardButton("🚫 Ban", callback_data="gm_ban_prompt"),
+                InlineKeyboardButton("✅ Unban", callback_data="gm_unban_prompt"),
+            ],
+            [
+                InlineKeyboardButton("⚙ Group Settings", callback_data="gm_settings_prompt"),
+                InlineKeyboardButton("📢 Broadcast", callback_data="gm_broadcast_prompt"),
+            ],
+            [InlineKeyboardButton(f"🔄 {toggle_label}", callback_data="gm_toggle_mode")],
+            [InlineKeyboardButton("‹ Control Center", callback_data="back_to_admin")],
+        ]
+    )
+
+    text = f"🏘 **Group Manager**\n\n{mode_label}\nConnected groups: `{await db.get_group_count():,}`"
     try:
         await callback.message.edit_text(text, reply_markup=markup)
     except Exception:
         await callback.message.reply_text(text, reply_markup=markup)
-    await callback.answer()
+    await answer_callback_safely(callback)
 
 
 # ── LIST & TOP GROUPS ─────────────────────────────────────────────────────────
 
+
 @Client.on_callback_query(filters.regex(r"^gm_list$") & filters.user(ADMIN_ID))
 async def gm_list_groups(client: Client, callback: CallbackQuery):
     await callback.message.edit_text("📋 **Fetching group list...**")
-    await callback.answer()
+    await answer_callback_safely(callback)
 
     groups = await db.get_all_groups()
     if not groups:
-        await callback.message.edit_text(
-            "📋 No groups connected yet.", reply_markup=_BACK_BTN
-        )
+        await callback.message.edit_text("📋 No groups connected yet.", reply_markup=_BACK_BTN)
         return
 
     text = f"📋 **All Connected Groups** ({len(groups)} total)\n\n"
     for g in groups[:20]:
         status = "🚫" if g.get("banned") else ("✅" if g.get("whitelisted") else "⚪")
         count = g.get("search_count", 0)
-        text += f"{status} `{g['_id']}` — {g.get('title','?')[:25]} ({count} searches)\n"
+        text += f"{status} `{g['_id']}` — {g.get('title', '?')[:25]} ({count} searches)\n"
 
     if len(groups) > 20:
         text += f"\n_...and {len(groups) - 20} more_"
@@ -82,7 +90,7 @@ async def gm_list_groups(client: Client, callback: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^gm_top$") & filters.user(ADMIN_ID))
 async def gm_top_groups(client: Client, callback: CallbackQuery):
-    await callback.answer()
+    await answer_callback_safely(callback)
     top = await db.get_top_groups(limit=10)
 
     if not top:
@@ -100,64 +108,59 @@ async def gm_top_groups(client: Client, callback: CallbackQuery):
 
 # ── BAN/UNBAN GROUP ───────────────────────────────────────────────────────────
 
+
 @Client.on_callback_query(filters.regex(r"^gm_ban_prompt$") & filters.user(ADMIN_ID))
 async def gm_ban_prompt(client: Client, callback: CallbackQuery):
-    set_state(callback.from_user.id, "gm_ban")
-    await callback.message.reply_text(
+    await begin_prompt(
+        callback,
+        "gm_ban",
         "🚫 **Ban a Group**\n\n"
         "Send me the **Group ID** to ban.\n"
-        "The bot will send a farewell message and leave the group.\n\n"
-        "*Type /cancel to abort.*"
+        "The bot will send a farewell message and leave the group.",
     )
-    await callback.answer()
 
 
 @Client.on_callback_query(filters.regex(r"^gm_unban_prompt$") & filters.user(ADMIN_ID))
 async def gm_unban_prompt(client: Client, callback: CallbackQuery):
-    set_state(callback.from_user.id, "gm_unban")
-    await callback.message.reply_text(
-        "✅ **Unban a Group**\n\n"
-        "Send me the **Group ID** to unban.\n\n"
-        "*Type /cancel to abort.*"
-    )
-    await callback.answer()
+    await begin_prompt(callback, "gm_unban", "✅ **Unban a Group**\n\nSend me the **Group ID** to unban.")
 
 
 # ── PER-GROUP SETTINGS ────────────────────────────────────────────────────────
 
+
 @Client.on_callback_query(filters.regex(r"^gm_settings_prompt$") & filters.user(ADMIN_ID))
 async def gm_settings_prompt(client: Client, callback: CallbackQuery):
     """Shows all connected groups as inline buttons — no text input needed."""
-    await callback.answer()
+    await answer_callback_safely(callback)
     groups = await db.get_all_groups()
     if not groups:
-        await callback.message.edit_text(
-            "⚙️ No groups connected yet.",
-            reply_markup=_BACK_BTN
-        )
+        await callback.message.edit_text("⚙️ No groups connected yet.", reply_markup=_BACK_BTN)
         return
 
     buttons = []
     for g in groups[:20]:
         status = "🚫" if g.get("banned") else ("✅" if g.get("whitelisted") else "⚪")
         title = g.get("title", "Unknown")[:22]
-        buttons.append([InlineKeyboardButton(
-            f"{status} {title}",
-            callback_data=f"gm_view_settings#{g['_id']}"
-        )])
+        buttons.append(
+            [InlineKeyboardButton(f"{status} {title}", callback_data=f"gm_view_settings#{g['_id']}")]
+        )
 
     if len(groups) > 20:
-        buttons.append([InlineKeyboardButton(
-            f"...and {len(groups)-20} more (use Find Group)",
-            callback_data="gm_find"
-        )])
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"...and {len(groups) - 20} more (use Find Group)", callback_data="gm_find"
+                )
+            ]
+        )
 
-    buttons.append([InlineKeyboardButton("🔙 Back", callback_data="group_manager_menu")])
+    buttons.append(
+        [InlineKeyboardButton("‹ Group Manager", callback_data="group_manager_menu")]
+    )
 
     await callback.message.edit_text(
-        f"⚙️ **Select a group to configure:**\n\n"
-        f"Total: `{len(groups)}` groups",
-        reply_markup=InlineKeyboardMarkup(buttons)
+        f"⚙️ **Select a group to configure:**\n\nTotal: `{len(groups)}` groups",
+        reply_markup=InlineKeyboardMarkup(buttons),
     )
 
 
@@ -166,10 +169,10 @@ async def gm_view_settings(client: Client, callback: CallbackQuery):
     try:
         group_id = int(callback.data.split("#")[1])
     except (ValueError, IndexError):
-        return await callback.answer("❌ Malformed callback.", show_alert=True)
+        return await answer_callback_safely(callback, "❌ Malformed callback.", show_alert=True)
     group = await db.get_group(group_id)
     if not group:
-        await callback.answer("Group not found in DB.", show_alert=True)
+        await answer_callback_safely(callback, "Group not found in DB.", show_alert=True)
         return
 
     settings = group.get("settings", {})
@@ -186,14 +189,18 @@ async def gm_view_settings(client: Client, callback: CallbackQuery):
         f"🔍 Total searches: `{group.get('search_count', 0)}`"
     )
 
-    markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Whitelist",  callback_data=f"gm_whitelist#{group_id}"),
-         InlineKeyboardButton("🚫 Ban",        callback_data=f"gm_ban_confirm#{group_id}")],
-        [InlineKeyboardButton("⏱ Set Auto-Delete", callback_data=f"gm_set_autodel#{group_id}")],
-        [InlineKeyboardButton("🔙 Back", callback_data="group_manager_menu")]
-    ])
+    markup = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Whitelist", callback_data=f"gm_whitelist#{group_id}"),
+                InlineKeyboardButton("🚫 Ban", callback_data=f"gm_ban_confirm#{group_id}"),
+            ],
+            [InlineKeyboardButton("⏱ Set Auto-Delete", callback_data=f"gm_set_autodel#{group_id}")],
+            [InlineKeyboardButton("‹ Group Manager", callback_data="group_manager_menu")],
+        ]
+    )
     await callback.message.edit_text(text, reply_markup=markup)
-    await callback.answer()
+    await answer_callback_safely(callback)
 
 
 @Client.on_callback_query(filters.regex(r"^gm_whitelist#") & filters.user(ADMIN_ID))
@@ -201,15 +208,15 @@ async def gm_whitelist_toggle(client: Client, callback: CallbackQuery):
     try:
         group_id = int(callback.data.split("#")[1])
     except (ValueError, IndexError):
-        return await callback.answer("❌ Malformed callback.", show_alert=True)
+        return await answer_callback_safely(callback, "❌ Malformed callback.", show_alert=True)
     group = await db.get_group(group_id)
     if not group:
-        await callback.answer("Group not found.", show_alert=True)
+        await answer_callback_safely(callback, "Group not found.", show_alert=True)
         return
     new_val = not group.get("whitelisted", False)
     await db.update_group(group_id, {"whitelisted": new_val})
     status = "✅ Whitelisted" if new_val else "⚪ Removed from whitelist"
-    await callback.answer(f"{status}", show_alert=True)
+    await answer_callback_safely(callback, f"{status}", show_alert=True)
     # Refresh settings view
     callback.data = f"gm_view_settings#{group_id}"
     await gm_view_settings(client, callback)
@@ -220,9 +227,9 @@ async def gm_ban_confirm(client: Client, callback: CallbackQuery):
     try:
         group_id = int(callback.data.split("#")[1])
     except (ValueError, IndexError):
-        return await callback.answer("❌ Malformed callback.", show_alert=True)
+        return await answer_callback_safely(callback, "❌ Malformed callback.", show_alert=True)
     await _ban_group(client, callback.message, group_id)
-    await callback.answer()
+    await answer_callback_safely(callback)
 
 
 @Client.on_callback_query(filters.regex(r"^gm_set_autodel#") & filters.user(ADMIN_ID))
@@ -230,18 +237,18 @@ async def gm_set_autodel_prompt(client: Client, callback: CallbackQuery):
     try:
         group_id = int(callback.data.split("#")[1])
     except (ValueError, IndexError):
-        return await callback.answer("❌ Malformed callback.", show_alert=True)
-    set_state(callback.from_user.id, f"gm_autodel#{group_id}")
-    await callback.message.reply_text(
+        return await answer_callback_safely(callback, "❌ Malformed callback.", show_alert=True)
+    await begin_prompt(
+        callback,
+        f"gm_autodel#{group_id}",
         f"⏱ **Set Auto-Delete for group `{group_id}`**\n\n"
         f"Send the number of minutes (1–60).\n"
-        f"Send `0` to use the global default.\n\n"
-        f"*Type /cancel to abort.*"
+        f"Send `0` to use the global default.",
     )
-    await callback.answer()
 
 
 # ── WHITELIST MODE TOGGLE ─────────────────────────────────────────────────────
+
 
 @Client.on_callback_query(filters.regex(r"^gm_toggle_mode$") & filters.user(ADMIN_ID))
 async def gm_toggle_mode(client: Client, callback: CallbackQuery):
@@ -250,68 +257,68 @@ async def gm_toggle_mode(client: Client, callback: CallbackQuery):
     new_mode = "whitelist" if current == "blacklist" else "blacklist"
     await db.update_config("group_whitelist_mode", new_mode)
     mode_label = "🔒 Whitelist Mode" if new_mode == "whitelist" else "🔓 Blacklist Mode"
-    await callback.answer(f"Switched to {mode_label}", show_alert=True)
+    await answer_callback_safely(callback, f"Switched to {mode_label}", show_alert=True)
     # Refresh menu
     await group_manager_menu(client, callback)
 
 
 # ── BROADCAST TO GROUPS ───────────────────────────────────────────────────────
 
+
 @Client.on_callback_query(filters.regex(r"^gm_broadcast_prompt$") & filters.user(ADMIN_ID))
 async def gm_broadcast_prompt(client: Client, callback: CallbackQuery):
-    await callback.message.reply_text(
+    await answer_callback_safely(callback)
+    await callback.message.edit_text(
         "📢 **Broadcast to Groups**\n\n"
         "Reply to any message with `/broadcast -groups` to send it to all connected groups.\n\n"
-        "Or use `/broadcast -users -groups` to send to both users and groups."
+        "Or use `/broadcast -users -groups` to send to both users and groups.",
+        reply_markup=_BACK_BTN,
     )
-    await callback.answer()
 
 
 # ── FIND GROUP ────────────────────────────────────────────────────────────────
 
+
 @Client.on_callback_query(filters.regex(r"^gm_find$") & filters.user(ADMIN_ID))
 async def gm_find_prompt(client: Client, callback: CallbackQuery):
-    set_state(callback.from_user.id, "gm_find")
-    await callback.message.reply_text(
-        "🔍 **Find Group**\n\n"
-        "Send me a **Group ID** or part of a **group name** to search.\n\n"
-        "*Type /cancel to abort.*"
+    await begin_prompt(
+        callback, "gm_find", "🔍 **Find Group**\n\nSend a **Group ID** or part of a **group name**."
     )
-    await callback.answer()
 
 
 # ── SHARED BAN HELPER ─────────────────────────────────────────────────────────
+
 
 async def _ban_group(client, reply_to_msg, group_id: int):
     """Bans a group: marks in DB, sends farewell, leaves."""
     await db.ban_group(group_id)
     try:
         await client.send_message(
-            group_id,
-            "⚠️ This bot has been removed from this group by the administrator."
+            group_id, "⚠️ This bot has been removed from this group by the administrator."
         )
         await client.leave_chat(group_id)
     except Exception as e:
         logger.warning(f"Could not leave group {group_id}: {e}")
 
-    await reply_to_msg.reply_text(
-        f"✅ **Group `{group_id}` banned and left.**\n"
-        f"Bot will not rejoin this group.",
-        reply_markup=_BACK_BTN
-    )
+    text = f"✅ **Group `{group_id}` banned and left.**\nBot will not rejoin this group."
+    if reply_to_msg is not None:
+        await reply_to_msg.reply_text(text, reply_markup=_BACK_BTN)
+    return text
 
 
 # ── INPUT HANDLER for group manager states ────────────────────────────────────
 
+
 @Client.on_message(
-    filters.private & filters.text & filters.user(ADMIN_ID) &
-    ~filters.command(["start", "admin", "ban", "unban",
-                      "reset_db", "broadcast", "filesearch", "cancel"]),
+    filters.private
+    & filters.text
+    & filters.user(ADMIN_ID)
+    & ~filters.command(["start", "admin", "ban", "unban", "reset_db", "broadcast", "filesearch", "cancel"]),
     group=-1,  # must win the race against filter.py's auto_filter — see admin.py's
-               # matching catch_admin_input handler for the full explanation. Without
-               # this, auto_filter (default group 0, registered earlier since
-               # group_manager.py loads after filter.py alphabetically) always
-               # consumes plain admin text first, so this handler never fires.
+    # matching catch_admin_input handler for the full explanation. Without
+    # this, auto_filter (default group 0, registered earlier since
+    # group_manager.py loads after filter.py alphabetically) always
+    # consumes plain admin text first, so this handler never fires.
 )
 async def gm_input_handler(client: Client, message: Message):
     admin_id = message.from_user.id
@@ -320,38 +327,37 @@ async def gm_input_handler(client: Client, message: Message):
     if not state or not state.startswith("gm_"):
         raise ContinuePropagation
 
-    if message.text.lower() in ("/cancel", "cancel"):
-        clear_state(admin_id)
-        await message.reply_text(
-            "🚫 **Cancelled.**",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back to Group Manager", callback_data="group_manager_menu")]
-            ])
+    async def respond(text, *, parse_mode=None):
+        await finish_prompt(
+            client,
+            admin_id,
+            text,
+            back_callback="group_manager_menu",
+            back_label="‹ Group Manager",
+            fallback_message=message,
+            parse_mode=parse_mode,
         )
+
+    if message.text.lower() in ("/cancel", "cancel"):
+        await restore_prompt(client, admin_id, fallback_message=message)
         raise StopPropagation
 
     if state == "gm_ban":
-        clear_state(admin_id)
         try:
             group_id = int(message.text.strip())
-            await _ban_group(client, message, group_id)
+            await respond(await _ban_group(client, None, group_id))
         except ValueError:
-            await message.reply_text("❌ Invalid Group ID. Must be a number.", reply_markup=_BACK_BTN)
+            await respond("❌ Invalid Group ID. Must be a number.")
 
     elif state == "gm_unban":
-        clear_state(admin_id)
         try:
             group_id = int(message.text.strip())
             await db.unban_group(group_id)
-            await message.reply_text(
-                f"✅ **Group `{group_id}` unbanned.**",
-                reply_markup=_BACK_BTN
-            )
+            await respond(f"✅ **Group `{group_id}` unbanned.**")
         except ValueError:
-            await message.reply_text("❌ Invalid Group ID.", reply_markup=_BACK_BTN)
+            await respond("❌ Invalid Group ID.")
 
     elif state == "gm_find":
-        clear_state(admin_id)
         query = message.text.strip()
         groups = await db.get_all_groups()
 
@@ -362,33 +368,25 @@ async def gm_input_handler(client: Client, message: Message):
                 matched.append(g)
 
         if not matched:
-            await message.reply_text(
+            await respond(
                 f"❌ No groups found matching <code>{_html(query)}</code>.",
                 parse_mode=ParseMode.HTML,
-                reply_markup=_BACK_BTN
             )
-            return
+            raise StopPropagation
 
         text = f"🔍 <b>Found {len(matched)} group(s):</b>\n\n"
         for g in matched[:10]:
             status = "🚫" if g.get("banned") else ("✅" if g.get("whitelisted") else "⚪")
-            text += (
-                f"{status} <code>{g['_id']}</code> — "
-                f"{_html(g.get('title', '?')[:30])}\n"
-            )
+            text += f"{status} <code>{g['_id']}</code> — {_html(g.get('title', '?')[:30])}\n"
 
-        await message.reply_text(
-            text, reply_markup=_BACK_BTN, parse_mode=ParseMode.HTML
-        )
+        await respond(text, parse_mode=ParseMode.HTML)
 
     elif state.startswith("gm_autodel#"):
         try:
             group_id = int(state.split("#")[1])
         except (ValueError, IndexError):
-            clear_state(admin_id)
-            await message.reply_text("❌ Session error. Please try again.", reply_markup=_BACK_BTN)
+            await respond("❌ Session error. Please try again.")
             raise StopPropagation
-        clear_state(admin_id)
         try:
             minutes = int(message.text.strip())
             if minutes == 0:
@@ -397,25 +395,17 @@ async def gm_input_handler(client: Client, message: Message):
                 settings = group.get("settings", {}) if group else {}
                 settings.pop("auto_delete_time", None)
                 await db.update_group(group_id, {"settings": settings})
-                await message.reply_text(
-                    f"✅ Group `{group_id}` will now use the **global auto-delete setting**.",
-                    reply_markup=_BACK_BTN
-                )
+                await respond(f"✅ Group `{group_id}` will now use the **global auto-delete setting**.")
             elif 1 <= minutes <= 60:
                 group = await db.get_group(group_id)
                 settings = group.get("settings", {}) if group else {}
                 settings["auto_delete_time"] = minutes * 60
                 await db.update_group(group_id, {"settings": settings})
-                await message.reply_text(
-                    f"✅ Auto-delete for group `{group_id}` set to **{minutes} minute(s)**.",
-                    reply_markup=_BACK_BTN
-                )
+                await respond(f"✅ Auto-delete for group `{group_id}` set to **{minutes} minute(s)**.")
             else:
-                await message.reply_text(
-                    "❌ Value must be 0–60 minutes.", reply_markup=_BACK_BTN
-                )
+                await respond("❌ Value must be 0–60 minutes.")
         except ValueError:
-            await message.reply_text("❌ Send a plain number like `5`.", reply_markup=_BACK_BTN)
+            await respond("❌ Send a plain number like `5`.")
 
     else:
         raise ContinuePropagation

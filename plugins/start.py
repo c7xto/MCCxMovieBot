@@ -5,6 +5,7 @@ import time
 import secrets
 from dotenv import load_dotenv
 from plugins.access_policy import authorize_user_action, enforce_user_action
+from plugins.callbacks import answer_callback_safely
 from plugins.filter import route_menu
 from plugins.search_indicator import show_search_indicator, remove_search_indicator
 from plugins.workload import (
@@ -25,8 +26,12 @@ from utils import (
 )
 from pyrogram import Client, filters
 from pyrogram.errors import (
-    FileIdInvalid, FileReferenceEmpty, FileReferenceExpired,
-    FileReferenceInvalid, MediaEmpty, MediaInvalid,
+    FileIdInvalid,
+    FileReferenceEmpty,
+    FileReferenceExpired,
+    FileReferenceInvalid,
+    MediaEmpty,
+    MediaInvalid,
 )
 from pyrogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, Message
 from pyrogram.enums import ParseMode, ChatAction
@@ -40,12 +45,12 @@ logger = logging.getLogger(__name__)
 # LANG_EMOJI and the rest of the bot's emoji usage. Centralizing this into a
 # dedicated branding module is a reasonable follow-up once more files need
 # it; scoped to start.py for now since this phase only touches this file.
-ICON_SEARCH   = "🔍"
-ICON_MOVIE    = "🎬"
-ICON_UPDATES  = "📢"
-ICON_SUCCESS  = "✅"
-ICON_FAIL     = "❌"
-ICON_REQUEST  = "📝"
+ICON_SEARCH = "🔍"
+ICON_MOVIE = "🎬"
+ICON_UPDATES = "📢"
+ICON_SUCCESS = "✅"
+ICON_FAIL = "❌"
+ICON_REQUEST = "📝"
 
 # All config (log channel, media, links) is read from MongoDB inside each
 # handler via db.get_config() — no module-level env reads needed here.
@@ -84,8 +89,7 @@ LANG_STRINGS = {
     },
     "ml": {
         "welcome_body": (
-            "സിനിമകളും സീരീസുകളും വേഗത്തിൽ കണ്ടെത്താനുള്ള നിങ്ങളുടെ ലൈബ്രറി.\n"
-            "താഴെ പേര് അയച്ച് വേണ്ട പതിപ്പ് തിരഞ്ഞെടുക്കൂ."
+            "സിനിമകളും സീരീസുകളും വേഗത്തിൽ കണ്ടെത്താനുള്ള നിങ്ങളുടെ ലൈബ്രറി.\nതാഴെ പേര് അയച്ച് വേണ്ട പതിപ്പ് തിരഞ്ഞെടുക്കൂ."
         ),
         "welcome_greeting": "സ്വാഗതം, {first_name}",
         "files_counting": "{total_files:,} ഫയലുകൾ ഇപ്പോൾ ലഭ്യമാണ്.",
@@ -112,15 +116,23 @@ def _lang_button(lang: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(f"🌐 {LANG_NAMES[next_lang]}", callback_data=f"toggle_lang#{next_lang}")
 
 
-def _build_start_ui(config, mention, total_files, bot_username, update_link, group_link,
-                     is_new=False, first_name="", lang="en"):
+def _build_start_ui(
+    config,
+    mention,
+    total_files,
+    bot_username,
+    update_link,
+    group_link,
+    is_new=False,
+    first_name="",
+    lang="en",
+):
     """Shared welcome UI builder — used by /start and start_home callback."""
     strings = LANG_STRINGS.get(lang, LANG_STRINGS["en"])
     safe_name = _html(first_name or mention)
     default_welcome = (
         "<b>🎬 MCCx Movie Bot</b>\n"
-        "<blockquote>" + strings["welcome_greeting"] + "\n"
-        + strings["welcome_body"] + "</blockquote>\n"
+        "<blockquote>" + strings["welcome_greeting"] + "\n" + strings["welcome_body"] + "</blockquote>\n"
         "<b>📚 " + strings["files_counting"] + "</b>"
     )
     # An admin-customized welcome_text is a single free-text field with no
@@ -157,10 +169,12 @@ def _build_start_ui(config, mention, total_files, bot_username, update_link, gro
 
     buttons = []
 
-    buttons.append([
-        InlineKeyboardButton("🔎 Search Guide", callback_data="help_menu"),
-        _lang_button(lang),
-    ])
+    buttons.append(
+        [
+            InlineKeyboardButton("🔎 Search Guide", callback_data="help_menu"),
+            _lang_button(lang),
+        ]
+    )
     discovery_row = []
     if group_link:
         discovery_row.append(InlineKeyboardButton("📝 Request Movie", url=group_link))
@@ -168,12 +182,14 @@ def _build_start_ui(config, mention, total_files, bot_username, update_link, gro
         discovery_row.append(InlineKeyboardButton("📢 New Releases", url=update_link))
     if discovery_row:
         buttons.append(discovery_row)
-    buttons.append([
-        InlineKeyboardButton(
-            "➕ Add Bot to Group",
-            url=f"https://t.me/{bot_username}?startgroup=true",
-        )
-    ])
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                "➕ Add Bot to Group",
+                url=f"https://t.me/{bot_username}?startgroup=true",
+            )
+        ]
+    )
     return text, InlineKeyboardMarkup(buttons)
 
 
@@ -216,34 +232,34 @@ async def _execute_search(client, status_msg, query: str, config: dict, user_id=
     if not results:
         lang = await db.get_user_language(user_id) if user_id is not None else "en"
         strings = LANG_STRINGS.get(lang, LANG_STRINGS["en"])
-        markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton(
-                f"{ICON_REQUEST} Request This Movie",
-                callback_data=callback_data("reqmovie#", query),
-            )],
-            [InlineKeyboardButton("⌂ Back to Home", callback_data="start_home")],
-        ])
+        markup = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        f"{ICON_REQUEST} Request This Movie",
+                        callback_data=callback_data("reqmovie#", query),
+                    )
+                ],
+                [InlineKeyboardButton("⌂ Back to Home", callback_data="start_home")],
+            ]
+        )
         text = f"🔎 " + strings["no_results"].format(query=_html(query))
         if getattr(status_msg, "sticker", None):
             chat_id = status_msg.chat.id
             await remove_search_indicator(status_msg)
-            return await client.send_message(
-                chat_id, text, reply_markup=markup, parse_mode=ParseMode.HTML
-            )
-        return await status_msg.edit_text(
-            text, reply_markup=markup, parse_mode=ParseMode.HTML
-        )
+            return await client.send_message(chat_id, text, reply_markup=markup, parse_mode=ParseMode.HTML)
+        return await status_msg.edit_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
 
     await db.clear_old_searches()
     session_id = secrets.token_urlsafe(9)
     session_data = {
-        "results":          results,
-        "query":            query,
-        "speed":            "0.001s",
-        "time":             time.time(),
+        "results": results,
+        "query": query,
+        "speed": "0.001s",
+        "time": time.time(),
         "auto_delete_time": int(config.get("auto_delete_time", 300)),
-        "user_id":          user_id,
-        "first_name":       first_name or "",
+        "user_id": user_id,
+        "first_name": first_name or "",
     }
     await db.save_search(session_id, session_data)
     return await route_menu(client, status_msg, session_id, 0)
@@ -258,11 +274,11 @@ async def _handle_file_link(client, message, file_obj_id: str):
     file_data = await db.get_file(file_obj_id)
     if not file_data:
         return await message.reply_text(
-            f"{ICON_FAIL} This file was deleted or is no longer available.",
-            parse_mode=ParseMode.HTML
+            f"{ICON_FAIL} This file was deleted or is no longer available.", parse_mode=ParseMode.HTML
         )
 
     from plugins.req_fsub import check_verification_gates
+
     if not await check_verification_gates(client, message, file_obj_id):
         return
 
@@ -279,14 +295,13 @@ async def _handle_file_link(client, message, file_obj_id: str):
     delete_minutes = delete_seconds // 60
 
     from plugins.filter import _auto_delete_file, _build_caption
+
     try:
         sent = await telegram_call(
             lambda: client.send_cached_media(
                 chat_id=message.chat.id,
                 file_id=file_data["file_id"],
-                caption=_build_caption(
-                    config, file_data, delete_minutes, client.me.username
-                ),
+                caption=_build_caption(config, file_data, delete_minutes, client.me.username),
                 parse_mode=ParseMode.HTML,
             ),
             route="file_delivery_deep_link",
@@ -294,9 +309,15 @@ async def _handle_file_link(client, message, file_obj_id: str):
             retry_safe=True,
             idempotency_key=f"{message.from_user.id}:{file_obj_id}",
         )
-        await _auto_delete_file(sent, file_data['file_name'], client.me.username, delete_seconds)
-    except (FileIdInvalid, FileReferenceEmpty, FileReferenceExpired,
-            FileReferenceInvalid, MediaEmpty, MediaInvalid) as exc:
+        await _auto_delete_file(sent, file_data["file_name"], client.me.username, delete_seconds)
+    except (
+        FileIdInvalid,
+        FileReferenceEmpty,
+        FileReferenceExpired,
+        FileReferenceInvalid,
+        MediaEmpty,
+        MediaInvalid,
+    ) as exc:
         await db.delete_file_by_id(file_data["file_id"])
         logger.warning("Removed invalid deep-linked file %s: %s", file_data["file_id"], exc)
         await message.reply_text(
@@ -312,17 +333,23 @@ async def _handle_file_link(client, message, file_obj_id: str):
 async def _handle_request_link(message, raw_query: str):
     """Deep-link payload: req_<query> — pre-fills a request confirmation."""
     movie_name = urllib.parse.unquote(raw_query).replace("_", " ")
-    markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            f"{ICON_SUCCESS} Confirm Request",
-            callback_data=callback_data("reqmovie#", movie_name),
-        )]
-    ])
+    markup = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"{ICON_SUCCESS} Confirm Request",
+                    callback_data=callback_data("reqmovie#", movie_name),
+                )
+            ]
+        ]
+    )
     return await message.reply_text(
         f"{ICON_REQUEST} <b>Movie Request</b>\n\n"
         f"Requesting: <code>{_html(movie_name)}</code>\n\n"
         f"Tap below to send this to the admins.",
-        reply_markup=markup, parse_mode=ParseMode.HTML, reply_parameters=None
+        reply_markup=markup,
+        parse_mode=ParseMode.HTML,
+        reply_parameters=None,
     )
 
 
@@ -336,8 +363,12 @@ async def _handle_search_payload(client, message, config, payload: str):
     query = urllib.parse.unquote(raw_query).replace("_", " ")
     status_msg = await show_search_indicator(client, message.chat.id)
     return await _execute_search(
-        client, status_msg, query, config,
-        user_id=message.from_user.id, first_name=message.from_user.first_name
+        client,
+        status_msg,
+        query,
+        config,
+        user_id=message.from_user.id,
+        first_name=message.from_user.first_name,
     )
 
 
@@ -376,6 +407,7 @@ async def start_handler(client: Client, message: Message):
     if len(message.command) > 1 and message.command[1].startswith("search_"):
         query = message.command[1].replace("search_", "").replace("_", " ")
         from plugins.filter import auto_filter
+
         return await auto_filter(client, message, manual_query=query)
 
     # 3. Deep-link dispatch — one clearly separated handler per payload type.
@@ -391,21 +423,51 @@ async def start_handler(client: Client, message: Message):
     # No payload — render the home panel.
     lang = await db.get_user_language(message.from_user.id)
     caption_text, reply_markup = _build_start_ui(
-        config, message.from_user.mention, total_files, client.me.username,
-        UPDATE_CHANNEL_LINK, MAIN_GROUP_LINK, is_new=is_new,
-        first_name=message.from_user.first_name, lang=lang
+        config,
+        message.from_user.mention,
+        total_files,
+        client.me.username,
+        UPDATE_CHANNEL_LINK,
+        MAIN_GROUP_LINK,
+        is_new=is_new,
+        first_name=message.from_user.first_name,
+        lang=lang,
     )
 
     try:
         media_lower = START_MEDIA.lower()
         if media_lower.endswith((".mp4", ".mkv", ".mov")):
-            await message.reply_video(video=START_MEDIA, caption=caption_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML, reply_parameters=None)
+            await message.reply_video(
+                video=START_MEDIA,
+                caption=caption_text,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.HTML,
+                reply_parameters=None,
+            )
         elif media_lower.endswith((".gif")):
-            await message.reply_animation(animation=START_MEDIA, caption=caption_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML, reply_parameters=None)
+            await message.reply_animation(
+                animation=START_MEDIA,
+                caption=caption_text,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.HTML,
+                reply_parameters=None,
+            )
         else:
-            await message.reply_photo(photo=START_MEDIA, caption=caption_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML, reply_parameters=None)
+            await message.reply_photo(
+                photo=START_MEDIA,
+                caption=caption_text,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.HTML,
+                reply_parameters=None,
+            )
     except Exception:
-        await message.reply_text(text=caption_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML, reply_parameters=None, **_no_preview())
+        await message.reply_text(
+            text=caption_text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.HTML,
+            reply_parameters=None,
+            **_no_preview(),
+        )
 
 
 @Client.on_callback_query(filters.regex(r"^help_menu$"))
@@ -420,18 +482,22 @@ async def help_menu_callback(client: Client, callback: CallbackQuery):
         "Try <code>Leo Malayalam 1080p</code> to narrow results instantly.\n\n"
         f"<i>{strings['help_footer']}</i>"
     )
-    markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⌂ Back to Home", callback_data="start_home")]
-    ])
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton("⌂ Back to Home", callback_data="start_home")]])
 
     try:
-        if getattr(callback.message, "video", None) or getattr(callback.message, "photo", None) or getattr(callback.message, "animation", None):
-            await callback.message.edit_caption(caption=help_text, reply_markup=markup, parse_mode=ParseMode.HTML)
+        if (
+            getattr(callback.message, "video", None)
+            or getattr(callback.message, "photo", None)
+            or getattr(callback.message, "animation", None)
+        ):
+            await callback.message.edit_caption(
+                caption=help_text, reply_markup=markup, parse_mode=ParseMode.HTML
+            )
         else:
             await callback.message.edit_text(text=help_text, reply_markup=markup, parse_mode=ParseMode.HTML)
     except Exception:
         pass
-    await callback.answer()
+    await answer_callback_safely(callback)
 
 
 @Client.on_callback_query(filters.regex(r"^start_home$"))
@@ -444,28 +510,42 @@ async def start_home_callback(client: Client, callback: CallbackQuery):
     lang = await db.get_user_language(callback.from_user.id)
 
     caption_text, reply_markup = _build_start_ui(
-        config, callback.from_user.mention, total_files, client.me.username,
-        UPDATE_CHANNEL_LINK, MAIN_GROUP_LINK, is_new=False,
-        first_name=callback.from_user.first_name, lang=lang
+        config,
+        callback.from_user.mention,
+        total_files,
+        client.me.username,
+        UPDATE_CHANNEL_LINK,
+        MAIN_GROUP_LINK,
+        is_new=False,
+        first_name=callback.from_user.first_name,
+        lang=lang,
     )
 
     try:
-        if getattr(callback.message, "video", None) or getattr(callback.message, "photo", None) or getattr(callback.message, "animation", None):
-            await callback.message.edit_caption(caption=caption_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+        if (
+            getattr(callback.message, "video", None)
+            or getattr(callback.message, "photo", None)
+            or getattr(callback.message, "animation", None)
+        ):
+            await callback.message.edit_caption(
+                caption=caption_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML
+            )
         else:
-            await callback.message.edit_text(text=caption_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+            await callback.message.edit_text(
+                text=caption_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML
+            )
     except Exception:
         pass
-    await callback.answer()
+    await answer_callback_safely(callback)
 
 
 @Client.on_callback_query(filters.regex(r"^toggle_lang#"))
 async def toggle_lang_callback(client: Client, callback: CallbackQuery):
     new_lang = callback.data.split("#", 1)[1]
     if new_lang not in LANG_STRINGS:
-        return await callback.answer()
+        return await answer_callback_safely(callback)
     await db.set_user_language(callback.from_user.id, new_lang)
-    await callback.answer(f"🌐 {LANG_NAMES[new_lang]}")
+    await answer_callback_safely(callback, f"🌐 {LANG_NAMES[new_lang]}")
     # Re-render the home panel in the new language — same code path as
     # start_home_callback so the two never drift apart.
     await start_home_callback(client, callback)

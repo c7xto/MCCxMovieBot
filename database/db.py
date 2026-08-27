@@ -51,14 +51,13 @@ logger = logging.getLogger(__name__)
 _SEARCH_CATALOG_PATH = Path(__file__).resolve().parents[1] / "runtime" / "search_titles.txt.gz"
 _DUPLICATE_SCAN_DIR = Path(__file__).resolve().parents[1] / "runtime" / "duplicate_scans"
 _SEARCH_TITLE_CATALOG: tuple[str, ...] = ()
-MAX_SEARCH_CATALOG_TITLES = min(
-    250_000, max(10_000, int(os.getenv("MAX_SEARCH_CATALOG_TITLES", "100000")))
-)
+MAX_SEARCH_CATALOG_TITLES = min(250_000, max(10_000, int(os.getenv("MAX_SEARCH_CATALOG_TITLES", "100000"))))
 MAX_DUPLICATE_GROUPS = 100
 MAX_DUPLICATE_IDS_PER_GROUP = 1000
 _DUPLICATE_HASH_BYTES = 12
 _VERIFIED_CLEANUP_BATCH_SIZE = 2000
 MAX_NOTIFICATION_OUTBOX_JOBS = 5000
+MAX_FILE_BRANDING_JOBS = 20_000
 MAX_REQUEST_MATCHES_PER_JOB = 100
 MAX_CONFIG_BACKUP_KEYS = 50
 MAX_CONFIG_BACKUP_DEPTH = 4
@@ -70,6 +69,9 @@ _RESTORABLE_CONFIG_TYPES = {
     "maintenance_mode": bool,
     "maintenance_message": str,
     "file_caption_template": str,
+    "file_branding_enabled": bool,
+    "file_branding_channel_id": int,
+    "file_branding_text": str,
     "update_channel": str,
     "main_group": str,
     "group_whitelist_mode": str,
@@ -134,10 +136,7 @@ def validate_config_restore(data: object) -> dict:
 
     if "auto_delete_time" in safe_data and not 60 <= safe_data["auto_delete_time"] <= 86400:
         raise ValueError("auto_delete_time must be between 60 and 86400")
-    if (
-        "req_fsub_interval_hours" in safe_data
-        and not 1 <= safe_data["req_fsub_interval_hours"] <= 720
-    ):
+    if "req_fsub_interval_hours" in safe_data and not 1 <= safe_data["req_fsub_interval_hours"] <= 720:
         raise ValueError("req_fsub_interval_hours must be between 1 and 720")
     if safe_data.get("group_whitelist_mode") not in (None, "whitelist", "blacklist"):
         raise ValueError("group_whitelist_mode must be whitelist or blacklist")
@@ -147,6 +146,7 @@ def validate_config_restore(data: object) -> dict:
         "welcome_text": 4096,
         "maintenance_message": 4096,
         "file_caption_template": 4096,
+        "file_branding_text": 64,
         "update_channel": 512,
         "main_group": 512,
         "group_whitelist_mode": 16,
@@ -164,9 +164,9 @@ class InsecureMongoURIError(ValueError):
 def _mongo_uri_hosts(uri: str) -> list[str]:
     lower_uri = uri.casefold()
     if lower_uri.startswith("mongodb+srv://"):
-        remainder = uri[len("mongodb+srv://"):]
+        remainder = uri[len("mongodb+srv://") :]
     elif lower_uri.startswith("mongodb://"):
-        remainder = uri[len("mongodb://"):]
+        remainder = uri[len("mongodb://") :]
     else:
         raise ValueError("MongoDB URI must use mongodb:// or mongodb+srv://")
     authority = remainder.split("/", 1)[0].split("?", 1)[0]
@@ -175,7 +175,7 @@ def _mongo_uri_hosts(uri: str) -> list[str]:
     for entry in hosts.split(","):
         entry = unquote(entry.strip())
         if entry.startswith("[") and "]" in entry:
-            host = entry[1:entry.index("]")]
+            host = entry[1 : entry.index("]")]
         elif entry.count(":") == 1:
             host = entry.rsplit(":", 1)[0]
         else:
@@ -207,31 +207,21 @@ def mongo_tls_options(
     hosts = _mongo_uri_hosts(uri)
     remote = not all(_is_loopback_mongo_host(host) for host in hosts)
     query = uri.split("?", 1)[1] if "?" in uri else ""
-    options = {
-        key.casefold(): value.casefold()
-        for key, value in parse_qsl(query, keep_blank_values=True)
-    }
+    options = {key.casefold(): value.casefold() for key, value in parse_qsl(query, keep_blank_values=True)}
     tls_value = options.get("tls", options.get("ssl"))
     tls_enabled = (
-        uri_lower.startswith("mongodb+srv://")
-        if tls_value is None
-        else tls_value in {"1", "true", "yes"}
+        uri_lower.startswith("mongodb+srv://") if tls_value is None else tls_value in {"1", "true", "yes"}
     )
     certificate_validation_disabled = any(
-        options.get(key) in {"1", "true", "yes"}
-        for key in ("tlsallowinvalidcertificates", "tlsinsecure")
+        options.get(key) in {"1", "true", "yes"} for key in ("tlsallowinvalidcertificates", "tlsinsecure")
     )
 
     if remote and (not tls_enabled or certificate_validation_disabled):
         if allow_insecure_development:
-            logger.critical(
-                "Development override permits insecure remote MongoDB transport"
-            )
+            logger.critical("Development override permits insecure remote MongoDB transport")
             return {}
         reason = (
-            "certificate validation is disabled"
-            if certificate_validation_disabled
-            else "TLS is not enabled"
+            "certificate validation is disabled" if certificate_validation_disabled else "TLS is not enabled"
         )
         raise InsecureMongoURIError(
             f"Remote MongoDB URI rejected because {reason}; use mongodb+srv:// "
@@ -252,6 +242,7 @@ class AllClustersFullError(Exception):
     Distinguishes "no cluster had room" from a normal (0 saved, N
     duplicates) result — without this, callers can't tell a full database
     apart from a batch that was simply all duplicates."""
+
     def __init__(self, unsaved_count: int, duplicates: int):
         self.unsaved_count = unsaved_count
         self.duplicates = duplicates
@@ -282,10 +273,37 @@ _SYMBOL_RE = re.compile(r"[_\-\.#+$%^&*()!~`,;:\"'?/<>\[\]{}=|\\]")
 _WS_COLLAPSE_RE = re.compile(r"\s+")
 _SEARCH_EXTENSION_TOKENS = {"mkv", "mp4", "avi", "mov", "zip", "srt"}
 _OPTIONAL_SEARCH_TOKENS = {
-    "malayalam", "tamil", "telugu", "hindi", "english", "kannada",
-    "dual", "multi", "audio", "dubbed", "sub", "subs", "esub", "esubs",
-    "2160p", "1080p", "720p", "480p", "4k", "uhd", "hdrip", "webrip",
-    "web", "dl", "webdl", "bluray", "predvd", "cam", "hevc", "x265", "x264",
+    "malayalam",
+    "tamil",
+    "telugu",
+    "hindi",
+    "english",
+    "kannada",
+    "dual",
+    "multi",
+    "audio",
+    "dubbed",
+    "sub",
+    "subs",
+    "esub",
+    "esubs",
+    "2160p",
+    "1080p",
+    "720p",
+    "480p",
+    "4k",
+    "uhd",
+    "hdrip",
+    "webrip",
+    "web",
+    "dl",
+    "webdl",
+    "bluray",
+    "predvd",
+    "cam",
+    "hevc",
+    "x265",
+    "x264",
 }
 _SEARCH_SERIES_MARKER_RE = re.compile(
     r"(?<![A-Za-z0-9])(?:S(?:EASON)?\s*\d{1,2}|"
@@ -316,11 +334,7 @@ def normalize_file_name(name: str) -> str:
 
 def search_tokens_for_name(name: str) -> list[str]:
     """Create a bounded, stable token array suitable for a multikey index."""
-    tokens = (
-        token[:64]
-        for token in normalize_file_name(name).casefold().split()
-        if token
-    )
+    tokens = (token[:64] for token in normalize_file_name(name).casefold().split() if token)
     return list(dict.fromkeys(tokens))[:32]
 
 
@@ -368,21 +382,19 @@ def _reference_search_pattern(words: list[str]) -> str:
     separator = r"[\s\.\+\-_]"
     if len(words) > 1:
         return (
-            r"(?:^|" + separator + r")"
+            r"(?:^|"
+            + separator
+            + r")"
             + (r".*" + separator).join(re.escape(word) for word in words)
-            + r"(?:$|" + separator + r")"
+            + r"(?:$|"
+            + separator
+            + r")"
         )
-    return (
-        r"(\b|[\.\+\-_])"
-        + re.escape(words[0])
-        + r"(\b|[\.\+\-_])"
-    )
+    return r"(\b|[\.\+\-_])" + re.escape(words[0]) + r"(\b|[\.\+\-_])"
 
 
 def _is_optional_search_token(token: str) -> bool:
-    return bool(re.fullmatch(r"(?:19|20)\d{2}", token)) or (
-        token.casefold() in _OPTIONAL_SEARCH_TOKENS
-    )
+    return bool(re.fullmatch(r"(?:19|20)\d{2}", token)) or (token.casefold() in _OPTIONAL_SEARCH_TOKENS)
 
 
 def primary_search_identity(name: str) -> str:
@@ -398,12 +410,9 @@ def primary_search_identity(name: str) -> str:
     normalized = " ".join(tokens)
     series_marker = _SEARCH_SERIES_MARKER_RE.search(normalized)
     if series_marker:
-        return normalized[:series_marker.start()].strip().casefold()
+        return normalized[: series_marker.start()].strip().casefold()
 
-    year_positions = [
-        index for index, token in enumerate(tokens)
-        if re.fullmatch(r"(?:19|20)\d{2}", token)
-    ]
+    year_positions = [index for index, token in enumerate(tokens) if re.fullmatch(r"(?:19|20)\d{2}", token)]
     if year_positions:
         # For numeric titles such as ``1917 2019``, the final year is release
         # metadata while the earlier number remains part of the title.
@@ -491,8 +500,7 @@ def load_search_catalog() -> int:
     return len(_SEARCH_TITLE_CATALOG)
 
 
-def suggest_search_titles(query: str, limit: int = 3,
-                          choices=None) -> list[str]:
+def suggest_search_titles(query: str, limit: int = 3, choices=None) -> list[str]:
     """Return the closest known visible titles using RapidFuzz."""
     query_identity = _fuzzy_query_identity(query)
     catalog = _SEARCH_TITLE_CATALOG if choices is None else choices
@@ -503,20 +511,24 @@ def suggest_search_titles(query: str, limit: int = 3,
     # (``avsham`` could rank a one-letter title highly). Plain edit similarity
     # handles spelling, while token-sort similarity handles reversed words.
     matches = process.extract(
-        query_identity, catalog, scorer=fuzz.ratio,
-        score_cutoff=72.0, limit=limit,
+        query_identity,
+        catalog,
+        scorer=fuzz.ratio,
+        score_cutoff=72.0,
+        limit=limit,
     )
     reordered = process.extract(
-        query_identity, catalog, scorer=fuzz.token_sort_ratio,
-        score_cutoff=80.0, limit=limit,
+        query_identity,
+        catalog,
+        scorer=fuzz.token_sort_ratio,
+        score_cutoff=80.0,
+        limit=limit,
     )
     best = {}
     for title, score, _ in matches + reordered:
         best[title] = max(score, best.get(title, 0.0))
     return [
-        title for title, _ in sorted(
-            best.items(), key=lambda item: (-item[1], len(item[0]), item[0])
-        )[:limit]
+        title for title, _ in sorted(best.items(), key=lambda item: (-item[1], len(item[0]), item[0]))[:limit]
     ]
 
 
@@ -533,11 +545,7 @@ def deduplicate_file_batch(files_list):
     for file_doc in files_list:
         fid = file_doc.get("file_id")
         unique_id = file_doc.get("file_unique_id") or ""
-        if (
-            not fid
-            or fid in seen_file_ids
-            or (unique_id and unique_id in seen_unique_ids)
-        ):
+        if not fid or fid in seen_file_ids or (unique_id and unique_id in seen_unique_ids):
             duplicate_count += 1
             continue
         seen_file_ids.add(fid)
@@ -557,15 +565,13 @@ _DUPE_JUNK_RE = re.compile(
     r"bluray|predvd|cam|hdcam|tsrip|dvdrip|x264|x265|hevc|aac|esub|hsub|"
     r"10bit|hq|nf|amzn|dual.audio|multi.audio|malayalam|tamil|telugu|hindi|"
     r"english|kannada|1xbet|tamilblasters|tamilmv|moviezwap)\b",
-    re.IGNORECASE
+    re.IGNORECASE,
 )
 _DUPE_YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
 _DUPE_BRACKET_RE = re.compile(r"[\[\(].*?[\]\)]")
 _DUPE_SEP_RE = re.compile(r"[._\-]")
 _DUPE_WS_RE = re.compile(r"\s+")
-_PROBABLE_DUPE_EXT_RE = re.compile(
-    r"\.(mkv|mp4|avi|mov|m4v|webm|zip|srt)$", re.IGNORECASE
-)
+_PROBABLE_DUPE_EXT_RE = re.compile(r"\.(mkv|mp4|avi|mov|m4v|webm|zip|srt)$", re.IGNORECASE)
 
 
 def normalize_duplicate_name(name: str) -> str:
@@ -661,9 +667,7 @@ def _initialize_duplicate_spool(database_path: str, mode: str = "both"):
                 "CREATE TABLE IF NOT EXISTS scan_meta ("
                 "key TEXT PRIMARY KEY, value INTEGER NOT NULL) WITHOUT ROWID"
             )
-            connection.execute(
-                "INSERT OR IGNORE INTO scan_meta (key, value) VALUES ('scanned', 0)"
-            )
+            connection.execute("INSERT OR IGNORE INTO scan_meta (key, value) VALUES ('scanned', 0)")
             if mode in {"exact", "both"}:
                 connection.execute(
                     "CREATE TABLE IF NOT EXISTS exact_counts ("
@@ -694,11 +698,7 @@ def _spool_duplicate_batch(
         exact_key, probable_key = _duplicate_fingerprints(document)
         if exact_key is not None and mode in {"exact", "both"}:
             exact_counts[exact_key] = exact_counts.get(exact_key, 0) + 1
-        if (
-            exact_key is not None
-            and probable_key is not None
-            and mode in {"probable", "both"}
-        ):
+        if exact_key is not None and probable_key is not None and mode in {"probable", "both"}:
             probable_members.add((probable_key, exact_key))
 
     with closing(sqlite3.connect(database_path, timeout=30)) as connection:
@@ -712,8 +712,7 @@ def _spool_duplicate_batch(
                 )
             if probable_members:
                 connection.executemany(
-                    "INSERT OR IGNORE INTO probable_members (group_key, exact_key) "
-                    "VALUES (?, ?)",
+                    "INSERT OR IGNORE INTO probable_members (group_key, exact_key) VALUES (?, ?)",
                     probable_members,
                 )
             connection.execute(
@@ -723,9 +722,12 @@ def _spool_duplicate_batch(
 
 
 def _sqlite_table_exists(connection: sqlite3.Connection, table: str) -> bool:
-    return connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
-    ).fetchone() is not None
+    return (
+        connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+        ).fetchone()
+        is not None
+    )
 
 
 def _initialize_verified_cleanup_spool(database_path: str):
@@ -734,18 +736,14 @@ def _initialize_verified_cleanup_spool(database_path: str):
         _configure_duplicate_spool(connection)
         with connection:
             connection.execute(
-                "CREATE TABLE IF NOT EXISTS exact_survivors ("
-                "key BLOB PRIMARY KEY) WITHOUT ROWID"
+                "CREATE TABLE IF NOT EXISTS exact_survivors (key BLOB PRIMARY KEY) WITHOUT ROWID"
             )
             connection.execute(
-                "CREATE TABLE IF NOT EXISTS pending_registry ("
-                "file_id TEXT PRIMARY KEY) WITHOUT ROWID"
+                "CREATE TABLE IF NOT EXISTS pending_registry (file_id TEXT PRIMARY KEY) WITHOUT ROWID"
             )
 
 
-def _classify_verified_duplicate_batch(
-    database_path: str, documents: list[dict]
-) -> list[dict]:
+def _classify_verified_duplicate_batch(database_path: str, documents: list[dict]) -> list[dict]:
     """Return rows whose exact Telegram identity already has a survivor."""
     duplicates = []
     with closing(sqlite3.connect(database_path, timeout=30)) as connection:
@@ -797,9 +795,7 @@ def _clear_cleanup_registry_ids(database_path: str, file_ids: list[str]):
     with closing(sqlite3.connect(database_path, timeout=30)) as connection:
         _configure_duplicate_spool(connection)
         with connection:
-            connection.executemany(
-                "DELETE FROM pending_registry WHERE file_id = ?", rows
-            )
+            connection.executemany("DELETE FROM pending_registry WHERE file_id = ?", rows)
 
 
 def _read_duplicate_report(database_path: str) -> dict:
@@ -809,32 +805,30 @@ def _read_duplicate_report(database_path: str) -> dict:
     probable_summary = (0, 0)
     with closing(sqlite3.connect(database_path, timeout=30)) as connection:
         _configure_duplicate_spool(connection)
-        scanned_row = connection.execute(
-            "SELECT value FROM scan_meta WHERE key = 'scanned'"
-        ).fetchone()
+        scanned_row = connection.execute("SELECT value FROM scan_meta WHERE key = 'scanned'").fetchone()
         scanned = int(scanned_row[0]) if scanned_row else 0
 
         if _sqlite_table_exists(connection, "exact_counts"):
             exact_summary = connection.execute(
-                "SELECT COUNT(*), COALESCE(SUM(copies - 1), 0) "
-                "FROM exact_counts WHERE copies > 1"
+                "SELECT COUNT(*), COALESCE(SUM(copies - 1), 0) FROM exact_counts WHERE copies > 1"
             ).fetchone()
             exact_groups = connection.execute(
-                "SELECT key, copies FROM exact_counts WHERE copies > 1 "
-                "ORDER BY copies DESC, key LIMIT ?",
+                "SELECT key, copies FROM exact_counts WHERE copies > 1 ORDER BY copies DESC, key LIMIT ?",
                 (MAX_DUPLICATE_GROUPS,),
             ).fetchall()
             for identity_bytes, count in exact_groups:
                 identity = bytes(identity_bytes).hex()
-                results.append({
-                    "key": stable_duplicate_key("exact", identity),
-                    "identity": identity,
-                    "name": f"Exact file {identity[:8]}",
-                    "count": int(count),
-                    "ids": [],
-                    "type": "exact",
-                    "truncated": False,
-                })
+                results.append(
+                    {
+                        "key": stable_duplicate_key("exact", identity),
+                        "identity": identity,
+                        "name": f"Exact file {identity[:8]}",
+                        "count": int(count),
+                        "ids": [],
+                        "type": "exact",
+                        "truncated": False,
+                    }
+                )
 
         remaining = max(0, MAX_DUPLICATE_GROUPS - len(results))
         if _sqlite_table_exists(connection, "probable_members"):
@@ -852,15 +846,17 @@ def _read_duplicate_report(database_path: str) -> dict:
                 ).fetchall()
                 for identity_bytes, count in probable_groups:
                     identity = bytes(identity_bytes).hex()
-                    results.append({
-                        "key": stable_duplicate_key("probable", identity),
-                        "identity": identity,
-                        "name": f"Possible match {identity[:8]}",
-                        "count": int(count),
-                        "ids": [],
-                        "type": "probable",
-                        "truncated": False,
-                    })
+                    results.append(
+                        {
+                            "key": stable_duplicate_key("probable", identity),
+                            "identity": identity,
+                            "name": f"Possible match {identity[:8]}",
+                            "count": int(count),
+                            "ids": [],
+                            "type": "probable",
+                            "truncated": False,
+                        }
+                    )
 
     return {
         "summary": {
@@ -944,15 +940,17 @@ class Database:
             os.getenv("DATABASE_URI_2"),
             os.getenv("DATABASE_URI_3"),
             os.getenv("DATABASE_URI_4"),
-            os.getenv("DATABASE_URI_5")
+            os.getenv("DATABASE_URI_5"),
         ]
 
         self.clients = []
         self.dbs = []
         self.file_cols = []
-        allow_insecure_mongo = os.getenv(
-            "ALLOW_INSECURE_MONGODB_FOR_DEVELOPMENT", "false"
-        ).casefold() in {"1", "true", "yes"}
+        allow_insecure_mongo = os.getenv("ALLOW_INSECURE_MONGODB_FOR_DEVELOPMENT", "false").casefold() in {
+            "1",
+            "true",
+            "yes",
+        }
         mongo_ca_file = os.getenv("MONGODB_TLS_CA_FILE") or None
 
         for i, uri in enumerate(self.uris):
@@ -981,11 +979,11 @@ class Database:
                         **tls_options,
                     )
                     self.clients.append(client)
-                    db_instance = client[f"MCCxBot_Cluster_{i+1}"]
+                    db_instance = client[f"MCCxBot_Cluster_{i + 1}"]
                     self.dbs.append(db_instance)
                     self.file_cols.append(db_instance["movies"])
                 except Exception as e:
-                    logger.error(f"Cluster {i+1} init failed: {e}")
+                    logger.error(f"Cluster {i + 1} init failed: {e}")
 
         self.users_col = None
         self.banned_col = None
@@ -995,6 +993,7 @@ class Database:
         self.rate_limits_col = None
         self.action_leases_col = None
         self.announcement_col = None
+        self.file_branding_col = None
         self.registry_col = None
         self.deletion_col = None
         self.deletion_dead_letter_col = None
@@ -1034,6 +1033,7 @@ class Database:
             self.rate_limits_col = _ops_db["rate_limits"]
             self.action_leases_col = _ops_db["action_leases"]
             self.announcement_col = _ops_db["announcement_outbox"]
+            self.file_branding_col = _ops_db["file_branding_jobs"]
             # Centralized cross-cluster identity registry — single source of
             # truth for file_id uniqueness across all sharded clusters, since
             # the per-cluster unique index on `movies.file_id` only protects
@@ -1055,11 +1055,7 @@ class Database:
         win, so a restart can never overwrite newer settings or counters with
         stale values from the read-only legacy database.
         """
-        if (
-            self.main_db is None
-            or self.legacy_main_db is None
-            or self.main_db is self.legacy_main_db
-        ):
+        if self.main_db is None or self.legacy_main_db is None or self.main_db is self.legacy_main_db:
             return
 
         marker_col = self.main_db["_migrations"]
@@ -1085,11 +1081,13 @@ class Database:
             async for document in source.find({}):
                 document_id = document.pop("_id")
                 payload = document or {"_legacy_migrated": True}
-                ops.append(UpdateOne(
-                    {"_id": document_id},
-                    {"$setOnInsert": payload},
-                    upsert=True,
-                ))
+                ops.append(
+                    UpdateOne(
+                        {"_id": document_id},
+                        {"$setOnInsert": payload},
+                        upsert=True,
+                    )
+                )
                 if len(ops) >= 500:
                     result = await target.bulk_write(ops, ordered=False)
                     copied += result.upserted_count
@@ -1105,8 +1103,9 @@ class Database:
         )
         logger.info("✅ Migrated %s legacy control-plane document(s) to operations DB.", copied)
 
-    async def consume_rate_limit(self, scope: str, key: str, limit: int,
-                                 window_seconds: int) -> tuple[bool, int]:
+    async def consume_rate_limit(
+        self, scope: str, key: str, limit: int, window_seconds: int
+    ) -> tuple[bool, int]:
         """Atomically consume a continuously refilled MongoDB token bucket."""
         if self.rate_limits_col is None:
             logger.error("Rate-limit store unavailable; rejecting %s:%s", scope, key)
@@ -1116,20 +1115,24 @@ class Database:
         document_id = f"{scope}:{key}"
         elapsed_seconds = {
             "$divide": [
-                {"$max": [
-                    0,
-                    {"$subtract": [now, {"$ifNull": ["$updated_at", now]}]},
-                ]},
+                {
+                    "$max": [
+                        0,
+                        {"$subtract": [now, {"$ifNull": ["$updated_at", now]}]},
+                    ]
+                },
                 1000,
             ]
         }
         available_tokens = {
             "$min": [
                 float(limit),
-                {"$add": [
-                    {"$ifNull": ["$tokens", float(limit)]},
-                    {"$multiply": [elapsed_seconds, refill_per_second]},
-                ]},
+                {
+                    "$add": [
+                        {"$ifNull": ["$tokens", float(limit)]},
+                        {"$multiply": [elapsed_seconds, refill_per_second]},
+                    ]
+                },
             ]
         }
         try:
@@ -1137,22 +1140,24 @@ class Database:
                 {"_id": document_id},
                 [
                     {"$set": {"_available_tokens": available_tokens}},
-                    {"$set": {
-                        "scope": scope,
-                        "key": str(key),
-                        "allowed": {"$gte": ["$_available_tokens", 1.0]},
-                        "tokens": {
-                            "$cond": [
-                                {"$gte": ["$_available_tokens", 1.0]},
-                                {"$subtract": ["$_available_tokens", 1.0]},
-                                "$_available_tokens",
-                            ]
-                        },
-                        "updated_at": now,
-                        "expires_at": datetime.fromtimestamp(
-                            now.timestamp() + (window_seconds * 2), timezone.utc
-                        ),
-                    }},
+                    {
+                        "$set": {
+                            "scope": scope,
+                            "key": str(key),
+                            "allowed": {"$gte": ["$_available_tokens", 1.0]},
+                            "tokens": {
+                                "$cond": [
+                                    {"$gte": ["$_available_tokens", 1.0]},
+                                    {"$subtract": ["$_available_tokens", 1.0]},
+                                    "$_available_tokens",
+                                ]
+                            },
+                            "updated_at": now,
+                            "expires_at": datetime.fromtimestamp(
+                                now.timestamp() + (window_seconds * 2), timezone.utc
+                            ),
+                        }
+                    },
                     {"$unset": "_available_tokens"},
                 ],
                 upsert=True,
@@ -1171,8 +1176,7 @@ class Database:
         retry_after = max(1, int((max(0.0, 1.0 - remaining) / refill_per_second) + 0.999))
         return allowed, retry_after
 
-    async def acquire_action_lease(self, scope: str, key: str,
-                                   ttl_seconds: int) -> str | None:
+    async def acquire_action_lease(self, scope: str, key: str, ttl_seconds: int) -> str | None:
         """Acquire a distributed idempotency lease, failing closed on errors."""
         if self.action_leases_col is None:
             return None
@@ -1180,16 +1184,14 @@ class Database:
         document_id = f"{scope}:{key}"
         owner = secrets.token_urlsafe(18)
         try:
-            await self.action_leases_col.delete_one(
-                {"_id": document_id, "expires_at": {"$lte": now}}
+            await self.action_leases_col.delete_one({"_id": document_id, "expires_at": {"$lte": now}})
+            await self.action_leases_col.insert_one(
+                {
+                    "_id": document_id,
+                    "owner": owner,
+                    "expires_at": datetime.fromtimestamp(now.timestamp() + ttl_seconds, timezone.utc),
+                }
             )
-            await self.action_leases_col.insert_one({
-                "_id": document_id,
-                "owner": owner,
-                "expires_at": datetime.fromtimestamp(
-                    now.timestamp() + ttl_seconds, timezone.utc
-                ),
-            })
             return owner
         except DuplicateKeyError:
             return None
@@ -1205,9 +1207,7 @@ class Database:
         if self.action_leases_col is None:
             return
         try:
-            await self.action_leases_col.delete_one({
-                "_id": f"{scope}:{key}", "owner": owner
-            })
+            await self.action_leases_col.delete_one({"_id": f"{scope}:{key}", "owner": owner})
         except Exception as exc:
             logger.warning(
                 "Action-lease cleanup deferred scope=%s error_type=%s",
@@ -1218,17 +1218,13 @@ class Database:
     async def search_tokens_need_migration(self) -> bool:
         """Return whether any legacy movie row lacks the indexed token field."""
         for col in self.file_cols:
-            if await col.find_one(
-                {"search_tokens": {"$exists": False}}, {"_id": 1}
-            ):
+            if await col.find_one({"search_tokens": {"$exists": False}}, {"_id": 1}):
                 return True
         return False
 
     async def ensure_indexes(self):
         if self.registry_col is None:
-            raise RequiredIndexError(
-                "Required file_registry collection is unavailable; refusing readiness."
-            )
+            raise RequiredIndexError("Required file_registry collection is unavailable; refusing readiness.")
         await ensure_required_unique_index(
             self.registry_col,
             "file_id",
@@ -1242,8 +1238,7 @@ class Database:
         try:
             indexes = await self.registry_col.index_information()
             unique_id_ready = any(
-                spec.get("key") == [("file_unique_id", 1)]
-                and spec.get("unique") is True
+                spec.get("key") == [("file_unique_id", 1)] and spec.get("unique") is True
                 for spec in indexes.values()
             )
             if not unique_id_ready:
@@ -1266,24 +1261,19 @@ class Database:
             try:
                 indexes = await col.index_information()
                 file_name_indexes = [
-                    spec for spec in indexes.values()
-                    if ("file_name", 1) in spec.get("key", [])
+                    spec for spec in indexes.values() if ("file_name", 1) in spec.get("key", [])
                 ]
                 if not file_name_indexes:
                     await col.create_index("file_name")
                 search_token_indexes = [
-                    spec for spec in indexes.values()
-                    if ("search_tokens", 1) in spec.get("key", [])
+                    spec for spec in indexes.values() if ("search_tokens", 1) in spec.get("key", [])
                 ]
                 if not search_token_indexes:
                     # Sparse keeps the compatibility index small: legacy
                     # libraries can continue using the reference regex search
                     # without adding one index entry per old document.
                     await col.create_index("search_tokens", sparse=True)
-                file_id_indexes = [
-                    spec for spec in indexes.values()
-                    if ("file_id", 1) in spec.get("key", [])
-                ]
+                file_id_indexes = [spec for spec in indexes.values() if ("file_id", 1) in spec.get("key", [])]
                 if not file_id_indexes:
                     await col.create_index("file_id", unique=True)
                 elif not any(spec.get("unique") for spec in file_id_indexes):
@@ -1296,9 +1286,9 @@ class Database:
                         "central registry enforces uniqueness.",
                         i + 1,
                     )
-                logger.info(f"✅ Indexes verified on Cluster {i+1}")
+                logger.info(f"✅ Indexes verified on Cluster {i + 1}")
             except Exception as e:
-                logger.warning(f"⚠️ Could not create index on Cluster {i+1}: {e}")
+                logger.warning(f"⚠️ Could not create index on Cluster {i + 1}: {e}")
         if self.main_db is not None:
             try:
                 await self.main_db["missed_searches"].create_index([("count", -1)])
@@ -1311,10 +1301,14 @@ class Database:
                 # they're naturally written to again (re-searched /
                 # re-requested).
                 await self.main_db["missed_searches"].create_index(
-                    "last_searched_at", expireAfterSeconds=90 * 24 * 3600  # 90 days of no repeat searches
+                    "last_searched_at",
+                    expireAfterSeconds=90 * 24 * 3600,  # 90 days of no repeat searches
                 )
                 await self.main_db["pending_requests"].create_index(
-                    "requested_at", expireAfterSeconds=180 * 24 * 3600  # 180 days — generous so a slow-to-fulfill request still gets auto-notified
+                    "requested_at",
+                    expireAfterSeconds=180
+                    * 24
+                    * 3600,  # 180 days — generous so a slow-to-fulfill request still gets auto-notified
                 )
             except Exception as e:
                 logger.warning("Could not ensure auxiliary indexes: %s", e)
@@ -1344,9 +1338,7 @@ class Database:
             (self.action_leases_col, "action-lease"),
         ):
             if collection is None:
-                raise RequiredIndexError(
-                    f"Required {label} collection is unavailable; refusing readiness."
-                )
+                raise RequiredIndexError(f"Required {label} collection is unavailable; refusing readiness.")
             try:
                 await collection.create_index("expires_at", expireAfterSeconds=0)
             except Exception as exc:
@@ -1354,28 +1346,38 @@ class Database:
                     f"Could not create required TTL index for {label} controls: {exc}"
                 ) from exc
         if self.announcement_col is None:
-            raise RequiredIndexError(
-                "Required announcement outbox is unavailable; refusing readiness."
-            )
+            raise RequiredIndexError("Required announcement outbox is unavailable; refusing readiness.")
         try:
             await self.announcement_col.create_index("due_at")
-            await self.announcement_col.create_index(
-                "expires_at", expireAfterSeconds=0
-            )
+            await self.announcement_col.create_index("expires_at", expireAfterSeconds=0)
         except Exception as exc:
-            raise RequiredIndexError(
-                f"Could not create announcement outbox indexes: {exc}"
-            ) from exc
+            raise RequiredIndexError(f"Could not create announcement outbox indexes: {exc}") from exc
+        # ``hasattr`` keeps lightweight test doubles and upgrade-time bare
+        # database objects compatible. A fully initialized production object
+        # always owns the attribute and still fails closed if its queue is lost.
+        if hasattr(self, "file_branding_col"):
+            if self.file_branding_col is None:
+                raise RequiredIndexError("Required file-branding queue is unavailable; refusing readiness.")
+            try:
+                await self.file_branding_col.create_index([("status", 1), ("due_at", 1)])
+                await self.file_branding_col.create_index("expires_at", expireAfterSeconds=0)
+            except Exception as exc:
+                raise RequiredIndexError(f"Could not create file-branding queue indexes: {exc}") from exc
+
     async def sync_config(self):
         if self.config_col is None:
             return
         config = await self.config_col.find_one({"_id": "bot_config"})
         migrations = {
-            "log_channel":       int(os.getenv("LOG_CHANNEL_ID", 0) or 0),
-            "db_channel":        int(os.getenv("DATABASE_CHANNEL_ID", 0) or 0),
+            "log_channel": int(os.getenv("LOG_CHANNEL_ID", 0) or 0),
+            "db_channel": int(os.getenv("DATABASE_CHANNEL_ID", 0) or 0),
             "update_channel_id": int(os.getenv("UPDATE_CHANNEL", 0) or 0),
-            "update_channel":    os.getenv("UPDATE_CHANNEL_LINK", ""),
-            "main_group":        os.getenv("MAIN_GROUP_LINK", ""),
+            "update_channel": os.getenv("UPDATE_CHANNEL_LINK", ""),
+            "main_group": os.getenv("MAIN_GROUP_LINK", ""),
+            "file_branding_channel_id": int(os.getenv("FILE_BRANDING_CHANNEL_ID", 0) or 0),
+            "file_branding_text": os.getenv("FILE_BRANDING_TEXT", ""),
+            "file_branding_enabled": os.getenv("FILE_BRANDING_ENABLED", "").casefold()
+            in {"1", "true", "yes", "on"},
         }
         fields_to_set = {}
         for key, env_val in migrations.items():
@@ -1388,11 +1390,7 @@ class Database:
                         type(env_val).__name__,
                     )
         if fields_to_set:
-            await self.config_col.update_one(
-                {"_id": "bot_config"},
-                {"$set": fields_to_set},
-                upsert=True
-            )
+            await self.config_col.update_one({"_id": "bot_config"}, {"$set": fields_to_set}, upsert=True)
             logger.info(f"✅ Config sync complete — {len(fields_to_set)} field(s) migrated.")
         else:
             logger.info("✅ Config sync complete — nothing to migrate.")
@@ -1403,7 +1401,9 @@ class Database:
         try:
             user = await self.users_col.find_one({"_id": user_id})
             if not user:
-                await self.users_col.insert_one({"_id": user_id, "first_name": first_name, "joined": time.time()})
+                await self.users_col.insert_one(
+                    {"_id": user_id, "first_name": first_name, "joined": time.time()}
+                )
                 return True
             return False
         except Exception:
@@ -1474,15 +1474,17 @@ class Database:
             return False
         group = await self.groups_col.find_one({"_id": group_id})
         if not group:
-            await self.groups_col.insert_one({
-                "_id": group_id,
-                "title": group_title,
-                "added": time.time(),
-                "whitelisted": False,
-                "banned": False,
-                "search_count": 0,
-                "settings": {}
-            })
+            await self.groups_col.insert_one(
+                {
+                    "_id": group_id,
+                    "title": group_title,
+                    "added": time.time(),
+                    "whitelisted": False,
+                    "banned": False,
+                    "search_count": 0,
+                    "settings": {},
+                }
+            )
             return True
         return False
 
@@ -1547,9 +1549,7 @@ class Database:
     async def increment_group_search(self, group_id):
         if self.groups_col is None:
             return
-        await self.groups_col.update_one(
-            {"_id": group_id}, {"$inc": {"search_count": 1}}, upsert=True
-        )
+        await self.groups_col.update_one({"_id": group_id}, {"$inc": {"search_count": 1}}, upsert=True)
 
     async def get_top_groups(self, limit=10):
         if self.groups_col is None:
@@ -1567,9 +1567,9 @@ class Database:
         one database made a 514MB cluster look like 249MB and repeatedly sent
         writes to a server that Atlas had already made read-only.
         """
-        now  = time.time()
-        key  = id(db_instance)
-        hit  = self._db_size_cache.get(key)
+        now = time.time()
+        key = id(db_instance)
+        hit = self._db_size_cache.get(key)
         if hit and (now - hit[0]) < self._DB_SIZE_TTL:
             return hit[1]
         try:
@@ -1582,8 +1582,7 @@ class Database:
             try:
                 stats = await db_instance.command("dbstats")
                 size = (
-                    max(stats.get("storageSize", 0), stats.get("dataSize", 0))
-                    + stats.get("indexSize", 0)
+                    max(stats.get("storageSize", 0), stats.get("dataSize", 0)) + stats.get("indexSize", 0)
                 ) / (1024 * 1024)
             except Exception as db_error:
                 # Unknown usage must fail closed: skipping a temporarily
@@ -1608,6 +1607,7 @@ class Database:
                 return await col.count_documents({})
             except Exception:
                 return 0
+
         counts = await asyncio.gather(*[_count(col) for col in self.file_cols])
         total = sum(counts)
         self._file_count_cache = (time.time(), total)
@@ -1654,17 +1654,13 @@ class Database:
                 cluster_count = 0
                 name_batch = []
                 try:
-                    cursor = collection.find(
-                        {}, {"file_name": 1, "_id": 0}
-                    ).batch_size(2000)
+                    cursor = collection.find({}, {"file_name": 1, "_id": 0}).batch_size(2000)
                     async for file_doc in cursor:
                         name_batch.append(file_doc.get("file_name", ""))
                         cluster_count += 1
                         scanned += 1
                         if len(name_batch) >= 2000:
-                            identities = await asyncio.to_thread(
-                                _catalog_identities, name_batch
-                            )
+                            identities = await asyncio.to_thread(_catalog_identities, name_batch)
                             name_batch = []
                             for identity in identities:
                                 if identity:
@@ -1676,12 +1672,11 @@ class Database:
                         if scanned % 100000 == 0:
                             logger.info(
                                 "🔤 Search catalog: %s files → %s titles",
-                                f"{scanned:,}", f"{len(titles):,}",
+                                f"{scanned:,}",
+                                f"{len(titles):,}",
                             )
                     if name_batch and len(titles) < MAX_SEARCH_CATALOG_TITLES:
-                        identities = await asyncio.to_thread(
-                            _catalog_identities, name_batch
-                        )
+                        identities = await asyncio.to_thread(_catalog_identities, name_batch)
                         for identity in identities:
                             if identity:
                                 titles.add(identity)
@@ -1690,11 +1685,13 @@ class Database:
                 except Exception as exc:
                     logger.warning(
                         "Search-catalog scan skipped remainder of cluster %s: %s",
-                        cluster_number, exc,
+                        cluster_number,
+                        exc,
                     )
                 logger.info(
                     "🔤 Search catalog cluster %s complete: %s files",
-                    cluster_number, f"{cluster_count:,}",
+                    cluster_number,
+                    f"{cluster_count:,}",
                 )
                 if len(titles) >= MAX_SEARCH_CATALOG_TITLES:
                     logger.info(
@@ -1722,7 +1719,9 @@ class Database:
             self._invalidate_file_count()
             logger.info(
                 "✅ Fuzzy-search catalog ready: %s titles from %s files in %.1fs",
-                f"{len(sorted_titles):,}", f"{scanned:,}", time.monotonic() - started,
+                f"{len(sorted_titles):,}",
+                f"{scanned:,}",
+                time.monotonic() - started,
             )
             return len(sorted_titles)
         finally:
@@ -1744,8 +1743,8 @@ class Database:
 
         return any(await asyncio.gather(*[_has_file(col) for col in self.file_cols]))
 
-    async def save_file(self, media):
-        file_id   = getattr(media, "file_id", "")
+    async def save_file(self, media, *, branding_status=None):
+        file_id = getattr(media, "file_id", "")
         file_unique_id = getattr(media, "file_unique_id", "") or ""
         file_name = normalize_file_name(getattr(media, "file_name", ""))
         file_size = getattr(media, "file_size", 0)
@@ -1778,6 +1777,8 @@ class Database:
         }
         if file_unique_id:
             file_doc["file_unique_id"] = file_unique_id
+        if branding_status:
+            file_doc["branding_status"] = str(branding_status)
         try:
             for i, col in enumerate(self.file_cols):
                 try:
@@ -1804,10 +1805,12 @@ class Database:
                         try:
                             await self.registry_col.update_one(
                                 {"file_id": file_id},
-                                {"$set": {
-                                    "cluster": i + 1,
-                                    "movie_id": str(existing["_id"]),
-                                }},
+                                {
+                                    "$set": {
+                                        "cluster": i + 1,
+                                        "movie_id": str(existing["_id"]),
+                                    }
+                                },
                             )
                         except Exception as exc:
                             logger.warning(
@@ -1830,10 +1833,12 @@ class Database:
                     try:
                         await self.registry_col.update_one(
                             {"file_id": file_id},
-                            {"$set": {
-                                "cluster": i + 1,
-                                "movie_id": str(result.inserted_id),
-                            }},
+                            {
+                                "$set": {
+                                    "cluster": i + 1,
+                                    "movie_id": str(result.inserted_id),
+                                }
+                            },
                         )
                     except Exception as exc:
                         logger.warning(
@@ -1842,7 +1847,7 @@ class Database:
                             type(exc).__name__,
                         )
                 self._invalidate_file_count()
-                return True, f"Saved to Cluster {i+1}"
+                return True, f"Saved to Cluster {i + 1}"
             return False, "All clusters full"
         finally:
             if reservation_created and not physical_present:
@@ -1852,12 +1857,14 @@ class Database:
         """Repair missing or stale registry locations from physical rows."""
         if self.registry_col is None:
             return {"checked": 0, "repaired": 0, "unresolved": 0}
-        cursor = self.registry_col.find({
-            "$or": [
-                {"cluster": {"$exists": False}},
-                {"movie_id": {"$exists": False}},
-            ]
-        }).limit(max(1, int(limit)))
+        cursor = self.registry_col.find(
+            {
+                "$or": [
+                    {"cluster": {"$exists": False}},
+                    {"movie_id": {"$exists": False}},
+                ]
+            }
+        ).limit(max(1, int(limit)))
         checked = repaired = unresolved = 0
         async for registry_doc in cursor:
             checked += 1
@@ -1875,31 +1882,27 @@ class Database:
                 and current_movie_id
             ):
                 try:
-                    location_valid = await self.file_cols[current_cluster - 1].find_one(
-                        {"_id": ObjectId(current_movie_id), "file_id": file_id},
-                        {"_id": 1},
-                    ) is not None
+                    location_valid = (
+                        await self.file_cols[current_cluster - 1].find_one(
+                            {"_id": ObjectId(current_movie_id), "file_id": file_id},
+                            {"_id": 1},
+                        )
+                        is not None
+                    )
                 except Exception:
                     location_valid = False
             if location_valid:
                 continue
 
             lookups = await asyncio.gather(
-                *[
-                    col.find_one({"file_id": file_id}, {"_id": 1})
-                    for col in self.file_cols
-                ],
+                *[col.find_one({"file_id": file_id}, {"_id": 1}) for col in self.file_cols],
                 return_exceptions=True,
             )
             if any(isinstance(value, BaseException) for value in lookups):
                 unresolved += 1
                 continue
             found = next(
-                (
-                    (index, doc)
-                    for index, doc in enumerate(lookups, 1)
-                    if doc
-                ),
+                ((index, doc) for index, doc in enumerate(lookups, 1) if doc),
                 None,
             )
             if not found:
@@ -1908,10 +1911,12 @@ class Database:
             cluster_index, movie_doc = found
             await self.registry_col.update_one(
                 {"_id": registry_doc["_id"], "file_id": file_id},
-                {"$set": {
-                    "cluster": cluster_index,
-                    "movie_id": str(movie_doc["_id"]),
-                }},
+                {
+                    "$set": {
+                        "cluster": cluster_index,
+                        "movie_id": str(movie_doc["_id"]),
+                    }
+                },
             )
             repaired += 1
         return {"checked": checked, "repaired": repaired, "unresolved": unresolved}
@@ -1950,31 +1955,26 @@ class Database:
                 # acknowledge them reliably. Remove only claims with no
                 # physical file, then force the indexer to retry later.
                 await self._release_registry_ids(file_ids)
-                raise RuntimeError(
-                    f"Registry write concern failed: {concern_errors[:1]}"
-                ) from bwe
-            dup_indexes  = {e["index"] for e in write_errors if e.get("code") == 11000}
+                raise RuntimeError(f"Registry write concern failed: {concern_errors[:1]}") from bwe
+            dup_indexes = {e["index"] for e in write_errors if e.get("code") == 11000}
             other_errors = [e for e in write_errors if e.get("code") != 11000]
             if other_errors:
                 # Continuing would store files without a uniqueness claim.
                 # Roll back reservations that did succeed, then fail so the
                 # caller can retry the complete batch safely.
                 failed_indexes = {e.get("index") for e in write_errors}
-                reserved = [
-                    fid for idx, fid in enumerate(file_ids)
-                    if idx not in failed_indexes
-                ]
+                reserved = [fid for idx, fid in enumerate(file_ids) if idx not in failed_indexes]
                 if reserved:
                     try:
                         await self.registry_col.delete_many({"file_id": {"$in": reserved}})
                     except Exception as rollback_error:
                         logger.error(
                             "Registry reservation rollback failed for %s IDs: %s",
-                            len(reserved), rollback_error,
+                            len(reserved),
+                            rollback_error,
                         )
                 raise RuntimeError(
-                    f"Registry reservation failed for {len(other_errors)} file(s): "
-                    f"{other_errors[:1]}"
+                    f"Registry reservation failed for {len(other_errors)} file(s): {other_errors[:1]}"
                 ) from bwe
             accepted = [fid for idx, fid in enumerate(file_ids) if idx not in dup_indexes]
             return accepted, len(dup_indexes)
@@ -1987,7 +1987,8 @@ class Database:
                 {"file_id": doc["file_id"]},
                 {"$set": {"cluster": cluster_index + 1, "movie_id": str(doc["_id"])}},
             )
-            for doc in docs if doc.get("file_id") and doc.get("_id")
+            for doc in docs
+            if doc.get("file_id") and doc.get("_id")
         ]
         if ops:
             try:
@@ -2020,13 +2021,13 @@ class Database:
         accepted_ids, duplicates = await self._registry_bulk_reserve(unique_files)
         duplicates += internal_duplicates
         accepted_set = set(accepted_ids)
-        new_files    = [f for f in unique_files if f["file_id"] in accepted_set]
+        new_files = [f for f in unique_files if f["file_id"] in accepted_set]
 
         if not new_files:
             return 0, duplicates
 
         saved_total = 0
-        remaining   = new_files[:]
+        remaining = new_files[:]
         for i, col in enumerate(self.file_cols):
             if not remaining:
                 break
@@ -2042,7 +2043,7 @@ class Database:
                     inserted.append(stored)
                 await self._mark_registry_locations(inserted, i)
                 saved_total += len(inserted)
-                remaining    = []
+                remaining = []
             except BulkWriteError as bwe:
                 errors = bwe.details.get("writeErrors", [])
                 failed_indexes = {err.get("index") for err in errors}
@@ -2082,23 +2083,21 @@ class Database:
                     retry.append(doc)
                 remaining = retry
                 logger.warning(
-                    f"Cluster {i+1} bulk insert: {len(successful)} saved, "
+                    f"Cluster {i + 1} bulk insert: {len(successful)} saved, "
                     f"{len(retry)} retryable, {len(errors) - len(retry)} duplicate(s)"
                 )
             except Exception as e:
                 if "space quota" in str(e).lower() or "over your space" in str(e).lower():
-                    logger.error(f"Cluster {i+1} FULL — add DATABASE_URI_{i+2} to .env")
+                    logger.error(f"Cluster {i + 1} FULL — add DATABASE_URI_{i + 2} to .env")
                 else:
-                    logger.warning(f"Cluster {i+1} bulk insert partial failure: {e}")
+                    logger.warning(f"Cluster {i + 1} bulk insert partial failure: {e}")
 
         if remaining and self.registry_col is not None:
             # Nothing left could actually be stored — roll back their
             # registry reservations so these file_ids aren't permanently
             # (and incorrectly) marked as taken.
             try:
-                await self.registry_col.delete_many(
-                    {"file_id": {"$in": [f["file_id"] for f in remaining]}}
-                )
+                await self.registry_col.delete_many({"file_id": {"$in": [f["file_id"] for f in remaining]}})
             except Exception as e:
                 logger.warning(f"Registry rollback failed for {len(remaining)} unsaved files: {e}")
 
@@ -2123,18 +2122,19 @@ class Database:
             return
         ids = list(dict.fromkeys(fid for fid in file_ids if fid))
         for start in range(0, len(ids), batch_size):
-            chunk = ids[start:start + batch_size]
-            present_sets = await asyncio.gather(*[
-                col.distinct("file_id", {"file_id": {"$in": chunk}})
-                for col in self.file_cols
-            ], return_exceptions=True)
+            chunk = ids[start : start + batch_size]
+            present_sets = await asyncio.gather(
+                *[col.distinct("file_id", {"file_id": {"$in": chunk}}) for col in self.file_cols],
+                return_exceptions=True,
+            )
             errors = [value for value in present_sets if isinstance(value, Exception)]
             if errors:
                 # Never release a uniqueness claim when an unavailable cluster
                 # prevents us from proving that no physical copy remains.
                 logger.warning(
                     "Registry cleanup deferred for %s file(s): %s cluster check(s) failed",
-                    len(chunk), len(errors),
+                    len(chunk),
+                    len(errors),
                 )
                 continue
             present = {fid for values in present_sets for fid in values}
@@ -2195,10 +2195,12 @@ class Database:
         for col in self.file_cols:
             result = await col.update_one(
                 {"_id": obj_id},
-                {"$set": {
-                    "file_name": normalized_name,
-                    "search_tokens": search_tokens_for_name(normalized_name),
-                }},
+                {
+                    "$set": {
+                        "file_name": normalized_name,
+                        "search_tokens": search_tokens_for_name(normalized_name),
+                    }
+                },
             )
             if result.matched_count > 0:
                 self._invalidate_file_count()
@@ -2211,7 +2213,7 @@ class Database:
         facet_stage = {
             lang: [
                 {"$match": {"file_name": {"$regex": rf"\b{re.escape(lang)}\b", "$options": "i"}}},
-                {"$count": "n"}
+                {"$count": "n"},
             ]
             for lang in LANGUAGES
         }
@@ -2245,43 +2247,35 @@ class Database:
             total = await self.get_total_files()
             started = time.monotonic()
             total_work = max(1, total * 3)
-            await asyncio.to_thread(
-                _DUPLICATE_SCAN_DIR.mkdir, parents=True, exist_ok=True
-            )
+            await asyncio.to_thread(_DUPLICATE_SCAN_DIR.mkdir, parents=True, exist_ok=True)
 
             def _remove_stale_spools():
                 cutoff = time.time() - 86400
-                for candidate in _DUPLICATE_SCAN_DIR.glob(
-                    "mccx-duplicates-*.sqlite3"
-                ):
+                for candidate in _DUPLICATE_SCAN_DIR.glob("mccx-duplicates-*.sqlite3"):
                     try:
                         if candidate.is_file() and candidate.stat().st_mtime < cutoff:
                             candidate.unlink(missing_ok=True)
                     except OSError:
-                        logger.debug(
-                            "Could not remove stale duplicate spool %s", candidate
-                        )
+                        logger.debug("Could not remove stale duplicate spool %s", candidate)
 
             await asyncio.to_thread(_remove_stale_spools)
 
-            async def _show_phase_progress(
-                phase, phase_scanned, cluster, phase_started, work_offset
-            ):
+            async def _show_phase_progress(phase, phase_scanned, cluster, phase_started, work_offset):
                 if not progress_callback:
                     return
-                await progress_callback({
-                    "phase": phase,
-                    "scanned": phase_scanned,
-                    "total": total,
-                    "overall_scanned": min(
-                        total_work, work_offset + phase_scanned
-                    ),
-                    "overall_total": total_work,
-                    "cluster": cluster,
-                    "clusters": len(self.file_cols),
-                    "elapsed": time.monotonic() - started,
-                    "phase_elapsed": time.monotonic() - phase_started,
-                })
+                await progress_callback(
+                    {
+                        "phase": phase,
+                        "scanned": phase_scanned,
+                        "total": total,
+                        "overall_scanned": min(total_work, work_offset + phase_scanned),
+                        "overall_total": total_work,
+                        "cluster": cluster,
+                        "clusters": len(self.file_cols),
+                        "elapsed": time.monotonic() - started,
+                        "phase_elapsed": time.monotonic() - phase_started,
+                    }
+                )
 
             async def _scan_aggregate_phase(mode: str, work_offset: int):
                 phase_started = time.monotonic()
@@ -2294,12 +2288,8 @@ class Database:
                 await asyncio.to_thread(os.close, descriptor)
                 phase_scanned = 0
                 try:
-                    await asyncio.to_thread(
-                        _initialize_duplicate_spool, spool_path, mode
-                    )
-                    await _show_phase_progress(
-                        mode, 0, 1, phase_started, work_offset
-                    )
+                    await asyncio.to_thread(_initialize_duplicate_spool, spool_path, mode)
+                    await _show_phase_progress(mode, 0, 1, phase_started, work_offset)
                     for cluster_index, col in enumerate(self.file_cols, 1):
                         batch = []
                         cursor = col.find(
@@ -2347,9 +2337,7 @@ class Database:
                                 phase_started,
                                 work_offset,
                             )
-                    return await asyncio.to_thread(
-                        _read_duplicate_report, spool_path
-                    )
+                    return await asyncio.to_thread(_read_duplicate_report, spool_path)
                 except sqlite3.OperationalError as error:
                     if "full" in str(error).casefold():
                         raise RuntimeError(
@@ -2358,9 +2346,7 @@ class Database:
                         ) from error
                     raise
                 finally:
-                    await asyncio.to_thread(
-                        Path(spool_path).unlink, missing_ok=True
-                    )
+                    await asyncio.to_thread(Path(spool_path).unlink, missing_ok=True)
 
             exact_report = await _scan_aggregate_phase("exact", 0)
             probable_report = await _scan_aggregate_phase("probable", total)
@@ -2384,21 +2370,15 @@ class Database:
 
             if groups:
                 exact_targets = {
-                    bytes.fromhex(group["identity"])
-                    for group in groups
-                    if group["type"] == "exact"
+                    bytes.fromhex(group["identity"]) for group in groups if group["type"] == "exact"
                 }
                 probable_targets = {
-                    bytes.fromhex(group["identity"])
-                    for group in groups
-                    if group["type"] == "probable"
+                    bytes.fromhex(group["identity"]) for group in groups if group["type"] == "probable"
                 }
                 labels: dict[tuple[str, bytes], str] = {}
                 phase_started = time.monotonic()
                 phase_scanned = 0
-                await _show_phase_progress(
-                    "labels", 0, 1, phase_started, total * 2
-                )
+                await _show_phase_progress("labels", 0, 1, phase_started, total * 2)
                 for cluster_index, col in enumerate(self.file_cols, 1):
                     batch = []
                     cursor = col.find(
@@ -2449,9 +2429,7 @@ class Database:
 
                 for group in groups:
                     identity = bytes.fromhex(group["identity"])
-                    group["name"] = labels.get(
-                        (group["type"], identity), group["name"]
-                    )
+                    group["name"] = labels.get((group["type"], identity), group["name"])
 
             report = {"summary": summary, "groups": groups}
 
@@ -2470,15 +2448,11 @@ class Database:
         group = cache.get(group_key) if cache is not None else None
         if group is None:
             groups = await self.find_duplicate_files()
-            group = next(
-                (item for item in groups if item.get("key") == group_key), None
-            )
+            group = next((item for item in groups if item.get("key") == group_key), None)
         return group
 
     async def delete_duplicate_group(self, group_key: str):
-        raise RuntimeError(
-            "Individual deletion is disabled. Use verified exact cleanup."
-        )
+        raise RuntimeError("Individual deletion is disabled. Use verified exact cleanup.")
 
     async def _reconcile_registry_file_ids(self, file_ids: list[str]):
         """Remove stale claims and point surviving claims at a real movie row."""
@@ -2505,13 +2479,9 @@ class Database:
                                 str(document["_id"]),
                             )
 
-                stale_ids = [
-                    file_id for file_id in unique_ids if file_id not in locations
-                ]
+                stale_ids = [file_id for file_id in unique_ids if file_id not in locations]
                 if stale_ids:
-                    await self.registry_col.delete_many(
-                        {"file_id": {"$in": stale_ids}}
-                    )
+                    await self.registry_col.delete_many({"file_id": {"$in": stale_ids}})
                 repairs = [
                     UpdateOne(
                         {"file_id": file_id},
@@ -2527,27 +2497,19 @@ class Database:
                 last_error = error
                 if attempt < 3:
                     await asyncio.sleep(attempt)
-        raise RuntimeError(
-            "Registry repair failed after verified movie rows were processed"
-        ) from last_error
+        raise RuntimeError("Registry repair failed after verified movie rows were processed") from last_error
 
     async def _recover_duplicate_cleanup_registry(self):
         """Finish registry repairs left by an interrupted exact cleanup."""
-        await asyncio.to_thread(
-            _DUPLICATE_SCAN_DIR.mkdir, parents=True, exist_ok=True
-        )
+        await asyncio.to_thread(_DUPLICATE_SCAN_DIR.mkdir, parents=True, exist_ok=True)
         for candidate in _DUPLICATE_SCAN_DIR.glob("mccx-cleanup-*.sqlite3"):
             try:
                 while True:
-                    file_ids = await asyncio.to_thread(
-                        _read_cleanup_registry_ids, str(candidate), 500
-                    )
+                    file_ids = await asyncio.to_thread(_read_cleanup_registry_ids, str(candidate), 500)
                     if not file_ids:
                         break
                     await self._reconcile_registry_file_ids(file_ids)
-                    await asyncio.to_thread(
-                        _clear_cleanup_registry_ids, str(candidate), file_ids
-                    )
+                    await asyncio.to_thread(_clear_cleanup_registry_ids, str(candidate), file_ids)
                 await asyncio.to_thread(candidate.unlink, missing_ok=True)
             except Exception as error:
                 logger.warning(
@@ -2582,29 +2544,18 @@ class Database:
             )
             await asyncio.to_thread(os.close, descriptor)
             try:
-                await asyncio.to_thread(
-                    _initialize_verified_cleanup_spool, spool_path
-                )
+                await asyncio.to_thread(_initialize_verified_cleanup_spool, spool_path)
             except Exception:
-                await asyncio.to_thread(
-                    Path(spool_path).unlink, missing_ok=True
-                )
+                await asyncio.to_thread(Path(spool_path).unlink, missing_ok=True)
                 raise
             keep_spool = False
 
             async def _process_batch(col, batch, cluster_index):
                 nonlocal scanned, deleted, keep_spool
-                duplicates = await asyncio.to_thread(
-                    _classify_verified_duplicate_batch, spool_path, batch
-                )
-                staged_ids = [
-                    str(document.get("file_id", "") or "")
-                    for document in duplicates
-                ]
+                duplicates = await asyncio.to_thread(_classify_verified_duplicate_batch, spool_path, batch)
+                staged_ids = [str(document.get("file_id", "") or "") for document in duplicates]
                 if duplicates:
-                    await asyncio.to_thread(
-                        _stage_cleanup_registry_ids, spool_path, staged_ids
-                    )
+                    await asyncio.to_thread(_stage_cleanup_registry_ids, spool_path, staged_ids)
                     keep_spool = True
                     object_ids = [document["_id"] for document in duplicates]
                     result = await col.delete_many({"_id": {"$in": object_ids}})
@@ -2613,52 +2564,52 @@ class Database:
                     else:
                         remaining = {
                             document["_id"]
-                            async for document in col.find(
-                                {"_id": {"$in": object_ids}}, {"_id": 1}
-                            )
+                            async for document in col.find({"_id": {"$in": object_ids}}, {"_id": 1})
                         }
                         confirmed_deleted = [
-                            document
-                            for document in duplicates
-                            if document["_id"] not in remaining
+                            document for document in duplicates if document["_id"] not in remaining
                         ]
                     await self._reconcile_registry_file_ids(staged_ids)
-                    await asyncio.to_thread(
-                        _clear_cleanup_registry_ids, spool_path, staged_ids
-                    )
+                    await asyncio.to_thread(_clear_cleanup_registry_ids, spool_path, staged_ids)
                     keep_spool = False
                     deleted += len(confirmed_deleted)
 
                 scanned += len(batch)
                 if progress_callback:
                     elapsed = time.monotonic() - started
-                    await progress_callback({
-                        "phase": "verified_cleanup",
-                        "scanned": scanned,
-                        "total": total,
-                        "deleted": deleted,
-                        "cluster": cluster_index,
-                        "clusters": len(self.file_cols),
-                        "elapsed": elapsed,
-                    })
+                    await progress_callback(
+                        {
+                            "phase": "verified_cleanup",
+                            "scanned": scanned,
+                            "total": total,
+                            "deleted": deleted,
+                            "cluster": cluster_index,
+                            "clusters": len(self.file_cols),
+                            "elapsed": elapsed,
+                        }
+                    )
 
             try:
                 for cluster_index in range(len(self.file_cols), 0, -1):
                     col = self.file_cols[cluster_index - 1]
                     batch = []
-                    cursor = col.find(
-                        {
-                            "file_name": {"$exists": True, "$ne": ""},
-                            "file_id": {"$exists": True, "$ne": ""},
-                        },
-                        {
-                            "file_name": 1,
-                            "file_id": 1,
-                            "file_unique_id": 1,
-                            "file_size": 1,
-                            "mime_type": 1,
-                        },
-                    ).sort("_id", -1).batch_size(_VERIFIED_CLEANUP_BATCH_SIZE)
+                    cursor = (
+                        col.find(
+                            {
+                                "file_name": {"$exists": True, "$ne": ""},
+                                "file_id": {"$exists": True, "$ne": ""},
+                            },
+                            {
+                                "file_name": 1,
+                                "file_id": 1,
+                                "file_unique_id": 1,
+                                "file_size": 1,
+                                "mime_type": 1,
+                            },
+                        )
+                        .sort("_id", -1)
+                        .batch_size(_VERIFIED_CLEANUP_BATCH_SIZE)
+                    )
                     async for document in cursor:
                         batch.append(document)
                         if len(batch) >= _VERIFIED_CLEANUP_BATCH_SIZE:
@@ -2668,19 +2619,13 @@ class Database:
                         await _process_batch(col, batch, cluster_index)
             finally:
                 try:
-                    pending = await asyncio.to_thread(
-                        _read_cleanup_registry_ids, spool_path, 1
-                    )
+                    pending = await asyncio.to_thread(_read_cleanup_registry_ids, spool_path, 1)
                 except Exception:
                     pending = ["unknown"]
                 if not pending and not keep_spool:
-                    await asyncio.to_thread(
-                        Path(spool_path).unlink, missing_ok=True
-                    )
+                    await asyncio.to_thread(Path(spool_path).unlink, missing_ok=True)
                 else:
-                    logger.warning(
-                        "Retained cleanup recovery spool %s", spool_path
-                    )
+                    logger.warning("Retained cleanup recovery spool %s", spool_path)
 
             self._invalidate_file_count()
             return {
@@ -2748,12 +2693,14 @@ class Database:
                 await self.file_cols[to_idx].insert_many(docs, ordered=False)
                 copied_src_ids = [entry["_id"] for entry in batch]
             except BulkWriteError as bwe:
-                write_errors  = bwe.details.get("writeErrors", [])
-                failed_idx    = {e["index"] for e in write_errors}
+                write_errors = bwe.details.get("writeErrors", [])
+                failed_idx = {e["index"] for e in write_errors}
                 copied_src_ids = [entry["_id"] for idx, entry in enumerate(batch) if idx not in failed_idx]
-                skipped       += len(failed_idx)
+                skipped += len(failed_idx)
                 if len(failed_idx) < len(write_errors):
-                    logger.warning(f"Migration batch: {len(write_errors)} write errors, {len(failed_idx)} unique docs failed")
+                    logger.warning(
+                        f"Migration batch: {len(write_errors)} write errors, {len(failed_idx)} unique docs failed"
+                    )
             except Exception as e:
                 logger.warning(f"Migration batch error: {e}")
                 skipped += len(batch)
@@ -2762,14 +2709,19 @@ class Database:
             if copied_src_ids:
                 copied_id_set = set(copied_src_ids)
                 copied_file_ids = [
-                    entry["doc"].get("file_id") for entry in batch
+                    entry["doc"].get("file_id")
+                    for entry in batch
                     if entry["_id"] in copied_id_set and entry["doc"].get("file_id")
                 ]
                 if copied_file_ids:
-                    stored_docs = await self.file_cols[to_idx].find(
-                        {"file_id": {"$in": copied_file_ids}},
-                        {"_id": 1, "file_id": 1},
-                    ).to_list(length=len(copied_file_ids))
+                    stored_docs = (
+                        await self.file_cols[to_idx]
+                        .find(
+                            {"file_id": {"$in": copied_file_ids}},
+                            {"_id": 1, "file_id": 1},
+                        )
+                        .to_list(length=len(copied_file_ids))
+                    )
                     await self._mark_registry_locations(stored_docs, to_idx)
                 try:
                     result = await self.file_cols[from_idx].delete_many({"_id": {"$in": copied_src_ids}})
@@ -2778,7 +2730,9 @@ class Database:
                     # Docs are now confirmed present in the destination but
                     # couldn't be removed from the source — they exist in
                     # both clusters until a retry cleans up the source.
-                    logger.error(f"Migration source-cleanup failed for {len(copied_src_ids)} doc(s) — now duplicated across clusters {from_idx+1}/{to_idx+1}: {e}")
+                    logger.error(
+                        f"Migration source-cleanup failed for {len(copied_src_ids)} doc(s) — now duplicated across clusters {from_idx + 1}/{to_idx + 1}: {e}"
+                    )
 
         batch = []
         async for doc in self.file_cols[from_idx].find({}):
@@ -2823,26 +2777,19 @@ class Database:
                 )
                 return []
 
-        cluster_results = await asyncio.gather(*[
-            _search_cluster(col) for col in self.file_cols
-        ])
-        files = deduplicate_search_results([
-            doc for docs in cluster_results for doc in docs
-        ])
+        cluster_results = await asyncio.gather(*[_search_cluster(col) for col in self.file_cols])
+        files = deduplicate_search_results(
+            [doc for docs in cluster_results for doc in docs if doc.get("branding_status") != "pending"]
+        )
         return files[:max_results]
 
     async def _legacy_search_results(self, query, max_results=40, offset=0):
         """Run the proven reference pattern without modifying legacy rows."""
         if isinstance(query, list):
-            raw_pattern = "|".join(
-                re.escape(str(item).strip())
-                for item in query if str(item).strip()
-            )
+            raw_pattern = "|".join(re.escape(str(item).strip()) for item in query if str(item).strip())
             if not raw_pattern:
                 return []
-            return await self._regex_search(
-                compile_regex(raw_pattern), max_results, offset
-            )
+            return await self._regex_search(compile_regex(raw_pattern), max_results, offset)
 
         query = str(query).strip()
         words = [word for word in query.split() if word][:12]
@@ -2888,10 +2835,7 @@ class Database:
 
     async def _indexed_token_search(self, token_groups, max_results, offset=0):
         """Search bounded candidates using the required multikey index."""
-        filters = [
-            {"search_tokens": {"$all": list(dict.fromkeys(group))}}
-            for group in token_groups if group
-        ]
+        filters = [{"search_tokens": {"$all": list(dict.fromkeys(group))}} for group in token_groups if group]
         if not filters:
             return []
         filter_mongo = filters[0] if len(filters) == 1 else {"$or": filters}
@@ -2908,11 +2852,7 @@ class Database:
                 # an ordered multi-word scan (measured at roughly 4 seconds).
                 async with asyncio.timeout(4.0):
                     cursor = (
-                        col.find(filter_mongo)
-                        .sort("_id", -1)
-                        .skip(offset)
-                        .limit(limit)
-                        .max_time_ms(3000)
+                        col.find(filter_mongo).sort("_id", -1).skip(offset).limit(limit).max_time_ms(3000)
                     )
                     return [doc async for doc in cursor]
             except TimeoutError:
@@ -2926,9 +2866,9 @@ class Database:
 
         cluster_results = await asyncio.gather(*[_search_cluster(col) for col in self.file_cols])
 
-        files = deduplicate_search_results([
-            doc for docs in cluster_results for doc in docs
-        ])
+        files = deduplicate_search_results(
+            [doc for docs in cluster_results for doc in docs if doc.get("branding_status") != "pending"]
+        )
         return files[:max_results]
 
     async def _get_search_results_uncached(self, query, max_results=40, offset=0):
@@ -2936,10 +2876,7 @@ class Database:
         if not getattr(self, "_search_tokens_complete", True):
             return await self._legacy_search_results(query, max_results, offset)
         if isinstance(query, list):
-            token_groups = [
-                search_tokens_for_name(str(item))[:12]
-                for item in query if str(item).strip()
-            ]
+            token_groups = [search_tokens_for_name(str(item))[:12] for item in query if str(item).strip()]
             return await self._indexed_token_search(token_groups, max_results, offset)
 
         query = query.strip()
@@ -2959,13 +2896,9 @@ class Database:
         # reference query is always attempted first; if it misses, retry the
         # same ordered search after removing only optional year/language/
         # quality tokens. Title, season and episode words are never relaxed.
-        title_words = [
-            word for word in words if not _is_optional_search_token(word)
-        ]
+        title_words = [word for word in words if not _is_optional_search_token(word)]
         if title_words and title_words != words:
-            candidates = await self._indexed_token_search(
-                [title_words], candidate_limit, offset
-            )
+            candidates = await self._indexed_token_search([title_words], candidate_limit, offset)
             ranked = rank_search_results(query, candidates, max_results)
             if ranked:
                 return ranked
@@ -2980,9 +2913,7 @@ class Database:
             suggestion_words = suggestion.split()[:12]
             if not suggestion_words:
                 continue
-            candidates = await self._indexed_token_search(
-                [suggestion_words], candidate_limit, 0
-            )
+            candidates = await self._indexed_token_search([suggestion_words], candidate_limit, 0)
             ranked = rank_search_results(query, candidates, max_results)
             if ranked:
                 return ranked
@@ -2992,13 +2923,9 @@ class Database:
         """Run bounded-catalog RapidFuzz work outside the event loop."""
         semaphore = getattr(self, "_fuzzy_worker_semaphore", None)
         if semaphore is None:
-            return await asyncio.to_thread(
-                suggest_search_titles, query, limit
-            )
+            return await asyncio.to_thread(suggest_search_titles, query, limit)
         async with semaphore:
-            return await asyncio.to_thread(
-                suggest_search_titles, query, limit
-            )
+            return await asyncio.to_thread(suggest_search_titles, query, limit)
 
     async def get_search_results(self, query, max_results=40, offset=0):
         """Return a short-lived cached search result when available."""
@@ -3030,9 +2957,7 @@ class Database:
         async def _bounded_find(collection, query, timeout_seconds):
             try:
                 async with asyncio.timeout(timeout_seconds):
-                    return await collection.find_one(
-                        query, max_time_ms=max(100, int(timeout_seconds * 800))
-                    )
+                    return await collection.find_one(query, max_time_ms=max(100, int(timeout_seconds * 800)))
             except TimeoutError:
                 return None
             except Exception as exc:
@@ -3044,28 +2969,27 @@ class Database:
 
         registry_doc = None
         if self.registry_col is not None:
-            registry_doc = await _bounded_find(
-                self.registry_col, {"movie_id": str(obj_id)}, 1.5
-            )
+            registry_doc = await _bounded_find(self.registry_col, {"movie_id": str(obj_id)}, 1.5)
         if registry_doc:
             cluster_number = registry_doc.get("cluster")
             if isinstance(cluster_number, int) and 1 <= cluster_number <= len(self.file_cols):
-                doc = await _bounded_find(
-                    self.file_cols[cluster_number - 1], {"_id": obj_id}, 2.5
-                )
-                if doc:
+                doc = await _bounded_find(self.file_cols[cluster_number - 1], {"_id": obj_id}, 2.5)
+                if doc and doc.get("branding_status") != "pending":
                     return doc
 
         async def _fallback(cluster_index, collection):
             document = await _bounded_find(collection, {"_id": obj_id}, 3.0)
             return cluster_index, document
 
-        lookups = await asyncio.gather(*[
-            _fallback(index, collection)
-            for index, collection in enumerate(self.file_cols, 1)
-        ])
+        lookups = await asyncio.gather(
+            *[_fallback(index, collection) for index, collection in enumerate(self.file_cols, 1)]
+        )
         found = next(
-            ((cluster, document) for cluster, document in lookups if document),
+            (
+                (cluster, document)
+                for cluster, document in lookups
+                if document and document.get("branding_status") != "pending"
+            ),
             None,
         )
         if found is None:
@@ -3077,10 +3001,12 @@ class Database:
                 async with asyncio.timeout(2.0):
                     await self.registry_col.update_one(
                         {"file_id": document["file_id"]},
-                        {"$set": {
-                            "cluster": cluster_number,
-                            "movie_id": str(document["_id"]),
-                        }},
+                        {
+                            "$set": {
+                                "cluster": cluster_number,
+                                "movie_id": str(document["_id"]),
+                            }
+                        },
                     )
             except Exception as exc:
                 logger.warning(
@@ -3106,13 +3032,13 @@ class Database:
     async def log_missed_search(self, query: str):
         if self.main_db is None:
             return False
-        col     = self.main_db["missed_searches"]
+        col = self.main_db["missed_searches"]
         cleaned = re.sub(r"[^a-zA-Z0-9 ]", "", query.lower()).strip()
         if not cleaned:
             return False
-        now          = time.time()
-        cooldown     = 3600
-        existing     = await col.find_one({"_id": cleaned})
+        now = time.time()
+        cooldown = 3600
+        existing = await col.find_one({"_id": cleaned})
         should_alert = existing is None or (now - existing.get("last_alerted", 0)) > cooldown
         # last_searched_at (a real BSON date) drives the TTL index in
         # ensure_indexes() — last_searched (epoch float) is kept as-is for
@@ -3155,10 +3081,10 @@ class Database:
             _count(self.banned_col),
             self.get_group_count(),
             self.get_total_files(),
-            *[_cluster_stats(i, db_instance) for i, db_instance in enumerate(self.dbs)]
+            *[_cluster_stats(i, db_instance) for i, db_instance in enumerate(self.dbs)],
         )
 
-        db_sizes    = [(idx, size) for idx, _, size in cluster_stats]
+        db_sizes = [(idx, size) for idx, _, size in cluster_stats]
         return total_users, total_banned, total_files, db_sizes, total_groups
 
     async def reset_database(self):
@@ -3197,9 +3123,12 @@ class Database:
                 "maintenance_mode": False,
                 "maintenance_message": "🔧 Bot is under maintenance. Back soon!",
                 "file_caption_template": "",
+                "file_branding_enabled": False,
+                "file_branding_channel_id": 0,
+                "file_branding_text": "",
             }
             await self.config_col.insert_one(config)
-        _config_cache    = config
+        _config_cache = config
         _config_cache_ts = now
         return config
 
@@ -3208,14 +3137,14 @@ class Database:
         if self.config_col is None:
             return False
         await self.config_col.update_one({"_id": "bot_config"}, {"$set": {key: value}}, upsert=True)
-        _config_cache    = None
+        _config_cache = None
         _config_cache_ts = 0.0
         return True
 
     async def export_config(self, *, include_private_invites=False):
-        config  = await self.get_config()
+        config = await self.get_config()
         exclude = {"_id", "log_channel", "admin_id", "db_channels", "update_channel_id", "db_channel"}
-        safe    = {k: v for k, v in config.items() if k not in exclude}
+        safe = {k: v for k, v in config.items() if k not in exclude}
         if include_private_invites:
             return safe
 
@@ -3225,8 +3154,7 @@ class Database:
         for channel_key in ("fsub_channels", "req_fsub_channels", "two_stage_channels"):
             if channel_key in safe:
                 safe[channel_key] = [
-                    ({"id": e.get("id")} if isinstance(e, dict) else e)
-                    for e in safe[channel_key]
+                    ({"id": e.get("id")} if isinstance(e, dict) else e) for e in safe[channel_key]
                 ]
         return redact_private_invites(safe)
 
@@ -3235,9 +3163,7 @@ class Database:
         safe_data = validate_config_restore(data)
         if not safe_data or self.config_col is None:
             return False
-        await self.config_col.update_one(
-            {"_id": "bot_config"}, {"$set": safe_data}, upsert=True
-        )
+        await self.config_col.update_one({"_id": "bot_config"}, {"$set": safe_data}, upsert=True)
         _config_cache = None
         _config_cache_ts = 0.0
         return True
@@ -3246,11 +3172,16 @@ class Database:
         if self.config_col is None:
             return False
         entry = {"id": channel_id}
-        await self.config_col.update_one({"_id": "bot_config"}, {"$pull": {"fsub_channels": {"id": channel_id}}})
+        await self.config_col.update_one(
+            {"_id": "bot_config"}, {"$pull": {"fsub_channels": {"id": channel_id}}}
+        )
         await self.config_col.update_one({"_id": "bot_config"}, {"$pull": {"fsub_channels": channel_id}})
-        await self.config_col.update_one({"_id": "bot_config"}, {"$push": {"fsub_channels": entry}}, upsert=True)
+        await self.config_col.update_one(
+            {"_id": "bot_config"}, {"$push": {"fsub_channels": entry}}, upsert=True
+        )
         global _config_cache, _config_cache_ts
-        _config_cache = None; _config_cache_ts = 0.0
+        _config_cache = None
+        _config_cache_ts = 0.0
         return True
 
     async def update_fsub_channel_link(self, channel_id, link):
@@ -3260,30 +3191,37 @@ class Database:
         if not config:
             return
         channels = config.get("fsub_channels", [])
-        updated  = []
+        updated = []
         for entry in channels:
             if isinstance(entry, dict) and entry.get("id") == channel_id:
                 entry["link"] = link
             updated.append(entry)
         await self.config_col.update_one({"_id": "bot_config"}, {"$set": {"fsub_channels": updated}})
         global _config_cache, _config_cache_ts
-        _config_cache = None; _config_cache_ts = 0.0
+        _config_cache = None
+        _config_cache_ts = 0.0
 
     async def remove_fsub_channel(self, channel_id):
         if self.config_col is None:
             return False
-        await self.config_col.update_one({"_id": "bot_config"}, {"$pull": {"fsub_channels": {"id": channel_id}}})
+        await self.config_col.update_one(
+            {"_id": "bot_config"}, {"$pull": {"fsub_channels": {"id": channel_id}}}
+        )
         await self.config_col.update_one({"_id": "bot_config"}, {"$pull": {"fsub_channels": channel_id}})
         global _config_cache, _config_cache_ts
-        _config_cache = None; _config_cache_ts = 0.0
+        _config_cache = None
+        _config_cache_ts = 0.0
         return True
 
     async def add_db_channel(self, channel_id):
         if self.config_col is None:
             return False
-        await self.config_col.update_one({"_id": "bot_config"}, {"$addToSet": {"db_channels": channel_id}}, upsert=True)
+        await self.config_col.update_one(
+            {"_id": "bot_config"}, {"$addToSet": {"db_channels": channel_id}}, upsert=True
+        )
         global _config_cache, _config_cache_ts
-        _config_cache = None; _config_cache_ts = 0.0
+        _config_cache = None
+        _config_cache_ts = 0.0
         return True
 
     async def remove_db_channel(self, channel_id):
@@ -3291,7 +3229,8 @@ class Database:
             return False
         await self.config_col.update_one({"_id": "bot_config"}, {"$pull": {"db_channels": channel_id}})
         global _config_cache, _config_cache_ts
-        _config_cache = None; _config_cache_ts = 0.0
+        _config_cache = None
+        _config_cache_ts = 0.0
         return True
 
     async def add_req_fsub_channel(self, channel_id, link, title=""):
@@ -3303,7 +3242,7 @@ class Database:
             return False, "A verified numeric channel ID is required"
         if not isinstance(link, str) or not link.startswith("https://t.me/"):
             return False, "A verified Telegram invite/public link is required"
-        config   = await self.config_col.find_one({"_id": "bot_config"})
+        config = await self.config_col.find_one({"_id": "bot_config"})
         existing = config.get("req_fsub_channels", []) if config else []
         if len(existing) >= 5:
             return False, "Max 5 reached"
@@ -3318,16 +3257,20 @@ class Database:
             upsert=True,
         )
         global _config_cache, _config_cache_ts
-        _config_cache = None; _config_cache_ts = 0.0
+        _config_cache = None
+        _config_cache_ts = 0.0
         return True, "Added"
 
     async def remove_req_fsub_channel(self, channel_id):
         if self.config_col is None:
             return False
-        await self.config_col.update_one({"_id": "bot_config"}, {"$pull": {"req_fsub_channels": {"id": channel_id}}})
+        await self.config_col.update_one(
+            {"_id": "bot_config"}, {"$pull": {"req_fsub_channels": {"id": channel_id}}}
+        )
         await self.config_col.update_one({"_id": "bot_config"}, {"$pull": {"req_fsub_channels": channel_id}})
         global _config_cache, _config_cache_ts
-        _config_cache = None; _config_cache_ts = 0.0
+        _config_cache = None
+        _config_cache_ts = 0.0
         return True
 
     async def update_req_fsub_link(self, channel_id, link):
@@ -3337,14 +3280,15 @@ class Database:
         if not config:
             return
         channels = config.get("req_fsub_channels", [])
-        updated  = []
+        updated = []
         for entry in channels:
             if isinstance(entry, dict) and str(entry.get("id")) == str(channel_id):
                 entry["link"] = link
             updated.append(entry)
         await self.config_col.update_one({"_id": "bot_config"}, {"$set": {"req_fsub_channels": updated}})
         global _config_cache, _config_cache_ts
-        _config_cache = None; _config_cache_ts = 0.0
+        _config_cache = None
+        _config_cache_ts = 0.0
 
     async def set_two_stage_channel(self, slot: int, channel_id) -> bool:
         """slot is 1 or 2 — a fixed 2-slot list (unlike fsub_channels/
@@ -3353,27 +3297,33 @@ class Database:
         Channel-2 flow, not "join any N of these"."""
         if self.config_col is None:
             return False
-        config   = await self.config_col.find_one({"_id": "bot_config"})
+        config = await self.config_col.find_one({"_id": "bot_config"})
         channels = list(config.get("two_stage_channels", [])) if config else []
         while len(channels) < 2:
             channels.append(None)
         channels[slot - 1] = {"id": channel_id}
-        await self.config_col.update_one({"_id": "bot_config"}, {"$set": {"two_stage_channels": channels}}, upsert=True)
+        await self.config_col.update_one(
+            {"_id": "bot_config"}, {"$set": {"two_stage_channels": channels}}, upsert=True
+        )
         global _config_cache, _config_cache_ts
-        _config_cache = None; _config_cache_ts = 0.0
+        _config_cache = None
+        _config_cache_ts = 0.0
         return True
 
     async def remove_two_stage_channel(self, slot: int) -> bool:
         if self.config_col is None:
             return False
-        config   = await self.config_col.find_one({"_id": "bot_config"})
+        config = await self.config_col.find_one({"_id": "bot_config"})
         channels = list(config.get("two_stage_channels", [])) if config else []
         while len(channels) < 2:
             channels.append(None)
         channels[slot - 1] = None
-        await self.config_col.update_one({"_id": "bot_config"}, {"$set": {"two_stage_channels": channels}}, upsert=True)
+        await self.config_col.update_one(
+            {"_id": "bot_config"}, {"$set": {"two_stage_channels": channels}}, upsert=True
+        )
         global _config_cache, _config_cache_ts
-        _config_cache = None; _config_cache_ts = 0.0
+        _config_cache = None
+        _config_cache_ts = 0.0
         return True
 
     async def update_two_stage_channel_link(self, channel_id, link):
@@ -3383,21 +3333,22 @@ class Database:
         if not config:
             return
         channels = config.get("two_stage_channels", [])
-        updated  = []
+        updated = []
         for entry in channels:
             if isinstance(entry, dict) and str(entry.get("id")) == str(channel_id):
                 entry["link"] = link
             updated.append(entry)
         await self.config_col.update_one({"_id": "bot_config"}, {"$set": {"two_stage_channels": updated}})
         global _config_cache, _config_cache_ts
-        _config_cache = None; _config_cache_ts = 0.0
+        _config_cache = None
+        _config_cache_ts = 0.0
 
     async def get_two_stage_gate_status(self, user_id: int) -> VerificationResult:
         """Return PASS when cached verification is valid, DENY when due."""
         if self.users_col is None:
             return VerificationResult.indeterminate("users_collection_unavailable")
         try:
-            doc  = await self.users_col.find_one({"_id": user_id}, {"two_stage_verified_at": 1})
+            doc = await self.users_col.find_one({"_id": user_id}, {"two_stage_verified_at": 1})
             last = doc.get("two_stage_verified_at", 0) if doc else 0
             if (time.time() - last) >= TWO_STAGE_VERIFY_INTERVAL:
                 return VerificationResult.deny("two_stage_due")
@@ -3419,12 +3370,12 @@ class Database:
             logger.warning("two_stage_cache_write_failed reason=users_collection_unavailable")
             return False
         try:
-            await self.users_col.update_one({"_id": user_id}, {"$set": {"two_stage_verified_at": time.time()}}, upsert=True)
+            await self.users_col.update_one(
+                {"_id": user_id}, {"$set": {"two_stage_verified_at": time.time()}}, upsert=True
+            )
             return True
         except Exception as exc:
-            logger.warning(
-                "two_stage_cache_write_failed error_type=%s", type(exc).__name__
-            )
+            logger.warning("two_stage_cache_write_failed error_type=%s", type(exc).__name__)
             return False
 
     async def get_req_fsub_interval(self):
@@ -3435,8 +3386,8 @@ class Database:
         if self.users_col is None:
             return VerificationResult.indeterminate("users_collection_unavailable")
         try:
-            doc      = await self.users_col.find_one({"_id": user_id}, {"req_fsub_last": 1})
-            last     = doc.get("req_fsub_last", 0) if doc else 0
+            doc = await self.users_col.find_one({"_id": user_id}, {"req_fsub_last": 1})
+            last = doc.get("req_fsub_last", 0) if doc else 0
             interval = await self.get_req_fsub_interval()
             if (time.time() - last) >= interval:
                 return VerificationResult.deny("request_fsub_due")
@@ -3457,7 +3408,9 @@ class Database:
         if self.users_col is None:
             return
         try:
-            await self.users_col.update_one({"_id": user_id}, {"$set": {"req_fsub_last": time.time()}}, upsert=True)
+            await self.users_col.update_one(
+                {"_id": user_id}, {"$set": {"req_fsub_last": time.time()}}, upsert=True
+            )
         except Exception:
             pass
 
@@ -3491,16 +3444,19 @@ class Database:
         # log_missed_search()'s last_searched_at above.
         await requests_col.update_one(
             {"user_id": user_id, "movie_name": movie_name.lower().strip()},
-            {"$set": {
-                "user_id": user_id, "movie_name": movie_name.lower().strip(),
-                "original_name": movie_name, "timestamp": time.time(),
-                "requested_at": datetime.now(timezone.utc),
-            }},
-            upsert=True
+            {
+                "$set": {
+                    "user_id": user_id,
+                    "movie_name": movie_name.lower().strip(),
+                    "original_name": movie_name,
+                    "timestamp": time.time(),
+                    "requested_at": datetime.now(timezone.utc),
+                }
+            },
+            upsert=True,
         )
 
-    async def iter_matching_requests(self, file_name, page_size=25,
-                                     max_matches=MAX_REQUEST_MATCHES_PER_JOB):
+    async def iter_matching_requests(self, file_name, page_size=25, max_matches=MAX_REQUEST_MATCHES_PER_JOB):
         if self.main_db is None:
             return
         requests_col = self.main_db["pending_requests"]
@@ -3519,16 +3475,14 @@ class Database:
 
     async def find_matching_requests(self, file_name, limit=MAX_REQUEST_MATCHES_PER_JOB):
         """Compatibility wrapper with a hard cap; prefer the streaming iterator."""
-        return [
-            match async for match in self.iter_matching_requests(
-                file_name, max_matches=limit
-            )
-        ]
+        return [match async for match in self.iter_matching_requests(file_name, max_matches=limit)]
 
     async def delete_pending_request(self, user_id, movie_name):
         if self.main_db is None:
             return
-        await self.main_db["pending_requests"].delete_one({"user_id": user_id, "movie_name": movie_name.lower().strip()})
+        await self.main_db["pending_requests"].delete_one(
+            {"user_id": user_id, "movie_name": movie_name.lower().strip()}
+        )
 
     async def pending_request_exists(self, user_id, movie_name) -> bool:
         """Used by the manual "Mark Uploaded" admin ticket flow to check
@@ -3555,10 +3509,12 @@ class Database:
         if self.indexer_col is not None:
             heartbeat = await self.indexer_col.update_one(
                 {"_id": str(chat_id)},
-                {"$set": {
-                    "updated": time.time(),
-                    "checkpoint": int(msg_id),
-                }},
+                {
+                    "$set": {
+                        "updated": time.time(),
+                        "checkpoint": int(msg_id),
+                    }
+                },
             )
             if not heartbeat.acknowledged:
                 raise RuntimeError("Index heartbeat write was not acknowledged")
@@ -3596,9 +3552,7 @@ class Database:
 
     async def resolve_index_failure(self, chat_id: int, start_id: int, end_id: int):
         if self.index_failures_col is not None:
-            await self.index_failures_col.delete_one(
-                {"_id": f"{chat_id}:{start_id}:{end_id}"}
-            )
+            await self.index_failures_col.delete_one({"_id": f"{chat_id}:{start_id}:{end_id}"})
 
     async def get_index_progress(self, chat_id):
         if self.main_db is None:
@@ -3622,7 +3576,9 @@ class Database:
         if self.indexer_col is None:
             return
         try:
-            await self.indexer_col.update_one({"_id": str(chat_id)}, {"$set": {"state": state, "updated": time.time()}}, upsert=True)
+            await self.indexer_col.update_one(
+                {"_id": str(chat_id)}, {"$set": {"state": state, "updated": time.time()}}, upsert=True
+            )
         except Exception as e:
             logger.warning(f"set_index_task failed: {e}")
 
@@ -3662,21 +3618,354 @@ class Database:
     async def clear_old_searches(self, expiry_seconds=600):
         self._search_cache.purge(expiry_seconds)
 
-    async def enqueue_notification_job(self, kind: str, coalesce_key: str,
-                                       payload: dict, delay_seconds=0):
+    async def set_file_branding_status(self, source_file_id: str, status: str):
+        """Change delivery visibility for one source row without moving media."""
+        source_file_id = str(source_file_id or "")
+        if not source_file_id:
+            return False
+
+        registry = None
+        if self.registry_col is not None:
+            try:
+                registry = await self.registry_col.find_one(
+                    {"file_id": source_file_id}, {"cluster": 1, "movie_id": 1}
+                )
+            except Exception:
+                registry = None
+        if registry:
+            cluster = registry.get("cluster")
+            movie_id = registry.get("movie_id")
+            if isinstance(cluster, int) and movie_id and 1 <= cluster <= len(self.file_cols):
+                try:
+                    result = await self.file_cols[cluster - 1].update_one(
+                        {"_id": ObjectId(movie_id)},
+                        {"$set": {"branding_status": str(status)}},
+                    )
+                    if result.matched_count:
+                        self._search_cache.clear()
+                        self._query_cache.clear()
+                        return True
+                except Exception:
+                    pass
+
+        for collection in self.file_cols:
+            try:
+                result = await collection.update_one(
+                    {
+                        "$or": [
+                            {"file_id": source_file_id},
+                            {"source_file_id": source_file_id},
+                        ]
+                    },
+                    {"$set": {"branding_status": str(status)}},
+                )
+                if result.matched_count:
+                    self._search_cache.clear()
+                    self._query_cache.clear()
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def enqueue_file_branding(self, payload: dict, delay_seconds=0):
+        """Queue one newly indexed file for a single, resumable re-upload."""
+        if self.file_branding_col is None:
+            raise RuntimeError("File-branding queue is unavailable")
+        source_file_id = str(payload.get("source_file_id", "") or "")
+        source_unique_id = str(payload.get("source_unique_id", "") or "")
+        identity = source_unique_id or source_file_id
+        if not identity:
+            raise ValueError("A Telegram file identity is required")
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
+        job_id = f"brand:{digest}"
+        existing = await self.file_branding_col.find_one({"_id": job_id}, {"_id": 1, "status": 1})
+        if existing and existing.get("status") == "complete":
+            return job_id
+        if existing is None:
+            depth = await self.file_branding_col.count_documents(
+                {"status": {"$in": ["pending", "running"]}},
+                limit=MAX_FILE_BRANDING_JOBS,
+            )
+            if depth >= MAX_FILE_BRANDING_JOBS:
+                raise RuntimeError("File-branding queue is full")
+        now = time.time()
+        await self.file_branding_col.update_one(
+            {"_id": job_id},
+            {
+                "$set": {
+                    "status": "pending",
+                    "payload": dict(payload),
+                    "due_at": now + max(0.0, float(delay_seconds)),
+                    "updated_at": now,
+                },
+                "$setOnInsert": {"created_at": now, "attempts": 0},
+                "$unset": {"locked_until": "", "lock_token": "", "last_error": ""},
+            },
+            upsert=True,
+        )
+        return job_id
+
+    async def claim_due_file_branding(self, lease_seconds=7200):
+        if self.file_branding_col is None:
+            return None
+        now = time.time()
+        lock_token = secrets.token_hex(16)
+        return await self.file_branding_col.find_one_and_update(
+            {
+                "status": {"$in": ["pending", "running"]},
+                "due_at": {"$lte": now},
+                "$or": [
+                    {"status": "pending"},
+                    {"locked_until": {"$lte": now}},
+                    {"locked_until": {"$exists": False}},
+                ],
+            },
+            {
+                "$set": {
+                    "status": "running",
+                    "lock_token": lock_token,
+                    "locked_until": now + max(300, int(lease_seconds)),
+                    "updated_at": now,
+                },
+                "$inc": {"attempts": 1},
+            },
+            sort=[("due_at", 1)],
+            return_document=ReturnDocument.AFTER,
+        )
+
+    async def complete_file_branding(self, job_id, lock_token: str, result: dict):
+        if self.file_branding_col is None:
+            return False
+        now = time.time()
+        updated = await self.file_branding_col.update_one(
+            {"_id": job_id, "lock_token": lock_token},
+            {
+                "$set": {
+                    "status": "complete",
+                    "result": dict(result),
+                    "completed_at": now,
+                    "updated_at": now,
+                    "expires_at": datetime.fromtimestamp(now + (30 * 24 * 3600), timezone.utc),
+                },
+                "$unset": {"locked_until": "", "lock_token": "", "last_error": ""},
+            },
+        )
+        return updated.modified_count == 1
+
+    async def checkpoint_file_branding_upload(self, job_id, lock_token: str, upload: dict):
+        """Remember a verified cache upload so a retry never uploads it twice."""
+        if self.file_branding_col is None:
+            return False
+        updated = await self.file_branding_col.update_one(
+            {"_id": job_id, "lock_token": lock_token},
+            {
+                "$set": {
+                    "uploaded": dict(upload),
+                    "updated_at": time.time(),
+                }
+            },
+        )
+        return updated.modified_count == 1
+
+    async def update_file_branding_progress(
+        self,
+        job_id,
+        lock_token: str,
+        *,
+        stage: str,
+        current: int,
+        total: int,
+        lease_seconds=7200,
+    ):
+        """Persist live transfer progress and keep a long upload's lease alive."""
+        if self.file_branding_col is None:
+            return False
+        now = time.time()
+        updated = await self.file_branding_col.update_one(
+            {"_id": job_id, "status": "running", "lock_token": lock_token},
+            {
+                "$set": {
+                    "progress": {
+                        "stage": str(stage),
+                        "current": max(0, int(current)),
+                        "total": max(0, int(total)),
+                        "updated_at": now,
+                    },
+                    "locked_until": now + max(1800, int(lease_seconds)),
+                    "updated_at": now,
+                }
+            },
+        )
+        return updated.matched_count == 1
+
+    async def retry_file_branding(self, job_id, lock_token: str, delay_seconds: float, error: str):
+        if self.file_branding_col is None:
+            return False
+        now = time.time()
+        updated = await self.file_branding_col.update_one(
+            {"_id": job_id, "lock_token": lock_token},
+            {
+                "$set": {
+                    "status": "pending",
+                    "due_at": now + max(5.0, float(delay_seconds)),
+                    "updated_at": now,
+                    "last_error": str(error)[:300],
+                },
+                "$unset": {"locked_until": "", "lock_token": ""},
+            },
+        )
+        return updated.modified_count == 1
+
+    async def fail_file_branding(self, job_id, lock_token: str, error: str):
+        if self.file_branding_col is None:
+            return False
+        now = time.time()
+        updated = await self.file_branding_col.update_one(
+            {"_id": job_id, "lock_token": lock_token},
+            {
+                "$set": {
+                    "status": "failed",
+                    "failed_at": now,
+                    "updated_at": now,
+                    "last_error": str(error)[:300],
+                    "expires_at": datetime.fromtimestamp(now + (30 * 24 * 3600), timezone.utc),
+                },
+                "$unset": {"locked_until": "", "lock_token": ""},
+            },
+        )
+        return updated.modified_count == 1
+
+    async def file_branding_stats(self):
+        if self.file_branding_col is None:
+            return {"pending": 0, "running": 0, "complete": 0, "failed": 0}
+        statuses = ("pending", "running", "complete", "failed")
+        counts = await asyncio.gather(
+            *[self.file_branding_col.count_documents({"status": status}) for status in statuses]
+        )
+        stats = dict(zip(statuses, counts))
+        stats["active"] = await self.file_branding_col.find_one(
+            {"status": "running"},
+            {"progress": 1, "payload.original_file_name": 1},
+            sort=[("updated_at", -1)],
+        )
+        return stats
+
+    async def replace_with_branded_media(
+        self,
+        *,
+        source_file_id: str,
+        branded_media,
+        branded_file_name: str,
+        branded_channel_id: int,
+        branded_message_id: int,
+    ):
+        """Idempotently switch one movie row and registry claim to branded media."""
+        new_file_id = str(getattr(branded_media, "file_id", "") or "")
+        new_unique_id = str(getattr(branded_media, "file_unique_id", "") or "")
+        if not source_file_id or not new_file_id:
+            raise ValueError("Both source and branded Telegram file IDs are required")
+
+        registry = None
+        if self.registry_col is not None:
+            registry = await self.registry_col.find_one(
+                {
+                    "$or": [
+                        {"file_id": source_file_id},
+                        {"file_id": new_file_id},
+                    ]
+                }
+            )
+
+        location = None
+        if registry:
+            cluster = registry.get("cluster")
+            movie_id = registry.get("movie_id")
+            if isinstance(cluster, int) and movie_id and 1 <= cluster <= len(self.file_cols):
+                try:
+                    location = (
+                        cluster,
+                        await self.file_cols[cluster - 1].find_one(
+                            {
+                                "_id": ObjectId(movie_id),
+                                "$or": [
+                                    {"file_id": source_file_id},
+                                    {"file_id": new_file_id},
+                                    {"source_file_id": source_file_id},
+                                ],
+                            }
+                        ),
+                    )
+                except Exception:
+                    location = None
+        if not location or not location[1]:
+            for cluster, collection in enumerate(self.file_cols, 1):
+                document = await collection.find_one(
+                    {
+                        "$or": [
+                            {"file_id": source_file_id},
+                            {"file_id": new_file_id},
+                            {"source_file_id": source_file_id},
+                        ]
+                    }
+                )
+                if document:
+                    location = (cluster, document)
+                    break
+        if not location or not location[1]:
+            raise RuntimeError("The indexed source row no longer exists")
+
+        cluster, movie = location
+        collection = self.file_cols[cluster - 1]
+        update = {
+            "file_id": new_file_id,
+            "source_file_id": source_file_id,
+            "delivery_file_name": str(branded_file_name),
+            "branding_status": "complete",
+            "branded_channel_id": int(branded_channel_id),
+            "branded_message_id": int(branded_message_id),
+            "branded_at": time.time(),
+        }
+        if new_unique_id:
+            update["file_unique_id"] = new_unique_id
+        await collection.update_one({"_id": movie["_id"]}, {"$set": update})
+
+        if self.registry_col is not None:
+            registry_update = {
+                "file_id": new_file_id,
+                "cluster": cluster,
+                "movie_id": str(movie["_id"]),
+            }
+            if new_unique_id:
+                registry_update["file_unique_id"] = new_unique_id
+            result = await self.registry_col.update_one(
+                {"file_id": source_file_id}, {"$set": registry_update}
+            )
+            if result.matched_count == 0:
+                await self.registry_col.update_one(
+                    {"file_id": new_file_id},
+                    {"$set": registry_update},
+                    upsert=True,
+                )
+
+        self._search_cache.clear()
+        self._query_cache.clear()
+        return {
+            "cluster": cluster,
+            "movie_id": str(movie["_id"]),
+            "file_id": new_file_id,
+            "file_unique_id": new_unique_id,
+        }
+
+    async def enqueue_notification_job(self, kind: str, coalesce_key: str, payload: dict, delay_seconds=0):
         """Persist a coalesced, bounded notification-pipeline job."""
         if self.announcement_col is None:
             raise RuntimeError("Announcement outbox is unavailable")
         now = time.time()
         digest = hashlib.sha256(coalesce_key.encode("utf-8")).hexdigest()[:32]
         job_id = f"{kind}:{digest}"
-        existing = await self.announcement_col.find_one(
-            {"_id": job_id}, {"_id": 1}
-        )
+        existing = await self.announcement_col.find_one({"_id": job_id}, {"_id": 1})
         if existing is None:
-            depth = await self.announcement_col.count_documents(
-                {}, limit=MAX_NOTIFICATION_OUTBOX_JOBS
-            )
+            depth = await self.announcement_col.count_documents({}, limit=MAX_NOTIFICATION_OUTBOX_JOBS)
             if depth >= MAX_NOTIFICATION_OUTBOX_JOBS:
                 logger.warning(
                     "notification_outbox_full kind=%s policy=drop_new depth=%s",
@@ -3691,9 +3980,7 @@ class Database:
                 "$set": {
                     "kind": kind,
                     "payload": dict(payload),
-                    "expires_at": datetime.fromtimestamp(
-                        now + (7 * 24 * 3600), timezone.utc
-                    ),
+                    "expires_at": datetime.fromtimestamp(now + (7 * 24 * 3600), timezone.utc),
                 },
                 "$setOnInsert": {"created_at": now, "attempts": 0},
                 "$inc": {"revision": 1},
@@ -3704,9 +3991,7 @@ class Database:
         return job_id
 
     async def enqueue_announcement(self, file_name: str, delay_seconds=0):
-        title_key = primary_search_identity(file_name) or normalized_search_identity(
-            file_name
-        )
+        title_key = primary_search_identity(file_name) or normalized_search_identity(file_name)
         return await self.enqueue_notification_job(
             "announcement",
             title_key,
@@ -3715,9 +4000,7 @@ class Database:
         )
 
     async def enqueue_request_fulfillment(self, file_name: str, delay_seconds=0):
-        title_key = primary_search_identity(file_name) or normalized_search_identity(
-            file_name
-        )
+        title_key = primary_search_identity(file_name) or normalized_search_identity(file_name)
         return await self.enqueue_notification_job(
             "request_fulfillment",
             title_key,
@@ -3789,9 +4072,7 @@ class Database:
     async def notification_outbox_depth(self):
         if self.announcement_col is None:
             return 0
-        return await self.announcement_col.count_documents(
-            {}, limit=MAX_NOTIFICATION_OUTBOX_JOBS + 1
-        )
+        return await self.announcement_col.count_documents({}, limit=MAX_NOTIFICATION_OUTBOX_JOBS + 1)
 
     async def enqueue_broadcast(
         self,
@@ -3914,14 +4195,10 @@ class Database:
             {cursor_field: 1},
         )
         return bool(
-            current
-            and current.get(cursor_field) is not None
-            and current[cursor_field] >= recipient_id
+            current and current.get(cursor_field) is not None and current[cursor_field] >= recipient_id
         )
 
-    async def complete_broadcast_phase(
-        self, job_id, lock_token: str, audience: str
-    ) -> bool:
+    async def complete_broadcast_phase(self, job_id, lock_token: str, audience: str) -> bool:
         if self.broadcast_col is None or audience not in {"users", "groups"}:
             return False
         result = await self.broadcast_col.update_one(
@@ -3942,9 +4219,7 @@ class Database:
         )
         return result.matched_count == 1
 
-    async def retry_broadcast(
-        self, job_id, lock_token: str, error: Exception, delay_seconds: int
-    ) -> bool:
+    async def retry_broadcast(self, job_id, lock_token: str, error: Exception, delay_seconds: int) -> bool:
         if self.broadcast_col is None:
             return False
         result = await self.broadcast_col.update_one(
@@ -3994,9 +4269,11 @@ class Database:
     async def get_due_deletions(self, limit=100):
         if self.deletion_col is None:
             return []
-        cursor = self.deletion_col.find(
-            {"due_at": {"$lte": datetime.now(timezone.utc).timestamp()}}
-        ).sort("due_at", 1).limit(limit)
+        cursor = (
+            self.deletion_col.find({"due_at": {"$lte": datetime.now(timezone.utc).timestamp()}})
+            .sort("due_at", 1)
+            .limit(limit)
+        )
         return [doc async for doc in cursor]
 
     async def complete_deletion(self, job_id):

@@ -9,6 +9,7 @@ from pyrogram.errors import InputUserDeactivated, UserIsBlocked
 from pyrogram.enums import ParseMode
 from database.db import db
 from plugins.access_policy import authorize_user_action
+from plugins.callbacks import answer_callback_safely
 from plugins.telegram_retry import BACKGROUND_RETRY, telegram_call
 from utils import (
     ADMIN_ID,
@@ -30,13 +31,14 @@ logger = logging.getLogger(__name__)
 _COOLDOWN_MAX = 10000
 USER_REQUEST_COOLDOWN = OrderedDict()  # LRU: oldest entry is first
 COOLDOWN_TIME = 30  # seconds — long enough to stop rapid-fire spam, short
-                    # enough that requesting a few different titles in one
-                    # sitting is never blocked
+# enough that requesting a few different titles in one
+# sitting is never blocked
 
 
 async def _delayed_delete(msg, delay=2):
     """Queue transient-message cleanup without retaining a sleeping task."""
     await db.schedule_deletion(msg.chat.id, msg.id, delay)
+
 
 # ── /request command ──────────────────────────────────────────────────────────
 @Client.on_message(filters.command("request") & filters.private)
@@ -47,12 +49,14 @@ async def request_cmd(client: Client, message: Message):
     movie_name = message.text.split(" ", 1)[1][:40]
     await send_request_ticket(client, message.from_user, movie_name, message)
 
+
 # ── "Request This Movie" button (from filter.py's no-results screen) ──────────
 @Client.on_callback_query(filters.regex(r"^reqmovie#"))
 async def handle_movie_request(client: Client, callback: CallbackQuery):
     movie_name = callback.data.split("#", 1)[1]
-    await callback.answer("📤 Sending request...", show_alert=False)
+    await answer_callback_safely(callback, "📤 Sending request...", show_alert=False)
     await send_request_ticket(client, callback.from_user, movie_name, callback.message, is_callback=True)
+
 
 # ── Ticket generator ────────────────────────────────────────────────────────────
 async def send_request_ticket(client, user, movie_name, message_obj, is_callback=False):
@@ -62,7 +66,7 @@ async def send_request_ticket(client, user, movie_name, message_obj, is_callback
     # Store the same bounded title carried by the admin callback. Telegram's
     # 64-byte callback limit is easy to exceed with multibyte titles.
     request_prefix = f"reqdone#{user.id}#"
-    movie_name = callback_data(request_prefix, movie_name)[len(request_prefix):].strip()
+    movie_name = callback_data(request_prefix, movie_name)[len(request_prefix) :].strip()
     if not movie_name:
         return await message_obj.reply_text("Please include a valid movie title.")
 
@@ -85,7 +89,7 @@ async def send_request_ticket(client, user, movie_name, message_obj, is_callback
 
     config = access.config
     log_channel = config.get("log_channel", 0)
-    
+
     if not log_channel:
         return await message_obj.reply_text("Request system is currently offline — log channel not set.")
 
@@ -96,12 +100,16 @@ async def send_request_ticket(client, user, movie_name, message_obj, is_callback
     )
 
     # The button the admin will click when they upload it
-    markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            "✅ Mark Uploaded & Notify User",
-            callback_data=callback_data(request_prefix, movie_name),
-        )]
-    ])
+    markup = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Mark Uploaded & Notify User",
+                    callback_data=callback_data(request_prefix, movie_name),
+                )
+            ]
+        ]
+    )
 
     try:
         access = await authorize_user_action(user.id, "request")
@@ -129,23 +137,18 @@ async def send_request_ticket(client, user, movie_name, message_obj, is_callback
             "we'll notify you here once it's uploaded."
         )
 
-        user_markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🏠 Back to Home", callback_data="start_home")]
-        ])
+        user_markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🏠 Back to Home", callback_data="start_home")]]
+        )
 
         if is_callback:
-            await message_obj.edit_text(
-                success_msg, reply_markup=user_markup, parse_mode=ParseMode.HTML
-            )
+            await message_obj.edit_text(success_msg, reply_markup=user_markup, parse_mode=ParseMode.HTML)
         else:
-            await message_obj.reply_text(
-                success_msg, reply_markup=user_markup, parse_mode=ParseMode.HTML
-            )
+            await message_obj.reply_text(success_msg, reply_markup=user_markup, parse_mode=ParseMode.HTML)
     except Exception as error:
-        reference = report_internal_error(
-            logger, "request_ticket", error, user_id=user.id
-        )
+        reference = report_internal_error(logger, "request_ticket", error, user_id=user.id)
         await message_obj.reply_text(public_error_message(reference))
+
 
 # ── Admin taps "Mark Uploaded & Notify User" ───────────────────────────────────
 @Client.on_callback_query(filters.regex(r"^reqdone#") & filters.user(ADMIN_ID))
@@ -153,30 +156,31 @@ async def mark_request_done(client: Client, callback: CallbackQuery):
     try:
         parts = callback.data.split("#", 2)
         if len(parts) < 3:
-            return await callback.answer("❌ Malformed data.", show_alert=True)
+            return await answer_callback_safely(callback, "❌ Malformed data.", show_alert=True)
         _, user_id, movie_name = parts
     except Exception:
-        return await callback.answer("❌ Malformed data.", show_alert=True)
+        return await answer_callback_safely(callback, "❌ Malformed data.", show_alert=True)
 
     # _fulfill_matching_requests() (realtime_indexer.py) may have already
     # auto-notified this user and deleted the ticket between when it was
     # created and when an admin got around to tapping this button — check
     # first so we never send the same "your movie is ready" message twice.
     if not await db.pending_request_exists(int(user_id), movie_name):
-        await callback.answer("Already fulfilled automatically — no duplicate sent.", show_alert=True)
+        await answer_callback_safely(
+            callback, "Already fulfilled automatically — no duplicate sent.", show_alert=True
+        )
         resolved_text = _html(callback.message.text) + (
-            "\n\nℹ️ <b>Already auto-fulfilled</b> — acknowledged by: "
-            f"{html_user_mention(callback.from_user)}"
+            f"\n\nℹ️ <b>Already auto-fulfilled</b> — acknowledged by: {html_user_mention(callback.from_user)}"
         )
         await callback.message.edit_text(resolved_text, parse_mode=ParseMode.HTML)
         return
 
-    await callback.answer("Notifying user...", show_alert=False)
+    await answer_callback_safely(callback, "Notifying user...", show_alert=False)
 
     # Notify the User
     try:
         # Deep-link payload can't contain spaces — swap them for underscores
-        safe_name = re.sub(r'[^a-zA-Z0-9]', '_', movie_name)
+        safe_name = re.sub(r"[^a-zA-Z0-9]", "_", movie_name)
 
         notify_text = (
             "🎉 <b>Good news</b>\n\n"
@@ -184,12 +188,19 @@ async def mark_request_done(client: Client, callback: CallbackQuery):
             "has just been uploaded.\n\n"
             "Tap below to fetch it instantly."
         )
-        
+
         # The button now triggers the search_ payload we built in start.py!
-        markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔍 Fetch Movie Now", url=f"https://t.me/{client.me.username}?start=search_{safe_name}")]
-        ])
-        
+        markup = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "🔍 Fetch Movie Now",
+                        url=f"https://t.me/{client.me.username}?start=search_{safe_name}",
+                    )
+                ]
+            ]
+        )
+
         await telegram_call(
             lambda: client.send_message(
                 chat_id=int(user_id),
@@ -214,12 +225,12 @@ async def mark_request_done(client: Client, callback: CallbackQuery):
             f"{html_user_mention(callback.from_user)}"
         )
         await callback.message.edit_text(resolved_text, parse_mode=ParseMode.HTML)
-        return await callback.answer("⚠️ User has blocked the bot — removed from database.", show_alert=True)
-    except Exception as error:
-        reference = report_internal_error(
-            logger, "request_notify", error, user_id=user_id
+        return await answer_callback_safely(
+            callback, "⚠️ User has blocked the bot — removed from database.", show_alert=True
         )
-        return await callback.answer(public_error_message(reference), show_alert=True)
+    except Exception as error:
+        reference = report_internal_error(logger, "request_notify", error, user_id=user_id)
+        return await answer_callback_safely(callback, public_error_message(reference), show_alert=True)
 
     # Update the Admin Ticket so you know it's done
     resolved_text = _html(callback.message.text) + (

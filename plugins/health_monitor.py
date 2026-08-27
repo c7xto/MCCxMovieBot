@@ -2,6 +2,7 @@
 Background tasks started from bot.py:
   - Health monitor — pings clusters every 10 min, alerts on issues
 """
+
 import asyncio
 import datetime
 import logging
@@ -13,6 +14,7 @@ from pyrogram import Client, filters
 from pyrogram.errors import FloodWait
 from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from database.db import db
+from plugins.callbacks import answer_callback_safely
 from plugins.filter import send_smart_log
 from plugins.workload import workload_snapshot
 from plugins.telegram_retry import (
@@ -88,10 +90,10 @@ async def check_all_channels(client, config):
 
     async def _check(label, ch_id, fix=None):
         if not ch_id or ch_id in [0, "", None]:
-            return {"label": label, "ok": None, "fix": fix,
-                    "text": f"{label}: ⚪ Not configured"}
+            return {"label": label, "ok": None, "fix": fix, "text": f"{label}: ⚪ Not configured"}
         try:
-            ch = int(ch_id) if str(ch_id).lstrip('-').isdigit() else str(ch_id)
+            ch = int(ch_id) if str(ch_id).lstrip("-").isdigit() else str(ch_id)
+
             async def _read_channel():
                 await client.get_chat(ch)
                 return await client.get_chat_member(ch, client.me.id)
@@ -105,25 +107,38 @@ async def check_all_channels(client, config):
             )
             status = member.status.name
             if status == "ADMINISTRATOR":
-                return {"label": label, "ok": True, "fix": fix,
-                        "text": f"{label}: ✅ Admin — `{ch_id}`"}
+                return {"label": label, "ok": True, "fix": fix, "text": f"{label}: ✅ Admin — `{ch_id}`"}
             elif status == "MEMBER":
-                return {"label": label, "ok": False, "fix": fix,
-                        "text": f"{label}: ⚠️ Member only — `{ch_id}`"}
+                return {
+                    "label": label,
+                    "ok": False,
+                    "fix": fix,
+                    "text": f"{label}: ⚠️ Member only — `{ch_id}`",
+                }
             else:
-                return {"label": label, "ok": False, "fix": fix,
-                        "text": f"{label}: ❓ Status `{status}` — `{ch_id}`"}
+                return {
+                    "label": label,
+                    "ok": False,
+                    "fix": fix,
+                    "text": f"{label}: ❓ Status `{status}` — `{ch_id}`",
+                }
         except FloodWait as e:
-            return {"label": label, "ok": False, "fix": fix,
-                    "text": f"{label}: ⏳ Rate-limited ({e.value}s), retry later — `{ch_id}`"}
+            return {
+                "label": label,
+                "ok": False,
+                "fix": fix,
+                "text": f"{label}: ⏳ Rate-limited ({e.value}s), retry later — `{ch_id}`",
+            }
         except Exception as error:
-            reference = report_internal_error(
-                logger, "channel_health", error, channel_id=ch_id
-            )
-            return {"label": label, "ok": False, "fix": fix,
-                    "text": f"{label}: ❌ No access — `{ch_id}`\n  Reference: `{reference}`"}
+            reference = report_internal_error(logger, "channel_health", error, channel_id=ch_id)
+            return {
+                "label": label,
+                "ok": False,
+                "fix": fix,
+                "text": f"{label}: ❌ No access — `{ch_id}`\n  Reference: `{reference}`",
+            }
 
-    results.append(await _check("📡 Log Channel",    config.get("log_channel"), fix="edit_logchannel"))
+    results.append(await _check("📡 Log Channel", config.get("log_channel"), fix="edit_logchannel"))
     results.append(await _check("📢 Update Channel", config.get("update_channel_id"), fix="edit_updatechid"))
 
     for i, ch in enumerate(config.get("db_channels", []), 1):
@@ -154,27 +169,36 @@ async def check_known_issues(client, config):
         except Exception:
             continue
         if size_mb >= 450:
-            findings.append({
-                "label": f"Cluster {i+1}", "ok": False,
-                "text": f"🛑 Cluster {i+1} is at its 450MB safety margin (`{size_mb:.0f} MB`) "
-                        f"— new saves will skip it. Add `DATABASE_URI_{i+2}`."
-            })
+            findings.append(
+                {
+                    "label": f"Cluster {i + 1}",
+                    "ok": False,
+                    "text": f"🛑 Cluster {i + 1} is at its 450MB safety margin (`{size_mb:.0f} MB`) "
+                    f"— new saves will skip it. Add `DATABASE_URI_{i + 2}`.",
+                }
+            )
         elif size_mb >= 400:
-            findings.append({
-                "label": f"Cluster {i+1}", "ok": False,
-                "text": f"⚠️ Cluster {i+1} is approaching its safety margin (`{size_mb:.0f} MB` / 450 MB)."
-            })
+            findings.append(
+                {
+                    "label": f"Cluster {i + 1}",
+                    "ok": False,
+                    "text": f"⚠️ Cluster {i + 1} is approaching its safety margin (`{size_mb:.0f} MB` / 450 MB).",
+                }
+            )
 
     # ── Whitelist mode with nothing whitelisted ───────────────────────────────
     if config.get("group_whitelist_mode", "blacklist") == "whitelist":
         try:
             groups = await db.get_all_groups()
             if not any(g.get("whitelisted") for g in groups):
-                findings.append({
-                    "label": "Group Whitelist", "ok": False,
-                    "text": "⚠️ Whitelist mode is ON but no group is whitelisted — the bot "
-                            "will leave every group it's added to. Approve groups in Group Manager."
-                })
+                findings.append(
+                    {
+                        "label": "Group Whitelist",
+                        "ok": False,
+                        "text": "⚠️ Whitelist mode is ON but no group is whitelisted — the bot "
+                        "will leave every group it's added to. Approve groups in Group Manager.",
+                    }
+                )
         except Exception:
             pass
 
@@ -187,31 +211,40 @@ async def check_known_issues(client, config):
     if len([c for c in config.get("two_stage_channels", []) if c]) >= 2:
         gates_active.append("Two-Stage Verification")
     if len(gates_active) >= 2:
-        findings.append({
-            "label": "Verification Gates", "ok": None,
-            "text": f"ℹ️ {len(gates_active)} verification gates are active at once "
-                    f"({', '.join(gates_active)}) — a new user may face multiple "
-                    f"join-and-confirm steps for one file."
-        })
+        findings.append(
+            {
+                "label": "Verification Gates",
+                "ok": None,
+                "text": f"ℹ️ {len(gates_active)} verification gates are active at once "
+                f"({', '.join(gates_active)}) — a new user may face multiple "
+                f"join-and-confirm steps for one file.",
+            }
+        )
 
     # ── Stale indexer tasks ───────────────────────────────────────────────────
     try:
         stale = await db.get_stale_index_tasks(older_than_seconds=7200)
         if stale:
             stale_ids = [s["_id"] for s in stale]
-            findings.append({
-                "label": "Indexer", "ok": False,
-                "text": f"⚠️ Indexer task(s) stuck \"running\" for 2h+: `{stale_ids}` — may have crashed."
-            })
+            findings.append(
+                {
+                    "label": "Indexer",
+                    "ok": False,
+                    "text": f'⚠️ Indexer task(s) stuck "running" for 2h+: `{stale_ids}` — may have crashed.',
+                }
+            )
     except Exception:
         pass
 
     # ── TMDB key ───────────────────────────────────────────────────────────────
     if not (os.getenv("TMDB_BEARER_TOKEN") or os.getenv("TMDB_API_READ_TOKEN")):
-        findings.append({
-            "label": "TMDB", "ok": None,
-            "text": "ℹ️ `TMDB_BEARER_TOKEN` is not set — new-upload announcements will post without a poster/rating."
-        })
+        findings.append(
+            {
+                "label": "TMDB",
+                "ok": None,
+                "text": "ℹ️ `TMDB_BEARER_TOKEN` is not set — new-upload announcements will post without a poster/rating.",
+            }
+        )
 
     if not findings:
         findings.append({"label": "All clear", "ok": True, "text": "✅ No known issues detected."})
@@ -252,27 +285,24 @@ async def run_health_monitor(client):
 
         # ── 1. Ping all clusters ──────────────────────────────────────────────
         for i, db_instance in enumerate(db.dbs):
-            key = f"cluster_{i+1}_down"
+            key = f"cluster_{i + 1}_down"
             try:
                 await db_instance.command("ping")
                 # If we previously alerted about this cluster, send recovery notice
                 if key in _last_alert:
                     await _clear_alert(key)
                     await send_smart_log(
-                        client,
-                        f"✅ **#ClusterRecovered**\n\nCluster {i+1} is back online."
+                        client, f"✅ **#ClusterRecovered**\n\nCluster {i + 1} is back online."
                     )
             except Exception as error:
-                reference = report_internal_error(
-                    logger, "cluster_health", error, cluster=i + 1
-                )
-                issues.append(f"Cluster {i+1} unreachable ({reference})")
+                reference = report_internal_error(logger, "cluster_health", error, cluster=i + 1)
+                issues.append(f"Cluster {i + 1} unreachable ({reference})")
                 if await _should_alert(key):
                     await send_smart_log(
                         client,
-                        f"🚨 **#HealthAlert — Cluster {i+1} Down**\n\n"
-                        f"MongoDB Cluster {i+1} is not responding.\n"
-                        f"Reference: `{reference}`"
+                        f"🚨 **#HealthAlert — Cluster {i + 1} Down**\n\n"
+                        f"MongoDB Cluster {i + 1} is not responding.\n"
+                        f"Reference: `{reference}`",
                     )
 
         # ── 2. Check for stale indexer tasks ──────────────────────────────────
@@ -288,7 +318,7 @@ async def run_health_monitor(client):
                         f"⚠️ **#HealthAlert — Stale Indexer**\n\n"
                         f"The following indexer tasks have been running for >2 hours "
                         f"and may have crashed:\n`{stale_ids}`\n\n"
-                        f"Use /admin to stop them manually."
+                        f"Use /admin to stop them manually.",
                     )
             else:
                 _last_alert.pop(key, None)
@@ -308,9 +338,7 @@ async def run_health_monitor(client):
                     registry_stats["checked"],
                 )
             if registry_stats["unresolved"]:
-                issues.append(
-                    f"Registry entries unresolved: {registry_stats['unresolved']}"
-                )
+                issues.append(f"Registry entries unresolved: {registry_stats['unresolved']}")
                 if await _should_alert(key):
                     await send_smart_log(
                         client,
@@ -322,9 +350,7 @@ async def run_health_monitor(client):
             else:
                 _last_alert.pop(key, None)
         except Exception as exc:
-            logger.warning(
-                "Registry reconciliation failed: %s", type(exc).__name__
-            )
+            logger.warning("Registry reconciliation failed: %s", type(exc).__name__)
 
         # Heartbeat removed — was noise in log channel
 
@@ -363,12 +389,16 @@ async def _dead_letter_deletion(client, job, error, *, permanent):
         f"Attempts: `{int(job.get('attempts', 0)) + 1}`\n"
         f"Error: `{type(error).__name__}`\n\n"
         "The job was retained and can be retried below.",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton(
-                "Retry deletion",
-                callback_data=f"retry_deletion#{dead_letter_id}",
-            )
-        ]]),
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "Retry deletion",
+                        callback_data=f"retry_deletion#{dead_letter_id}",
+                    )
+                ]
+            ]
+        ),
     )
     return "dead_lettered"
 
@@ -388,12 +418,8 @@ async def process_deletion_job(client, job):
     except FloodWait as error:
         attempts = int(job.get("attempts", 0))
         if attempts + 1 >= MAX_DELETION_ATTEMPTS:
-            return await _dead_letter_deletion(
-                client, job, error, permanent=False
-            )
-        await db.retry_deletion(
-            job["_id"], deletion_retry_delay(attempts, error.value)
-        )
+            return await _dead_letter_deletion(client, job, error, permanent=False)
+        await db.retry_deletion(job["_id"], deletion_retry_delay(attempts, error.value))
         return "retry_scheduled"
     except Exception as error:
         classification = classify_deletion_error(error)
@@ -412,17 +438,19 @@ async def process_deletion_job(client, job):
         return "retry_scheduled"
 
 
-@Client.on_callback_query(
-    filters.regex(r"^retry_deletion#") & filters.user(ADMIN_ID)
-)
+@Client.on_callback_query(filters.regex(r"^retry_deletion#") & filters.user(ADMIN_ID))
 async def retry_dead_letter_callback(client: Client, callback: CallbackQuery):
     job_id = callback.data.split("#", 1)[1]
     retried = await db.retry_dead_letter_deletion(job_id)
     if not retried:
-        await callback.answer("Deletion job is missing or was already retried.", show_alert=True)
+        await answer_callback_safely(
+            callback,
+            "Deletion job is missing or was already retried.",
+            show_alert=True,
+        )
         return
     await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.answer("Deletion queued for retry.", show_alert=True)
+    await answer_callback_safely(callback, "Deletion queued for retry.", show_alert=True)
 
 
 async def run_deletion_worker(client):
@@ -448,9 +476,7 @@ async def run_deletion_worker(client):
                             deletion_retry_delay(int(job.get("attempts", 0))),
                         )
                     except Exception:
-                        logger.exception(
-                            "Could not defer deletion job after processing failure"
-                        )
+                        logger.exception("Could not defer deletion job after processing failure")
         except Exception as e:
             logger.error("Deletion worker iteration failed: %s", e)
             await asyncio.sleep(10)
