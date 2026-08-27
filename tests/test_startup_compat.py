@@ -34,3 +34,15 @@ def test_startup_check_avoids_deprecated_get_event_loop_call():
     }
     assert "get_event_loop" not in calls
     assert "get_running_loop" in calls
+
+
+def test_python_sources_do_not_use_invalid_logging_comma_specifier():
+    project_root = BOT_SOURCE.parent
+    invalid_specifier = "%" + ",d"
+    offenders = [
+        path.relative_to(project_root).as_posix()
+        for path in project_root.rglob("*.py")
+        if not any(part.startswith(".venv") for part in path.parts)
+        and invalid_specifier in path.read_text(encoding="utf-8", errors="replace")
+    ]
+    assert offenders == []

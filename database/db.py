@@ -838,8 +838,8 @@ class Database:
                         scanned += 1
                         if scanned % 100000 == 0:
                             logger.info(
-                                "🔤 Search catalog: %,d files → %,d titles",
-                                scanned, len(titles),
+                                "🔤 Search catalog: %s files → %s titles",
+                                f"{scanned:,}", f"{len(titles):,}",
                             )
                 except Exception as exc:
                     logger.warning(
@@ -847,8 +847,8 @@ class Database:
                         cluster_number, exc,
                     )
                 logger.info(
-                    "🔤 Search catalog cluster %s complete: %,d files",
-                    cluster_number, cluster_count,
+                    "🔤 Search catalog cluster %s complete: %s files",
+                    cluster_number, f"{cluster_count:,}",
                 )
 
             if not titles:
@@ -867,8 +867,8 @@ class Database:
             _SEARCH_TITLE_CATALOG = sorted_titles
             self._invalidate_file_count()
             logger.info(
-                "✅ Fuzzy-search catalog ready: %,d titles from %,d files in %.1fs",
-                len(sorted_titles), scanned, time.monotonic() - started,
+                "✅ Fuzzy-search catalog ready: %s titles from %s files in %.1fs",
+                f"{len(sorted_titles):,}", f"{scanned:,}", time.monotonic() - started,
             )
             return len(sorted_titles)
         finally:
