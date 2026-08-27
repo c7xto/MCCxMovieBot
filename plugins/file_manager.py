@@ -186,7 +186,7 @@ async def fm_dupes_page(client: Client, callback: CallbackQuery):
 @Client.on_callback_query(filters.regex(r"^fm_dupe_review#") & filters.user(ADMIN_ID))
 async def fm_review_duplicate_group(client: Client, callback: CallbackQuery):
     await callback.answer(
-        "Report only: deletion will be added only after you approve the report.",
+        "Yellow matches are never deleted because metadata alone is not proof.",
         show_alert=True,
     )
 
@@ -194,9 +194,123 @@ async def fm_review_duplicate_group(client: Client, callback: CallbackQuery):
 @Client.on_callback_query(filters.regex(r"^fm_dupe_delete#") & filters.user(ADMIN_ID))
 async def fm_delete_duplicate_group(client: Client, callback: CallbackQuery):
     await callback.answer(
-        "Deletion is disabled in report-only mode. No files were changed.",
+        "Use verified exact cleanup. Yellow matches remain protected.",
         show_alert=True,
     )
+
+
+@Client.on_callback_query(filters.regex(r"^fm_dupes_cleanup$") & filters.user(ADMIN_ID))
+async def fm_verified_cleanup_prompt(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback)
+    report = _cached_dupes.get(callback.from_user.id)
+    if not report:
+        await callback.message.edit_text(
+            "⚠️ Scan results expired. Run the duplicate report again.",
+            reply_markup=_BACK_BTN,
+        )
+        return
+    exact_extras = int(report["summary"].get("exact_extras", 0))
+    if exact_extras <= 0:
+        await callback.message.edit_text(
+            "✅ No Telegram-verified exact copies were found.",
+            reply_markup=_BACK_BTN,
+        )
+        return
+    await callback.message.edit_text(
+        "🧹 **Verified Exact Cleanup**\n\n"
+        f"Telegram proved `{exact_extras:,}` rows point to media already stored "
+        "elsewhere in your database.\n\n"
+        "✅ One database row will be kept for every Telegram file.\n"
+        "✅ Only extra MongoDB rows will be removed.\n"
+        "✅ Telegram channel files and messages will not be touched.\n"
+        "🔒 Yellow metadata-only matches will not be touched.\n\n"
+        "Continue with the strict cleanup?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                f"✅ Remove {exact_extras:,} exact copies",
+                callback_data="fm_dupes_cleanup_confirm",
+            )],
+            [InlineKeyboardButton("‹ Cancel", callback_data="file_manager_menu")],
+        ]),
+    )
+
+
+@Client.on_callback_query(
+    filters.regex(r"^fm_dupes_cleanup_confirm$") & filters.user(ADMIN_ID)
+)
+async def fm_verified_cleanup_confirm(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback, "🧹 Starting verified cleanup…")
+    status = await callback.message.edit_text(
+        "🧹 **Verified Exact Cleanup • Starting**\n\n"
+        "Preparing the survivor list. Yellow matches remain protected."
+    )
+    try:
+        supervisor.spawn(
+            _run_verified_cleanup(status, callback.from_user.id),
+            key="maintenance:verified-duplicate-cleanup",
+            owner=f"admin:{callback.from_user.id}",
+            resources=("movie-catalog",),
+            drain_on_shutdown=True,
+        )
+    except TaskConflict as exc:
+        await status.edit_text(f"⚠️ **Cleanup not started:** `{exc}`")
+
+
+async def _run_verified_cleanup(status_msg, admin_id):
+    last_update = 0.0
+    latest = {"scanned": 0, "deleted": 0, "total": 0}
+
+    async def show_progress(progress):
+        nonlocal last_update, latest
+        latest = progress
+        now = time.monotonic()
+        if now - last_update < 3.0:
+            return
+        last_update = now
+        scanned = int(progress.get("scanned", 0))
+        total = max(scanned, int(progress.get("total", 0)))
+        deleted = int(progress.get("deleted", 0))
+        elapsed = max(0.1, float(progress.get("elapsed", 0.1)))
+        speed = scanned / elapsed
+        remaining = max(0, total - scanned)
+        eta = int(remaining / speed) if speed > 0 else 0
+        percent = min(100.0, scanned * 100 / max(1, total))
+        filled = min(10, int(percent / 10))
+        bar = "▰" * filled + "▱" * (10 - filled)
+        eta_text = "Calculating…" if speed <= 0 else f"{eta // 60}m {eta % 60}s"
+        await status_msg.edit_text(
+            "🧹 **Verified Exact Cleanup • Running**\n\n"
+            f"`{bar}`  **{percent:.1f}%**\n"
+            f"📂 Cluster `{progress.get('cluster', 1)}/"
+            f"{progress.get('clusters', 1)}`\n"
+            f"🔎 Checked  `{scanned:,} / {total:,}`\n"
+            f"🗑 Removed  `{deleted:,}` verified copies\n"
+            f"⚡ Speed    `{speed:,.0f} files/s`\n"
+            f"⌛ ETA      `{eta_text}`\n\n"
+            "🔒 One copy is kept • yellow matches are untouched"
+        )
+
+    try:
+        result = await db.delete_verified_duplicates(show_progress)
+        _cached_dupes.pop(admin_id, None)
+        await status_msg.edit_text(
+            "✅ **Verified Exact Cleanup Complete**\n\n"
+            f"🗑 Removed: `{result['deleted']:,}` exact copies\n"
+            f"📚 Remaining: `{result['remaining']:,}` files\n\n"
+            "🔒 Metadata-only possible matches were not touched.\n"
+            "📢 Telegram channel messages were not touched.",
+            reply_markup=_BACK_BTN,
+        )
+    except Exception as error:
+        reference = report_internal_error(logger, "verified_duplicate_cleanup", error)
+        await status_msg.edit_text(
+            "❌ **Verified Cleanup Stopped Safely**\n\n"
+            f"Checked: `{int(latest.get('scanned', 0)):,}`\n"
+            f"Removed before stop: `{int(latest.get('deleted', 0)):,}`\n"
+            "A verified survivor was always kept. Run the report again to resume.\n\n"
+            f"Reference: `{reference}`",
+            reply_markup=_BACK_BTN,
+        )
 
 
 async def _run_duplicate_scan(client, status_msg, admin_id):
@@ -301,12 +415,13 @@ async def _show_dupes_page(msg_or_callback, report, page=0):
     text = (
         f"🧬 **Duplicate Report • Page {page+1}/{total_pages}**\n\n"
         f"📨 Scanned: `{summary['scanned']:,}` files\n"
-        f"🟠 Exact: `{summary['exact_groups']:,}` groups • "
+        f"🟢 Telegram-verified: `{summary['exact_groups']:,}` groups • "
         f"`{summary['exact_extras']:,}` extra copies\n"
-        f"🟡 Probable: `{summary['probable_groups']:,}` groups • "
+        f"🟡 Metadata-only: `{summary['probable_groups']:,}` groups • "
         f"`{summary['probable_matches']:,}` matches\n\n"
-        f"🔒 **Report only. Nothing was deleted.**\n"
-        f"Language, quality, codec, size, season and episode variants are preserved.\n\n"
+        f"🔒 **Nothing was deleted during this report.**\n"
+        f"Only green Telegram-verified copies can be cleaned.\n"
+        f"Yellow matches and release variants remain protected.\n\n"
     )
 
     buttons = []
@@ -314,7 +429,7 @@ async def _show_dupes_page(msg_or_callback, report, page=0):
         name = dupe['name'][:35]
         count = dupe['count']
         dtype = dupe.get('type', 'exact')
-        type_icon = "🟠" if dtype == "exact" else "🟡"
+        type_icon = "🟢" if dtype == "exact" else "🟡"
         size_mb = dupe.get('size', 0) / (1024 * 1024)
         size_str = f"{size_mb:.0f}MB" if size_mb > 0 else ""
         label = "copies" if dtype == "exact" else "possible matches"
@@ -330,6 +445,12 @@ async def _show_dupes_page(msg_or_callback, report, page=0):
         nav.append(InlineKeyboardButton("Next ▶️", callback_data=f"fm_dupes_page#{page+1}"))
     if nav:
         buttons.append(nav)
+
+    if int(summary.get("exact_extras", 0)) > 0:
+        buttons.append([InlineKeyboardButton(
+            f"🧹 Remove {summary['exact_extras']:,} verified copies",
+            callback_data="fm_dupes_cleanup",
+        )])
 
     buttons.append([InlineKeyboardButton("🔙 Back to File Manager", callback_data="file_manager_menu")])
 

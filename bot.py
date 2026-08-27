@@ -212,6 +212,14 @@ class AutoFilterBot(Client):
                 "Run `python tools/migrate_registry.py` once before starting the bot."
             )
 
+        try:
+            await db._recover_duplicate_cleanup_registry()
+        except Exception as error:
+            logger.warning(
+                "Interrupted duplicate-cleanup registry repair was deferred: %s",
+                type(error).__name__,
+            )
+
         db._search_tokens_complete = not await db.search_tokens_need_migration()
         if not db._search_tokens_complete:
             logger.info(

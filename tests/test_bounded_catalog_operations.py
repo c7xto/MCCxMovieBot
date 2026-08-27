@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+from pyrogram.file_id import FileId, FileType
 
 
 try:
@@ -25,11 +26,17 @@ from database.db import (
     MAX_DUPLICATE_GROUPS,
     MAX_SEARCH_CATALOG_TITLES,
     _initialize_duplicate_spool,
+    _initialize_verified_cleanup_spool,
+    _classify_verified_duplicate_batch,
+    _clear_cleanup_registry_ids,
+    _read_cleanup_registry_ids,
     _read_duplicate_groups,
     _read_duplicate_report,
+    _stage_cleanup_registry_ids,
     _spool_duplicate_batch,
     normalize_duplicate_name,
     probable_duplicate_name,
+    telegram_file_identity,
 )
 
 
@@ -41,6 +48,12 @@ class _FakeCursor:
         self._documents = list(documents)
 
     def batch_size(self, _size):
+        return self
+
+    def sort(self, key, direction):
+        self._documents.sort(
+            key=lambda document: document.get(key), reverse=direction < 0
+        )
         return self
 
     def __aiter__(self):
@@ -58,8 +71,49 @@ class _FakeCollection:
     def __init__(self, documents):
         self._documents = documents
 
-    def find(self, *_args, **_kwargs):
-        return _FakeCursor(self._documents)
+    def find(self, query=None, *_args, **_kwargs):
+        query = query or {}
+
+        def matches(document):
+            for key, condition in query.items():
+                value = document.get(key)
+                if isinstance(condition, dict) and "$in" in condition:
+                    if value not in condition["$in"]:
+                        return False
+                elif isinstance(condition, dict):
+                    if condition.get("$exists") and key not in document:
+                        return False
+                    if "$ne" in condition and value == condition["$ne"]:
+                        return False
+                elif value != condition:
+                    return False
+            return True
+
+        return _FakeCursor([doc for doc in self._documents if matches(doc)])
+
+    async def delete_many(self, query):
+        object_ids = set(query.get("_id", {}).get("$in", []))
+        before = len(self._documents)
+        self._documents[:] = [
+            document
+            for document in self._documents
+            if document.get("_id") not in object_ids
+        ]
+        return SimpleNamespace(deleted_count=before - len(self._documents))
+
+
+class _FakeRegistry:
+    def __init__(self):
+        self.deleted_queries = []
+        self.repairs = []
+
+    async def delete_many(self, query):
+        self.deleted_queries.append(query)
+        return SimpleNamespace(deleted_count=1)
+
+    async def bulk_write(self, operations, ordered=False):
+        self.repairs.extend(operations)
+        return SimpleNamespace(modified_count=len(operations))
 
 
 class BoundedCatalogTests(unittest.TestCase):
@@ -119,6 +173,114 @@ class BoundedCatalogTests(unittest.TestCase):
         self.assertEqual(exact_report["summary"]["probable_groups"], 0)
         self.assertEqual(probable_report["summary"]["exact_groups"], 0)
         self.assertEqual(probable_report["summary"]["probable_groups"], 1)
+
+    def test_telegram_media_identity_ignores_refreshable_file_reference(self):
+        first = FileId(
+            file_type=FileType.VIDEO,
+            dc_id=4,
+            file_reference=b"first-reference",
+            media_id=987654321,
+            access_hash=111,
+        ).encode()
+        refreshed = FileId(
+            file_type=FileType.VIDEO,
+            dc_id=4,
+            file_reference=b"new-reference",
+            media_id=987654321,
+            access_hash=222,
+        ).encode()
+
+        self.assertNotEqual(first, refreshed)
+        self.assertEqual(
+            telegram_file_identity(first), telegram_file_identity(refreshed)
+        )
+
+    def test_verified_cleanup_classifies_only_same_telegram_media(self):
+        def file_id(media_id, reference):
+            return FileId(
+                file_type=FileType.VIDEO,
+                dc_id=4,
+                file_reference=reference,
+                media_id=media_id,
+                access_hash=media_id * 10,
+            ).encode()
+
+        documents = [
+            {"_id": "keep", "file_id": file_id(10, b"new")},
+            {"_id": "remove", "file_id": file_id(10, b"old")},
+            {"_id": "different", "file_id": file_id(11, b"other")},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = str(Path(directory) / "cleanup.sqlite3")
+            _initialize_verified_cleanup_spool(database_path)
+            duplicates = _classify_verified_duplicate_batch(
+                database_path, documents
+            )
+            _stage_cleanup_registry_ids(database_path, ["one", "two", "one"])
+            pending = _read_cleanup_registry_ids(database_path)
+            _clear_cleanup_registry_ids(database_path, ["one", "two"])
+            cleared = _read_cleanup_registry_ids(database_path)
+
+        self.assertEqual([item["_id"] for item in duplicates], ["remove"])
+        self.assertEqual(set(pending), {"one", "two"})
+        self.assertEqual(cleared, [])
+
+    def test_verified_cleanup_keeps_newer_row_and_repairs_registry(self):
+        def file_id(media_id, reference):
+            return FileId(
+                file_type=FileType.VIDEO,
+                dc_id=4,
+                file_reference=reference,
+                media_id=media_id,
+                access_hash=media_id * 10,
+            ).encode()
+
+        shared_file_id = file_id(25, b"shared")
+        old_copy = {
+            "_id": "1",
+            "file_id": shared_file_id,
+            "file_name": "Movie 2026.mkv",
+            "file_size": 100,
+            "mime_type": "video/x-matroska",
+        }
+        newest_copy = {
+            "_id": "3",
+            "file_id": shared_file_id,
+            "file_name": "Movie 2026.mkv",
+            "file_size": 100,
+            "mime_type": "video/x-matroska",
+        }
+        different = {
+            "_id": "2",
+            "file_id": file_id(26, b"different"),
+            "file_name": "Other 2026.mkv",
+            "file_size": 200,
+            "mime_type": "video/x-matroska",
+        }
+        older_cluster = _FakeCollection([old_copy])
+        newer_cluster = _FakeCollection([different, newest_copy])
+        database = Database.__new__(Database)
+        database.file_cols = [older_cluster, newer_cluster]
+        database.registry_col = _FakeRegistry()
+        database.get_total_files = AsyncMock(side_effect=[3, 2])
+        progress = []
+
+        async def collect_progress(update):
+            progress.append(update)
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "database.db._DUPLICATE_SCAN_DIR", Path(directory)
+        ):
+            result = asyncio.run(
+                database.delete_verified_duplicates(collect_progress)
+            )
+
+        self.assertEqual(result["deleted"], 1)
+        self.assertEqual(result["remaining"], 2)
+        self.assertEqual(older_cluster._documents, [])
+        self.assertEqual(len(newer_cluster._documents), 2)
+        self.assertTrue(database.registry_col.repairs)
+        self.assertEqual(progress[-1]["deleted"], 1)
 
     def test_full_duplicate_scan_reports_live_phases_and_cleans_spools(self):
         documents = [

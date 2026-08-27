@@ -22,6 +22,7 @@ from pymongo import AsyncMongoClient, InsertOne, ReturnDocument, UpdateOne
 from pymongo.errors import DuplicateKeyError, BulkWriteError
 from dotenv import load_dotenv
 from rapidfuzz import fuzz, process
+from pyrogram.file_id import DOCUMENT_TYPES, FileId
 from database.index_policy import (
     RequiredIndexError,
     ensure_required_index,
@@ -56,6 +57,7 @@ MAX_SEARCH_CATALOG_TITLES = min(
 MAX_DUPLICATE_GROUPS = 100
 MAX_DUPLICATE_IDS_PER_GROUP = 1000
 _DUPLICATE_HASH_BYTES = 12
+_VERIFIED_CLEANUP_BATCH_SIZE = 2000
 MAX_NOTIFICATION_OUTBOX_JOBS = 5000
 MAX_REQUEST_MATCHES_PER_JOB = 100
 MAX_CONFIG_BACKUP_KEYS = 50
@@ -590,11 +592,35 @@ def probable_duplicate_name(name: str) -> str:
     return _DUPE_WS_RE.sub(" ", normalized).strip().casefold()
 
 
+def telegram_file_identity(file_id: str) -> str:
+    """Derive Telegram's stable document identity from a reusable file ID.
+
+    For documents, videos and audio, Telegram's own ``file_unique_id`` is
+    based on this media ID. File references and access hashes may change when
+    the same media is encountered again, so comparing the complete file_id
+    incorrectly treats those exact copies as different files.
+    """
+    if not file_id:
+        return ""
+    try:
+        decoded = FileId.decode(file_id)
+    except Exception:
+        # Legacy/imported rows may contain Bot API IDs from older layouts or
+        # malformed text. Falling back keeps the scan stable and conservative.
+        return ""
+    if decoded.file_type not in DOCUMENT_TYPES or decoded.media_id is None:
+        return ""
+    return f"telegram-document:{int(decoded.media_id)}"
+
+
 def _duplicate_fingerprints(document: dict) -> tuple[bytes | None, bytes | None]:
     """Return compact exact/probable identities without retaining user data."""
     file_id = str(document.get("file_id", "") or "")
     unique_id = str(document.get("file_unique_id", "") or "")
-    exact_value = f"u:{unique_id}" if unique_id else (f"f:{file_id}" if file_id else "")
+    telegram_identity = telegram_file_identity(file_id)
+    exact_value = telegram_identity or (
+        f"u:{unique_id}" if unique_id else (f"f:{file_id}" if file_id else "")
+    )
     if not exact_value:
         return None, None
 
@@ -700,6 +726,80 @@ def _sqlite_table_exists(connection: sqlite3.Connection, table: str) -> bool:
     return connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
     ).fetchone() is not None
+
+
+def _initialize_verified_cleanup_spool(database_path: str):
+    """Create the compact survivor set used by strict duplicate cleanup."""
+    with closing(sqlite3.connect(database_path, timeout=30)) as connection:
+        _configure_duplicate_spool(connection)
+        with connection:
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS exact_survivors ("
+                "key BLOB PRIMARY KEY) WITHOUT ROWID"
+            )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS pending_registry ("
+                "file_id TEXT PRIMARY KEY) WITHOUT ROWID"
+            )
+
+
+def _classify_verified_duplicate_batch(
+    database_path: str, documents: list[dict]
+) -> list[dict]:
+    """Return rows whose exact Telegram identity already has a survivor."""
+    duplicates = []
+    with closing(sqlite3.connect(database_path, timeout=30)) as connection:
+        _configure_duplicate_spool(connection)
+        with connection:
+            for document in documents:
+                exact_key, _probable_key = _duplicate_fingerprints(document)
+                if exact_key is None:
+                    continue
+                inserted = connection.execute(
+                    "INSERT OR IGNORE INTO exact_survivors (key) VALUES (?)",
+                    (exact_key,),
+                ).rowcount
+                if not inserted:
+                    duplicates.append(document)
+    return duplicates
+
+
+def _stage_cleanup_registry_ids(database_path: str, file_ids: list[str]):
+    rows = [(file_id,) for file_id in dict.fromkeys(file_ids) if file_id]
+    if not rows:
+        return
+    with closing(sqlite3.connect(database_path, timeout=30)) as connection:
+        _configure_duplicate_spool(connection)
+        with connection:
+            connection.executemany(
+                "INSERT OR IGNORE INTO pending_registry (file_id) VALUES (?)",
+                rows,
+            )
+
+
+def _read_cleanup_registry_ids(database_path: str, limit: int = 500) -> list[str]:
+    with closing(sqlite3.connect(database_path, timeout=30)) as connection:
+        _configure_duplicate_spool(connection)
+        if not _sqlite_table_exists(connection, "pending_registry"):
+            return []
+        return [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT file_id FROM pending_registry LIMIT ?", (int(limit),)
+            ).fetchall()
+        ]
+
+
+def _clear_cleanup_registry_ids(database_path: str, file_ids: list[str]):
+    rows = [(file_id,) for file_id in dict.fromkeys(file_ids) if file_id]
+    if not rows:
+        return
+    with closing(sqlite3.connect(database_path, timeout=30)) as connection:
+        _configure_duplicate_spool(connection)
+        with connection:
+            connection.executemany(
+                "DELETE FROM pending_registry WHERE file_id = ?", rows
+            )
 
 
 def _read_duplicate_report(database_path: str) -> dict:
@@ -2377,13 +2477,222 @@ class Database:
 
     async def delete_duplicate_group(self, group_key: str):
         raise RuntimeError(
-            "Duplicate deletion is disabled. Review and approve the report first."
+            "Individual deletion is disabled. Use verified exact cleanup."
         )
 
-    async def delete_duplicates_all(self):
+    async def _reconcile_registry_file_ids(self, file_ids: list[str]):
+        """Remove stale claims and point surviving claims at a real movie row."""
+        if self.registry_col is None:
+            return
+        unique_ids = list(dict.fromkeys(file_id for file_id in file_ids if file_id))
+        if not unique_ids:
+            return
+
+        last_error = None
+        for attempt in range(1, 4):
+            try:
+                locations = {}
+                for cluster_index, col in enumerate(self.file_cols, 1):
+                    cursor = col.find(
+                        {"file_id": {"$in": unique_ids}},
+                        {"_id": 1, "file_id": 1},
+                    )
+                    async for document in cursor:
+                        file_id = document.get("file_id")
+                        if file_id and file_id not in locations:
+                            locations[file_id] = (
+                                cluster_index,
+                                str(document["_id"]),
+                            )
+
+                stale_ids = [
+                    file_id for file_id in unique_ids if file_id not in locations
+                ]
+                if stale_ids:
+                    await self.registry_col.delete_many(
+                        {"file_id": {"$in": stale_ids}}
+                    )
+                repairs = [
+                    UpdateOne(
+                        {"file_id": file_id},
+                        {"$set": {"cluster": cluster, "movie_id": movie_id}},
+                        upsert=True,
+                    )
+                    for file_id, (cluster, movie_id) in locations.items()
+                ]
+                if repairs:
+                    await self.registry_col.bulk_write(repairs, ordered=False)
+                return
+            except Exception as error:
+                last_error = error
+                if attempt < 3:
+                    await asyncio.sleep(attempt)
         raise RuntimeError(
-            "Bulk duplicate deletion is disabled. Review and approve the report first."
+            "Registry repair failed after verified movie rows were processed"
+        ) from last_error
+
+    async def _recover_duplicate_cleanup_registry(self):
+        """Finish registry repairs left by an interrupted exact cleanup."""
+        await asyncio.to_thread(
+            _DUPLICATE_SCAN_DIR.mkdir, parents=True, exist_ok=True
         )
+        for candidate in _DUPLICATE_SCAN_DIR.glob("mccx-cleanup-*.sqlite3"):
+            try:
+                while True:
+                    file_ids = await asyncio.to_thread(
+                        _read_cleanup_registry_ids, str(candidate), 500
+                    )
+                    if not file_ids:
+                        break
+                    await self._reconcile_registry_file_ids(file_ids)
+                    await asyncio.to_thread(
+                        _clear_cleanup_registry_ids, str(candidate), file_ids
+                    )
+                await asyncio.to_thread(candidate.unlink, missing_ok=True)
+            except Exception as error:
+                logger.warning(
+                    "Deferred duplicate-cleanup registry recovery for %s: %s",
+                    candidate.name,
+                    type(error).__name__,
+                )
+                raise
+
+    async def delete_verified_duplicates(self, progress_callback=None):
+        """Delete only rows with an already-preserved exact Telegram identity.
+
+        Higher-numbered clusters and newer ObjectIds are scanned first, so
+        the freshest usable row survives. Metadata-only probable matches are
+        never considered by this cleanup.
+        """
+        cleanup_lock = getattr(self, "_verified_cleanup_lock", None)
+        if cleanup_lock is None:
+            cleanup_lock = asyncio.Lock()
+            self._verified_cleanup_lock = cleanup_lock
+
+        async with cleanup_lock:
+            await self._recover_duplicate_cleanup_registry()
+            total = await self.get_total_files()
+            started = time.monotonic()
+            scanned = deleted = 0
+            descriptor, spool_path = await asyncio.to_thread(
+                tempfile.mkstemp,
+                suffix=".sqlite3",
+                prefix="mccx-cleanup-",
+                dir=str(_DUPLICATE_SCAN_DIR),
+            )
+            await asyncio.to_thread(os.close, descriptor)
+            try:
+                await asyncio.to_thread(
+                    _initialize_verified_cleanup_spool, spool_path
+                )
+            except Exception:
+                await asyncio.to_thread(
+                    Path(spool_path).unlink, missing_ok=True
+                )
+                raise
+            keep_spool = False
+
+            async def _process_batch(col, batch, cluster_index):
+                nonlocal scanned, deleted, keep_spool
+                duplicates = await asyncio.to_thread(
+                    _classify_verified_duplicate_batch, spool_path, batch
+                )
+                staged_ids = [
+                    str(document.get("file_id", "") or "")
+                    for document in duplicates
+                ]
+                if duplicates:
+                    await asyncio.to_thread(
+                        _stage_cleanup_registry_ids, spool_path, staged_ids
+                    )
+                    keep_spool = True
+                    object_ids = [document["_id"] for document in duplicates]
+                    result = await col.delete_many({"_id": {"$in": object_ids}})
+                    if result.deleted_count == len(object_ids):
+                        confirmed_deleted = duplicates
+                    else:
+                        remaining = {
+                            document["_id"]
+                            async for document in col.find(
+                                {"_id": {"$in": object_ids}}, {"_id": 1}
+                            )
+                        }
+                        confirmed_deleted = [
+                            document
+                            for document in duplicates
+                            if document["_id"] not in remaining
+                        ]
+                    await self._reconcile_registry_file_ids(staged_ids)
+                    await asyncio.to_thread(
+                        _clear_cleanup_registry_ids, spool_path, staged_ids
+                    )
+                    keep_spool = False
+                    deleted += len(confirmed_deleted)
+
+                scanned += len(batch)
+                if progress_callback:
+                    elapsed = time.monotonic() - started
+                    await progress_callback({
+                        "phase": "verified_cleanup",
+                        "scanned": scanned,
+                        "total": total,
+                        "deleted": deleted,
+                        "cluster": cluster_index,
+                        "clusters": len(self.file_cols),
+                        "elapsed": elapsed,
+                    })
+
+            try:
+                for cluster_index in range(len(self.file_cols), 0, -1):
+                    col = self.file_cols[cluster_index - 1]
+                    batch = []
+                    cursor = col.find(
+                        {
+                            "file_name": {"$exists": True, "$ne": ""},
+                            "file_id": {"$exists": True, "$ne": ""},
+                        },
+                        {
+                            "file_name": 1,
+                            "file_id": 1,
+                            "file_unique_id": 1,
+                            "file_size": 1,
+                            "mime_type": 1,
+                        },
+                    ).sort("_id", -1).batch_size(_VERIFIED_CLEANUP_BATCH_SIZE)
+                    async for document in cursor:
+                        batch.append(document)
+                        if len(batch) >= _VERIFIED_CLEANUP_BATCH_SIZE:
+                            await _process_batch(col, batch, cluster_index)
+                            batch = []
+                    if batch:
+                        await _process_batch(col, batch, cluster_index)
+            finally:
+                try:
+                    pending = await asyncio.to_thread(
+                        _read_cleanup_registry_ids, spool_path, 1
+                    )
+                except Exception:
+                    pending = ["unknown"]
+                if not pending and not keep_spool:
+                    await asyncio.to_thread(
+                        Path(spool_path).unlink, missing_ok=True
+                    )
+                else:
+                    logger.warning(
+                        "Retained cleanup recovery spool %s", spool_path
+                    )
+
+            self._invalidate_file_count()
+            return {
+                "scanned": scanned,
+                "deleted": deleted,
+                "remaining": await self.get_total_files(),
+                "report_only_matches_untouched": True,
+            }
+
+    async def delete_duplicates_all(self, progress_callback=None):
+        """Compatibility wrapper for strict Telegram-identity cleanup only."""
+        return await self.delete_verified_duplicates(progress_callback)
 
     async def purge_by_pattern(self, pattern):
         deleted_total = 0
