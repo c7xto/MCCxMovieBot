@@ -48,12 +48,14 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 _SEARCH_CATALOG_PATH = Path(__file__).resolve().parents[1] / "runtime" / "search_titles.txt.gz"
+_DUPLICATE_SCAN_DIR = Path(__file__).resolve().parents[1] / "runtime" / "duplicate_scans"
 _SEARCH_TITLE_CATALOG: tuple[str, ...] = ()
 MAX_SEARCH_CATALOG_TITLES = min(
     250_000, max(10_000, int(os.getenv("MAX_SEARCH_CATALOG_TITLES", "100000")))
 )
 MAX_DUPLICATE_GROUPS = 100
 MAX_DUPLICATE_IDS_PER_GROUP = 1000
+_DUPLICATE_HASH_BYTES = 12
 MAX_NOTIFICATION_OUTBOX_JOBS = 5000
 MAX_REQUEST_MATCHES_PER_JOB = 100
 MAX_CONFIG_BACKUP_KEYS = 50
@@ -588,131 +590,188 @@ def probable_duplicate_name(name: str) -> str:
     return _DUPE_WS_RE.sub(" ", normalized).strip().casefold()
 
 
-def _spool_duplicate_batch(
-    database_path: str, documents: list[dict], cluster_index: int = 1
-):
-    """Normalize and persist one bounded scan batch entirely off-loop."""
-    rows = []
-    for document in documents:
-        name = str(document.get("file_name", ""))
-        file_id = str(document.get("file_id", "") or "")
-        unique_id = str(document.get("file_unique_id", "") or "")
-        exact_key = f"u:{unique_id}" if unique_id else (f"f:{file_id}" if file_id else "")
-        mime_type = str(document.get("mime_type", "") or "").split(";", 1)[0].casefold()
-        rows.append((
-            int(cluster_index),
-            str(document.get("_id", "")),
-            file_id,
-            unique_id,
-            exact_key,
-            probable_duplicate_name(name),
-            int(document.get("file_size", 0) or 0),
-            mime_type,
-            name,
-        ))
-    with closing(sqlite3.connect(database_path)) as connection:
-        with connection:
-            connection.executemany(
-                "INSERT INTO files (cluster_id, object_id, file_id, file_unique_id, "
-                "exact_key, probable_key, file_size, mime_type, name) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                rows,
-            )
+def _duplicate_fingerprints(document: dict) -> tuple[bytes | None, bytes | None]:
+    """Return compact exact/probable identities without retaining user data."""
+    file_id = str(document.get("file_id", "") or "")
+    unique_id = str(document.get("file_unique_id", "") or "")
+    exact_value = f"u:{unique_id}" if unique_id else (f"f:{file_id}" if file_id else "")
+    if not exact_value:
+        return None, None
+
+    exact_key = hashlib.blake2b(
+        exact_value.encode("utf-8", "surrogatepass"),
+        digest_size=_DUPLICATE_HASH_BYTES,
+        person=b"mccx-exact-v1",
+    ).digest()
+    name = probable_duplicate_name(str(document.get("file_name", "")))
+    file_size = int(document.get("file_size", 0) or 0)
+    if not name or file_size <= 0:
+        return exact_key, None
+    mime_type = str(document.get("mime_type", "") or "").split(";", 1)[0].casefold()
+    probable_value = f"{name}\x1f{file_size}\x1f{mime_type}"
+    probable_key = hashlib.blake2b(
+        probable_value.encode("utf-8", "surrogatepass"),
+        digest_size=_DUPLICATE_HASH_BYTES,
+        person=b"mccx-prob-v1",
+    ).digest()
+    return exact_key, probable_key
 
 
-def _initialize_duplicate_spool(database_path: str):
-    with closing(sqlite3.connect(database_path)) as connection:
+def _configure_duplicate_spool(connection: sqlite3.Connection):
+    """Tune a disposable report database for low disk usage."""
+    connection.execute("PRAGMA journal_mode=OFF")
+    connection.execute("PRAGMA synchronous=OFF")
+    connection.execute("PRAGMA temp_store=MEMORY")
+    connection.execute("PRAGMA cache_size=-4096")
+
+
+def _initialize_duplicate_spool(database_path: str, mode: str = "both"):
+    if mode not in {"exact", "probable", "both"}:
+        raise ValueError(f"Unknown duplicate spool mode: {mode}")
+    with closing(sqlite3.connect(database_path, timeout=30)) as connection:
+        _configure_duplicate_spool(connection)
         with connection:
             connection.execute(
-                "CREATE TABLE files ("
-                "cluster_id INTEGER NOT NULL, object_id TEXT NOT NULL, "
-                "file_id TEXT, file_unique_id TEXT, exact_key TEXT, "
-                "probable_key TEXT, file_size INTEGER, mime_type TEXT, name TEXT"
-                ")"
+                "CREATE TABLE IF NOT EXISTS scan_meta ("
+                "key TEXT PRIMARY KEY, value INTEGER NOT NULL) WITHOUT ROWID"
             )
+            connection.execute(
+                "INSERT OR IGNORE INTO scan_meta (key, value) VALUES ('scanned', 0)"
+            )
+            if mode in {"exact", "both"}:
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS exact_counts ("
+                    "key BLOB PRIMARY KEY, copies INTEGER NOT NULL) WITHOUT ROWID"
+                )
+            if mode in {"probable", "both"}:
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS probable_members ("
+                    "group_key BLOB NOT NULL, exact_key BLOB NOT NULL, "
+                    "PRIMARY KEY (group_key, exact_key)) WITHOUT ROWID"
+                )
+
+
+def _spool_duplicate_batch(
+    database_path: str,
+    documents: list[dict],
+    cluster_index: int = 1,
+    mode: str = "both",
+):
+    """Aggregate one bounded batch using fingerprints, never raw file data."""
+    del cluster_index  # Kept in the signature for compatibility with older callers.
+    if mode not in {"exact", "probable", "both"}:
+        raise ValueError(f"Unknown duplicate spool mode: {mode}")
+
+    exact_counts: dict[bytes, int] = {}
+    probable_members: set[tuple[bytes, bytes]] = set()
+    for document in documents:
+        exact_key, probable_key = _duplicate_fingerprints(document)
+        if exact_key is not None and mode in {"exact", "both"}:
+            exact_counts[exact_key] = exact_counts.get(exact_key, 0) + 1
+        if (
+            exact_key is not None
+            and probable_key is not None
+            and mode in {"probable", "both"}
+        ):
+            probable_members.add((probable_key, exact_key))
+
+    with closing(sqlite3.connect(database_path, timeout=30)) as connection:
+        _configure_duplicate_spool(connection)
+        with connection:
+            if exact_counts:
+                connection.executemany(
+                    "INSERT INTO exact_counts (key, copies) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET copies = copies + excluded.copies",
+                    exact_counts.items(),
+                )
+            if probable_members:
+                connection.executemany(
+                    "INSERT OR IGNORE INTO probable_members (group_key, exact_key) "
+                    "VALUES (?, ?)",
+                    probable_members,
+                )
+            connection.execute(
+                "UPDATE scan_meta SET value = value + ? WHERE key = 'scanned'",
+                (len(documents),),
+            )
+
+
+def _sqlite_table_exists(connection: sqlite3.Connection, table: str) -> bool:
+    return connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+    ).fetchone() is not None
 
 
 def _read_duplicate_report(database_path: str) -> dict:
-    """Aggregate a disk-backed scan into a bounded, non-destructive report."""
+    """Read a bounded report from compact aggregate tables."""
     results = []
-    with closing(sqlite3.connect(database_path)) as connection:
-        connection.execute(
-            "CREATE INDEX IF NOT EXISTS files_exact_key ON files(exact_key)"
-        )
-        connection.execute(
-            "CREATE INDEX IF NOT EXISTS files_probable_key ON files("
-            "probable_key, file_size, mime_type)"
-        )
-        scanned = connection.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-
-        exact_summary = connection.execute(
-            "SELECT COUNT(*), COALESCE(SUM(copies - 1), 0) FROM ("
-            "SELECT COUNT(*) AS copies FROM files WHERE exact_key <> '' "
-            "GROUP BY exact_key HAVING COUNT(*) > 1)"
+    exact_summary = (0, 0)
+    probable_summary = (0, 0)
+    with closing(sqlite3.connect(database_path, timeout=30)) as connection:
+        _configure_duplicate_spool(connection)
+        scanned_row = connection.execute(
+            "SELECT value FROM scan_meta WHERE key = 'scanned'"
         ).fetchone()
-        probable_summary = connection.execute(
-            "SELECT COUNT(*), COALESCE(SUM(identities - 1), 0) FROM ("
-            "SELECT COUNT(DISTINCT exact_key) AS identities FROM files "
-            "WHERE probable_key <> '' AND file_size > 0 AND exact_key <> '' "
-            "GROUP BY probable_key, file_size, mime_type "
-            "HAVING COUNT(DISTINCT exact_key) > 1)"
-        ).fetchone()
+        scanned = int(scanned_row[0]) if scanned_row else 0
 
-        exact_groups = connection.execute(
-            "SELECT exact_key, MIN(name), COUNT(*) FROM files "
-            "WHERE exact_key <> '' GROUP BY exact_key HAVING COUNT(*) > 1 "
-            "ORDER BY COUNT(*) DESC LIMIT ?",
-            (MAX_DUPLICATE_GROUPS,),
-        ).fetchall()
-        for identity, name, count in exact_groups:
-            ids = [f"{row[0]}:{row[1]}" for row in connection.execute(
-                "SELECT cluster_id, object_id FROM files WHERE exact_key = ? "
-                "ORDER BY cluster_id, object_id LIMIT ?",
-                (identity, MAX_DUPLICATE_IDS_PER_GROUP),
-            ).fetchall()]
-            results.append({
-                "key": stable_duplicate_key("exact", identity),
-                "identity": identity,
-                "name": name or "Unknown",
-                "count": int(count),
-                "ids": ids,
-                "type": "exact",
-                "truncated": int(count) > len(ids),
-            })
-
-        remaining = max(0, MAX_DUPLICATE_GROUPS - len(results))
-        if remaining:
-            probable_groups = connection.execute(
-                "SELECT probable_key, file_size, mime_type, MIN(name), "
-                "COUNT(DISTINCT exact_key) FROM files "
-                "WHERE probable_key <> '' AND file_size > 0 AND exact_key <> '' "
-                "GROUP BY probable_key, file_size, mime_type "
-                "HAVING COUNT(DISTINCT exact_key) > 1 "
-                "ORDER BY COUNT(DISTINCT exact_key) DESC LIMIT ?",
-                (remaining,),
+        if _sqlite_table_exists(connection, "exact_counts"):
+            exact_summary = connection.execute(
+                "SELECT COUNT(*), COALESCE(SUM(copies - 1), 0) "
+                "FROM exact_counts WHERE copies > 1"
+            ).fetchone()
+            exact_groups = connection.execute(
+                "SELECT key, copies FROM exact_counts WHERE copies > 1 "
+                "ORDER BY copies DESC, key LIMIT ?",
+                (MAX_DUPLICATE_GROUPS,),
             ).fetchall()
-            for identity, file_size, mime_type, name, count in probable_groups:
-                compound_identity = f"{identity}\x1f{file_size}\x1f{mime_type}"
+            for identity_bytes, count in exact_groups:
+                identity = bytes(identity_bytes).hex()
                 results.append({
-                    "key": stable_duplicate_key("probable", compound_identity),
-                    "identity": compound_identity,
-                    "name": name or "Unknown",
+                    "key": stable_duplicate_key("exact", identity),
+                    "identity": identity,
+                    "name": f"Exact file {identity[:8]}",
                     "count": int(count),
                     "ids": [],
-                    "type": "probable",
-                    "size": int(file_size),
+                    "type": "exact",
                     "truncated": False,
                 })
 
+        remaining = max(0, MAX_DUPLICATE_GROUPS - len(results))
+        if _sqlite_table_exists(connection, "probable_members"):
+            probable_summary = connection.execute(
+                "SELECT COUNT(*), COALESCE(SUM(members - 1), 0) FROM ("
+                "SELECT COUNT(*) AS members FROM probable_members "
+                "GROUP BY group_key HAVING COUNT(*) > 1)"
+            ).fetchone()
+            if remaining:
+                probable_groups = connection.execute(
+                    "SELECT group_key, COUNT(*) AS members FROM probable_members "
+                    "GROUP BY group_key HAVING COUNT(*) > 1 "
+                    "ORDER BY members DESC, group_key LIMIT ?",
+                    (remaining,),
+                ).fetchall()
+                for identity_bytes, count in probable_groups:
+                    identity = bytes(identity_bytes).hex()
+                    results.append({
+                        "key": stable_duplicate_key("probable", identity),
+                        "identity": identity,
+                        "name": f"Possible match {identity[:8]}",
+                        "count": int(count),
+                        "ids": [],
+                        "type": "probable",
+                        "truncated": False,
+                    })
+
     return {
         "summary": {
-            "scanned": int(scanned),
+            "scanned": scanned,
             "exact_groups": int(exact_summary[0]),
             "exact_extras": int(exact_summary[1]),
             "probable_groups": int(probable_summary[0]),
             "probable_matches": int(probable_summary[1]),
             "shown_groups": len(results),
             "report_only": True,
+            "storage": "compact_fingerprints",
         },
         "groups": results,
     }
@@ -2076,7 +2135,7 @@ class Database:
         return results
 
     async def scan_duplicate_report(self, progress_callback=None):
-        """Build a conservative duplicate report without deleting any data."""
+        """Build a conservative, low-disk report without deleting any data."""
         scan_lock = getattr(self, "_duplicate_scan_lock", None)
         if scan_lock is None:
             scan_lock = asyncio.Lock()
@@ -2084,14 +2143,162 @@ class Database:
 
         async with scan_lock:
             total = await self.get_total_files()
-            scanned = 0
             started = time.monotonic()
-            descriptor, spool_path = await asyncio.to_thread(
-                tempfile.mkstemp, ".sqlite3", "mccx-duplicates-"
+            total_work = max(1, total * 3)
+            await asyncio.to_thread(
+                _DUPLICATE_SCAN_DIR.mkdir, parents=True, exist_ok=True
             )
-            await asyncio.to_thread(os.close, descriptor)
-            try:
-                await asyncio.to_thread(_initialize_duplicate_spool, spool_path)
+
+            def _remove_stale_spools():
+                cutoff = time.time() - 86400
+                for candidate in _DUPLICATE_SCAN_DIR.glob(
+                    "mccx-duplicates-*.sqlite3"
+                ):
+                    try:
+                        if candidate.is_file() and candidate.stat().st_mtime < cutoff:
+                            candidate.unlink(missing_ok=True)
+                    except OSError:
+                        logger.debug(
+                            "Could not remove stale duplicate spool %s", candidate
+                        )
+
+            await asyncio.to_thread(_remove_stale_spools)
+
+            async def _show_phase_progress(
+                phase, phase_scanned, cluster, phase_started, work_offset
+            ):
+                if not progress_callback:
+                    return
+                await progress_callback({
+                    "phase": phase,
+                    "scanned": phase_scanned,
+                    "total": total,
+                    "overall_scanned": min(
+                        total_work, work_offset + phase_scanned
+                    ),
+                    "overall_total": total_work,
+                    "cluster": cluster,
+                    "clusters": len(self.file_cols),
+                    "elapsed": time.monotonic() - started,
+                    "phase_elapsed": time.monotonic() - phase_started,
+                })
+
+            async def _scan_aggregate_phase(mode: str, work_offset: int):
+                phase_started = time.monotonic()
+                descriptor, spool_path = await asyncio.to_thread(
+                    tempfile.mkstemp,
+                    suffix=".sqlite3",
+                    prefix="mccx-duplicates-",
+                    dir=str(_DUPLICATE_SCAN_DIR),
+                )
+                await asyncio.to_thread(os.close, descriptor)
+                phase_scanned = 0
+                try:
+                    await asyncio.to_thread(
+                        _initialize_duplicate_spool, spool_path, mode
+                    )
+                    await _show_phase_progress(
+                        mode, 0, 1, phase_started, work_offset
+                    )
+                    for cluster_index, col in enumerate(self.file_cols, 1):
+                        batch = []
+                        cursor = col.find(
+                            {"file_name": {"$exists": True, "$ne": ""}},
+                            {
+                                "file_name": 1,
+                                "file_id": 1,
+                                "file_unique_id": 1,
+                                "file_size": 1,
+                                "mime_type": 1,
+                            },
+                        ).batch_size(1000)
+                        async for document in cursor:
+                            batch.append(document)
+                            if len(batch) >= 1000:
+                                await asyncio.to_thread(
+                                    _spool_duplicate_batch,
+                                    spool_path,
+                                    batch,
+                                    cluster_index,
+                                    mode,
+                                )
+                                phase_scanned += len(batch)
+                                await _show_phase_progress(
+                                    mode,
+                                    phase_scanned,
+                                    cluster_index,
+                                    phase_started,
+                                    work_offset,
+                                )
+                                batch = []
+                        if batch:
+                            await asyncio.to_thread(
+                                _spool_duplicate_batch,
+                                spool_path,
+                                batch,
+                                cluster_index,
+                                mode,
+                            )
+                            phase_scanned += len(batch)
+                            await _show_phase_progress(
+                                mode,
+                                phase_scanned,
+                                cluster_index,
+                                phase_started,
+                                work_offset,
+                            )
+                    return await asyncio.to_thread(
+                        _read_duplicate_report, spool_path
+                    )
+                except sqlite3.OperationalError as error:
+                    if "full" in str(error).casefold():
+                        raise RuntimeError(
+                            "The host storage is full. Free at least 150 MB of "
+                            "server disk space, then run the duplicate report again."
+                        ) from error
+                    raise
+                finally:
+                    await asyncio.to_thread(
+                        Path(spool_path).unlink, missing_ok=True
+                    )
+
+            exact_report = await _scan_aggregate_phase("exact", 0)
+            probable_report = await _scan_aggregate_phase("probable", total)
+
+            exact_groups = exact_report["groups"]
+            remaining = max(0, MAX_DUPLICATE_GROUPS - len(exact_groups))
+            groups = exact_groups + probable_report["groups"][:remaining]
+            summary = {
+                "scanned": max(
+                    exact_report["summary"]["scanned"],
+                    probable_report["summary"]["scanned"],
+                ),
+                "exact_groups": exact_report["summary"]["exact_groups"],
+                "exact_extras": exact_report["summary"]["exact_extras"],
+                "probable_groups": probable_report["summary"]["probable_groups"],
+                "probable_matches": probable_report["summary"]["probable_matches"],
+                "shown_groups": len(groups),
+                "report_only": True,
+                "storage": "compact_fingerprints",
+            }
+
+            if groups:
+                exact_targets = {
+                    bytes.fromhex(group["identity"])
+                    for group in groups
+                    if group["type"] == "exact"
+                }
+                probable_targets = {
+                    bytes.fromhex(group["identity"])
+                    for group in groups
+                    if group["type"] == "probable"
+                }
+                labels: dict[tuple[str, bytes], str] = {}
+                phase_started = time.monotonic()
+                phase_scanned = 0
+                await _show_phase_progress(
+                    "labels", 0, 1, phase_started, total * 2
+                )
                 for cluster_index, col in enumerate(self.file_cols, 1):
                     batch = []
                     cursor = col.find(
@@ -2107,55 +2314,46 @@ class Database:
                     async for document in cursor:
                         batch.append(document)
                         if len(batch) >= 1000:
-                            await asyncio.to_thread(
-                                _spool_duplicate_batch,
-                                spool_path,
-                                batch,
+                            for item in batch:
+                                exact_key, probable_key = _duplicate_fingerprints(item)
+                                name = str(item.get("file_name", "") or "Unknown")
+                                if exact_key in exact_targets:
+                                    labels.setdefault(("exact", exact_key), name)
+                                if probable_key in probable_targets:
+                                    labels.setdefault(("probable", probable_key), name)
+                            phase_scanned += len(batch)
+                            await _show_phase_progress(
+                                "labels",
+                                phase_scanned,
                                 cluster_index,
+                                phase_started,
+                                total * 2,
                             )
-                            scanned += len(batch)
-                            if progress_callback:
-                                await progress_callback({
-                                    "phase": "scanning",
-                                    "scanned": scanned,
-                                    "total": total,
-                                    "cluster": cluster_index,
-                                    "clusters": len(self.file_cols),
-                                    "elapsed": time.monotonic() - started,
-                                })
                             batch = []
                     if batch:
-                        await asyncio.to_thread(
-                            _spool_duplicate_batch,
-                            spool_path,
-                            batch,
+                        for item in batch:
+                            exact_key, probable_key = _duplicate_fingerprints(item)
+                            name = str(item.get("file_name", "") or "Unknown")
+                            if exact_key in exact_targets:
+                                labels.setdefault(("exact", exact_key), name)
+                            if probable_key in probable_targets:
+                                labels.setdefault(("probable", probable_key), name)
+                        phase_scanned += len(batch)
+                        await _show_phase_progress(
+                            "labels",
+                            phase_scanned,
                             cluster_index,
+                            phase_started,
+                            total * 2,
                         )
-                        scanned += len(batch)
-                        if progress_callback:
-                            await progress_callback({
-                                "phase": "scanning",
-                                "scanned": scanned,
-                                "total": total,
-                                "cluster": cluster_index,
-                                "clusters": len(self.file_cols),
-                                "elapsed": time.monotonic() - started,
-                            })
 
-                if progress_callback:
-                    await progress_callback({
-                        "phase": "comparing",
-                        "scanned": scanned,
-                        "total": total,
-                        "cluster": len(self.file_cols),
-                        "clusters": len(self.file_cols),
-                        "elapsed": time.monotonic() - started,
-                    })
-                report = await asyncio.to_thread(
-                    _read_duplicate_report, spool_path
-                )
-            finally:
-                await asyncio.to_thread(Path(spool_path).unlink, missing_ok=True)
+                for group in groups:
+                    identity = bytes.fromhex(group["identity"])
+                    group["name"] = labels.get(
+                        (group["type"], identity), group["name"]
+                    )
+
+            report = {"summary": summary, "groups": groups}
 
         cache = getattr(self, "_duplicate_group_cache", None)
         if cache is not None:

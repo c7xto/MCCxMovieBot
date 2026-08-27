@@ -205,25 +205,45 @@ async def _run_duplicate_scan(client, status_msg, admin_id):
     async def show_progress(progress):
         nonlocal last_update
         now = time.monotonic()
-        if progress.get("phase") != "comparing" and now - last_update < 3.0:
+        if now - last_update < 3.0 and int(progress.get("scanned", 0)) > 0:
             return
         last_update = now
         scanned = int(progress.get("scanned", 0))
         total = max(scanned, int(progress.get("total", 0)))
-        elapsed = max(0.1, float(progress.get("elapsed", 0.1)))
-        speed = scanned / elapsed
-        remaining = max(0, total - scanned)
-        eta = int(remaining / speed) if speed > 0 else 0
-        phase = (
-            "Comparing safely"
-            if progress.get("phase") == "comparing"
-            else f"Scanning cluster {progress.get('cluster', 1)}/{progress.get('clusters', 1)}"
+        overall_scanned = int(progress.get("overall_scanned", scanned))
+        overall_total = max(
+            overall_scanned, int(progress.get("overall_total", total))
         )
+        elapsed = max(0.1, float(progress.get("elapsed", 0.1)))
+        phase_elapsed = max(0.1, float(progress.get("phase_elapsed", elapsed)))
+        speed = scanned / phase_elapsed
+        overall_speed = overall_scanned / elapsed
+        remaining = max(0, overall_total - overall_scanned)
+        eta = int(remaining / overall_speed) if overall_speed > 0 else 0
+        phase_key = progress.get("phase", "exact")
+        phase_names = {
+            "exact": ("Checking exact copies", 1),
+            "probable": ("Checking possible matches", 2),
+            "labels": ("Preparing clean file names", 3),
+        }
+        phase, phase_number = phase_names.get(phase_key, ("Scanning safely", 1))
+        percent = min(100.0, overall_scanned * 100 / max(1, overall_total))
+        filled = min(10, int(percent / 10))
+        progress_bar = "▰" * filled + "▱" * (10 - filled)
+        if not remaining:
+            eta_text = "Finishing…"
+        elif overall_speed <= 0:
+            eta_text = "Calculating…"
+        else:
+            eta_text = f"About {eta // 60}m {eta % 60}s"
         await status_msg.edit_text(
             f"🧬 **Duplicate Report • {phase}**\n\n"
-            f"📨 Scanned  `{scanned:,} / {total:,}`\n"
-            f"⚙️ Speed    `{speed:,.0f} files/s`\n"
-            f"⌛ ETA      `{'Finishing…' if not remaining else f'{eta // 60}m {eta % 60}s'}`\n\n"
+            f"`{progress_bar}`  **{percent:.1f}%**\n"
+            f"📂 Phase `{phase_number}/3` • Cluster "
+            f"`{progress.get('cluster', 1)}/{progress.get('clusters', 1)}`\n"
+            f"📨 This phase  `{scanned:,} / {total:,}`\n"
+            f"⚡ Live speed  `{speed:,.0f} files/s`\n"
+            f"⌛ Time left   `{eta_text}`\n\n"
             f"🔒 Report only • no files will be deleted"
         )
 
@@ -245,6 +265,20 @@ async def _run_duplicate_scan(client, status_msg, admin_id):
         _cached_dupes[admin_id] = report
         await _show_dupes_page(status_msg, report, page=0)
 
+    except RuntimeError as error:
+        if "host storage is full" in str(error).casefold():
+            await status_msg.edit_text(
+                "❌ **Duplicate Report Paused**\n\n"
+                f"{error}\n\n"
+                "🔒 Nothing was deleted or changed.",
+                reply_markup=_BACK_BTN,
+            )
+            return
+        reference = report_internal_error(logger, "duplicate_scan", error)
+        await status_msg.edit_text(
+            f"❌ Duplicate scan failed. Reference: `{reference}`",
+            reply_markup=_BACK_BTN,
+        )
     except Exception as error:
         reference = report_internal_error(logger, "duplicate_scan", error)
         await status_msg.edit_text(
