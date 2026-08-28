@@ -102,9 +102,7 @@ def test_movie_label_uses_clean_title_year_and_fixed_metadata_order():
         "file_name": "Aavesham_2024_Malayalam_1080p_WEB-DL_x265.mkv",
         "file_size": 500 * 1024 * 1024,
     }
-    assert _flat_file_label(file_doc) == (
-        "[500.00 MB] Aavesham (2024) • Malayalam • 1080p • HEVC"
-    )
+    assert _flat_file_label(file_doc) == "[500.00 MB] Aavesham (2024) • Malayalam • 1080p"
 
 
 def test_long_series_title_is_trimmed_without_hiding_quality_fields():
@@ -116,10 +114,20 @@ def test_long_series_title_is_trimmed_without_hiding_quality_fields():
         "file_size": 700 * 1024 * 1024,
     }
     label = _flat_file_label(file_doc)
-    assert len(label) <= 64
+    assert len(label) <= 52
     assert label.startswith("[700.00 MB] [S02E04]")
     assert "An Even Longer Episode Name" not in label
-    assert label.endswith("English • 1080p • HEVC")
+    assert label.endswith("English • 1080p")
+
+
+def test_release_platform_is_not_mistaken_for_movie_title():
+    file_doc = {
+        "file_name": "Balan.The.Boy.2026.1080p.ZEE5.WEB-DL.Hindi.DDP5.1.x264.mkv",
+        "file_size": 2650 * 1024 * 1024,
+    }
+    label = _flat_file_label(file_doc)
+    assert label == "[2.59 GB] Balan The Boy (2026) • Hindi • 1080p"
+    assert len(label) <= 52
 
 
 def test_listing_name_removes_brackets_extension_and_promotional_url():
@@ -153,6 +161,7 @@ def test_results_caption_contains_shared_count_and_page_header():
     assert "Files:</b> 152" in caption
     assert "Page:</b> 1 / 16" in caption
     assert "👤 <b>7</b>" in caption
+    assert "Choose below by size, language and quality" in caption
 
 
 def test_movie_results_sort_from_largest_to_smallest():

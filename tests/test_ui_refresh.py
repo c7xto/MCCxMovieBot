@@ -37,6 +37,7 @@ def test_admin_prompts_do_not_show_raw_markdown_or_cancel_instructions():
     assert "Type /cancel" not in sources
     assert "Action Cancelled" not in sources
     assert "_Select an action._" not in sources
+    assert "Select an action." not in sources
     assert "🔙" not in sources
 
 

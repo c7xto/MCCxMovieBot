@@ -135,6 +135,7 @@ async def get_admin_menu_data():
 _CATEGORY_MENUS = {
     "library": (
         "📚 **Library**",
+        "Manage source channels and every indexed file.",
         [
             ("📥 Source Channels", "db_chan_menu"),
             ("🗂 File Manager", "file_manager_menu"),
@@ -142,6 +143,7 @@ _CATEGORY_MENUS = {
     ),
     "appearance": (
         "🎨 **Appearance**",
+        "Customize welcome screens, captions and file branding.",
         [
             ("✏ File Captions", "edit_captiontemplate"),
             ("🏷 File Branding", "file_branding_menu"),
@@ -151,6 +153,7 @@ _CATEGORY_MENUS = {
     ),
     "users": (
         "👥 **Users, Groups & Access**",
+        "Manage verification requirements and connected groups.",
         [
             ("🛡 Access Gates", "verification_gates_menu"),
             ("🏘 Group Manager", "group_manager_menu"),
@@ -158,6 +161,7 @@ _CATEGORY_MENUS = {
     ),
     "settings": (
         "⚙ **Preferences & Backup**",
+        "Manage channels, deletion rules, backups and deployment.",
         [
             ("💬 Request Group", "edit_maingroup"),
             ("📢 Public Updates", "edit_update"),
@@ -172,6 +176,7 @@ _CATEGORY_MENUS = {
     ),
     "health": (
         "🩺 **Health & System**",
+        "Review analytics, channel access and system health.",
         [
             ("📊 Analytics", "admin_stats"),
             ("🔎 Channel Check", "channel_health_check"),
@@ -193,9 +198,9 @@ async def show_category_menu(client: Client, callback: CallbackQuery):
     _clear_state(callback.from_user.id)
     await answer_callback_safely(callback)
     key = callback.data.split("_", 2)[2]
-    title, items = _CATEGORY_MENUS[key]
+    title, description, items = _CATEGORY_MENUS[key]
 
-    text = f"{title}\n\nSelect an action."
+    text = f"{title}\n\n{description}"
     buttons = []
     for index in range(0, len(items), 2):
         buttons.append(

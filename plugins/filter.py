@@ -198,6 +198,12 @@ _JUNK_WORDS = {
     "proper",
     "repack",
     "telly",
+    "zee5",
+    "sonyliv",
+    "jiohotstar",
+    "sunxt",
+    "voot",
+    "manoramamax",
     "collective",
     "etrg",
     "yts",
@@ -471,14 +477,22 @@ def _series_identity(filename: str) -> tuple[str, str]:
 
 
 def _compose_aligned_label(prefix: str, identity: str, metadata: list[str], max_length: int) -> str:
-    """Keep the fixed fields visible and trim only the variable title."""
+    """Keep buttons phone-friendly while preserving useful variant details."""
+    metadata = list(metadata)
     suffix = "" if not metadata else " • " + " • ".join(metadata)
     available = max_length - len(prefix) - len(suffix) - 1
-    if available < 8 and metadata:
-        # Prefer the identity over the least important trailing metadata when
-        # Telegram's 64-character button limit is especially tight.
-        metadata = metadata[:-1]
-        return _compose_aligned_label(prefix, identity, metadata, max_length)
+    while metadata and len(identity) > available:
+        shorter_metadata = metadata[:-1]
+        shorter_suffix = "" if not shorter_metadata else " • " + " • ".join(shorter_metadata)
+        shorter_available = max_length - len(prefix) - len(shorter_suffix) - 1
+        # Drop the least important trailing field (codec first) when that
+        # preserves the full title, or when too little title would remain.
+        if len(identity) <= shorter_available or available < 8:
+            metadata = shorter_metadata
+            suffix = shorter_suffix
+            available = shorter_available
+            continue
+        break
     if available < 2:
         return f"{prefix} {identity}"[:max_length]
     if len(identity) > available:
@@ -486,7 +500,7 @@ def _compose_aligned_label(prefix: str, identity: str, metadata: list[str], max_
     return f"{prefix} {identity}{suffix}"
 
 
-def _flat_file_label(file_doc: dict, max_length: int = 64) -> str:
+def _flat_file_label(file_doc: dict, max_length: int = 52) -> str:
     """Build a consistent smart label for movie and episodic files."""
     filename = file_doc.get("file_name", "")
     prefix = f"[{_fmt_size(file_doc)}]"
@@ -508,6 +522,7 @@ def _build_results_caption(query: str, total: int, page: int, total_pages: int, 
         [
             "",
             f"📁 <b>Files:</b> {total}  •  📚 <b>Page:</b> {page + 1} / {total_pages}",
+            "<i>Choose below by size, language and quality.</i>",
         ]
     )
     return "\n".join(lines)
