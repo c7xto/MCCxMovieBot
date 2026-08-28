@@ -16,13 +16,13 @@ from plugins.state import (
 )
 from plugins.verification_channels import (
     ChannelConfigurationError,
+    resolve_channel_id,
     resolve_request_fsub_channel,
 )
-from plugins.telegram_retry import BACKGROUND_RETRY, telegram_call
 from plugins.config_backup import encrypt_config_export
 from plugins.callbacks import answer_callback_safely
 from plugins.access_gates import access_gate_health, get_access_gates
-from plugins.ui_helpers import begin_prompt, finish_prompt, restore_prompt
+from plugins.ui_helpers import begin_prompt, delete_prompt_input, finish_prompt, restore_prompt
 from utils import (
     ADMIN_ID,
     _no_preview,
@@ -332,30 +332,31 @@ async def handle_edit_buttons(client: Client, callback: CallbackQuery):
         "remdb": ("➖ **Remove Source Channel**\n\nSend the channel ID."),
         "media": ("🖼 **Welcome Media**\n\nSend the Catbox link for an image, GIF or MP4."),
         "addfsub": (
-            "➕ **Send the channel link, @username, or ID.**\n\n"
+            "➕ **Add Required Channel**\n\n"
             "Accepted formats:\n"
             "`https://t.me/yourchannel`\n"
             "`@yourchannel`\n"
-            "`-100123456789`\n\n"
+            "`-100123456789`\n"
+            "`-100123456789 https://t.me/+xxxx` — private chat\n\n"
             "Bot must be **Admin** in that channel."
         ),
         "remfsub": ("➖ **Remove Required Channel**\n\nSend the channel ID or username."),
         "twostage1": (
             "➕ **Set Two-Stage Channel 1**\n\n"
-            "Send the channel in any format:\n"
-            "`https://t.me/+xxxxxxx` — private invite link ✅\n"
+            "Send the channel in one of these formats:\n"
             "`https://t.me/username` — public channel link\n"
             "`@username` — public username\n"
-            "`-1001234567890` — numeric channel ID\n\n"
+            "`-1001234567890` — numeric channel ID\n"
+            "`-1001234567890 https://t.me/+xxxx` — private ID and link\n\n"
             "Bot must be **Admin** in that channel."
         ),
         "twostage2": (
             "➕ **Set Two-Stage Channel 2**\n\n"
-            "Send the channel in any format:\n"
-            "`https://t.me/+xxxxxxx` — private invite link ✅\n"
+            "Send the channel in one of these formats:\n"
             "`https://t.me/username` — public channel link\n"
             "`@username` — public username\n"
-            "`-1001234567890` — numeric channel ID\n\n"
+            "`-1001234567890` — numeric channel ID\n"
+            "`-1001234567890 https://t.me/+xxxx` — private ID and link\n\n"
             "Bot must be **Admin** in that channel."
         ),
         "welcometext": (
@@ -418,7 +419,7 @@ async def show_fsub_menu(client: Client, callback: CallbackQuery):
     config = await db.get_config()
     channels = config.get("fsub_channels", [])
 
-    text = "🔐 **Global FSub (Force Subscribe) Manager**\n\n"
+    text = "🔐 **Required Access Channels**\n\n"
     if not channels:
         text += "🔸 **Status:** ⚫ Disabled (No channels set).\n"
     else:
@@ -433,7 +434,7 @@ async def show_fsub_menu(client: Client, callback: CallbackQuery):
                 text += f" {i}. `{ch_id}`  —  {type_icon}\n"
             else:
                 text += f" {i}. `{ch}`  —  📢 Join\n"
-    text += "\nUsers must join every listed channel."
+    text += "\nUsers must join every listed channel before receiving files."
 
     markup = InlineKeyboardMarkup(
         [
@@ -491,9 +492,9 @@ async def show_req_fsub_menu(client: Client, callback: CallbackQuery):
     channels = config.get("req_fsub_channels", [])
     interval = int(config.get("req_fsub_interval_hours", 24))
     text = (
-        f"📢 **Request Channel FSub**\n\n"
-        f"Users are prompted to join one random channel before file delivery.\n"
-        f"Only once every **{interval}h** per user.\n\n"
+        f"⏱ **Timed Access Channels**\n\n"
+        f"Users verify all configured timed channels once every **{interval}h**.\n"
+        f"Required channels remain separate and are checked more often.\n\n"
         f"**Channels ({len(channels)}/5):**\n"
     )
     for i, entry in enumerate(channels, 1):
@@ -519,12 +520,14 @@ async def req_fsub_add_prompt(client: Client, callback: CallbackQuery):
     await begin_prompt(
         callback,
         "req_fsub_add",
-        "➕ **Add a Req FSub Channel**\n\n"
-        "The bot must already be a channel admin. Use:\n"
-        "• `https://t.me/username` — public channel link\n"
-        "• `@username` — public username\n"
-        "• `-1001234567890 https://t.me/+xxxxxxx` — private ID and invite\n\n"
-        "A private invite URL by itself cannot be verified.",
+        "➕ **Add Timed Access Channel**\n\n"
+        "Use a public link, @username, numeric ID, or private ID and link:\n"
+        "`https://t.me/username`\n"
+        "`@username`\n"
+        "`-1001234567890`\n"
+        "`-1001234567890 https://t.me/+xxxx`\n\n"
+        "The bot must already be an administrator. A private invite link alone "
+        "does not reveal its chat ID.",
     )
 
 
@@ -697,6 +700,7 @@ async def catch_admin_input(client: Client, message: Message):
 
     if message.text.lower() in ("/cancel", "cancel"):
         await restore_prompt(client, admin_id, fallback_message=message)
+        await delete_prompt_input(message)
         raise StopPropagation
 
     # ── STATE HANDLERS ────────────────────────────────────────────────────────
@@ -760,94 +764,28 @@ async def catch_admin_input(client: Client, message: Message):
         )
 
     elif state == "addfsub":
-        import re as _re
-
         raw = message.text.strip()
-
-        # Resolve input → channel identifier Pyrogram can look up
-        # Accepted: https://t.me/username  |  @username  |  -100xxxxxxx
-        link_to_store = None
-        ch_input = raw  # what we pass to get_chat / get_chat_member
-
-        # Extract username from t.me link
-        tme_match = _re.match(r"https?://t\.me/([a-zA-Z0-9_]+)", raw)
-        if tme_match:
-            username = tme_match.group(1)
-            ch_input = f"@{username}"
-            link_to_store = raw  # store the original https link
-
-        elif raw.startswith("@"):
-            ch_input = raw
-            link_to_store = f"https://t.me/{raw.lstrip('@')}"
-
-        # bare numeric ID — no link to store (private channel, generate invite later)
-        elif raw.lstrip("-").isdigit():
-            ch_input = int(raw)
-
-        else:
-            await respond(
-                "❌ **Invalid format.**\n\n"
-                "Send one of:\n"
-                "• `https://t.me/yourchannel`\n"
-                "• `@yourchannel`\n"
-                "• `-100123456789`",
-                reply_markup=_BACK_BTN,
-            )
-            _clear_state(admin_id)
-            raise StopPropagation
-
         try:
-            # Resolve to actual channel object to get numeric ID + title
-            chat = await client.get_chat(ch_input)
-            ch_id = chat.id
-            ch_title = getattr(chat, "title", str(ch_id))
-
-            # If public channel and no link stored yet, build from username
-            if not link_to_store:
-                uname = getattr(chat, "username", None)
-                if uname:
-                    link_to_store = f"https://t.me/{uname}"
-                # private channel: generate invite link
-                else:
-                    try:
-                        link_to_store = await client.export_chat_invite_link(ch_id)
-                    except Exception:
-                        link_to_store = None
-
-            # Check bot is admin
-            try:
-                member = await client.get_chat_member(ch_id, client.me.id)
-                is_admin = member.status.name in ["ADMINISTRATOR", "CREATOR"]
-            except Exception:
-                is_admin = False
-
-            if not is_admin:
-                await respond(
-                    f"❌ <b>Bot is not Admin in</b> <code>{_html(ch_title)}</code>.\n\n"
-                    "Make the bot an Admin first, then add it again.",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=_BACK_BTN,
-                )
-                _clear_state(admin_id)
-                raise StopPropagation
-
-            # Save: store numeric ID + link together
-            await db.add_fsub_channel(ch_id)
-            if link_to_store:
-                await db.update_fsub_channel_link(ch_id, link_to_store)
+            verified = await resolve_request_fsub_channel(client, raw)
+            await db.add_fsub_channel(verified.chat_id, verified.link)
 
             await respond(
-                "✅ <b>FSub Channel Added!</b>\n\n"
-                f"📢 <b>{_html(ch_title)}</b>\n"
-                f"🆔 <code>{ch_id}</code>\n"
-                f"🔗 <code>{_html(link_to_store or 'No link (set manually)')}</code>\n\n"
+                "✅ <b>Required Channel Added</b>\n\n"
+                f"📢 <b>{_html(verified.title)}</b>\n"
+                f"🆔 <code>{verified.chat_id}</code>\n"
+                f"🔗 <code>{_html(verified.link)}</code>\n\n"
                 "Users must join this channel to use the bot.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=_BACK_BTN,
             )
-
-        except StopPropagation:
-            raise
+        except ChannelConfigurationError as error:
+            logger.info("Required access channel rejected: %s", error)
+            await respond(
+                "❌ <b>Required Channel Not Added</b>\n\n"
+                f"{_html(str(error))}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=_BACK_BTN,
+            )
         except Exception as error:
             reference = report_internal_error(logger, "admin_add_fsub", error)
             await respond(
@@ -860,95 +798,40 @@ async def catch_admin_input(client: Client, message: Message):
     elif state == "remfsub":
         raw = message.text.strip()
         try:
-            ch_val = int(raw)
-        except ValueError:
-            ch_val = raw  # treat as @username
-        await db.remove_fsub_channel(ch_val)
-        await respond(f"✅ **Channel `{ch_val}` Successfully Removed from FSub!**", reply_markup=_BACK_BTN)
-
-    elif state in ("twostage1", "twostage2"):
-        import re as _re
-
-        raw = message.text.strip()
-        slot = 1 if state == "twostage1" else 2
-
-        # Same input-resolution logic as addfsub — accepts a t.me link,
-        # @username, or a bare numeric ID.
-        link_to_store = None
-        ch_input = raw
-
-        tme_match = _re.match(r"https?://t\.me/([a-zA-Z0-9_]+)", raw)
-        if tme_match:
-            username = tme_match.group(1)
-            ch_input = f"@{username}"
-            link_to_store = raw
-        elif raw.startswith("@"):
-            ch_input = raw
-            link_to_store = f"https://t.me/{raw.lstrip('@')}"
-        elif raw.lstrip("-").isdigit():
-            ch_input = int(raw)
-        else:
-            await respond(
-                "❌ **Invalid format.**\n\n"
-                "Send one of:\n"
-                "• `https://t.me/yourchannel`\n"
-                "• `@yourchannel`\n"
-                "• `-100123456789`",
-                reply_markup=_BACK_BTN,
-            )
-            _clear_state(admin_id)
-            raise StopPropagation
-
-        try:
-            chat = await client.get_chat(ch_input)
-            ch_id = chat.id
-            ch_title = getattr(chat, "title", str(ch_id))
-
-            if not link_to_store:
-                uname = getattr(chat, "username", None)
-                if uname:
-                    link_to_store = f"https://t.me/{uname}"
-                else:
-                    # Private channel — a "request to join" link, matching
-                    # the "Request to Join" wording this gate uses, not a
-                    # direct-join link like the main FSub's addfsub flow.
-                    try:
-                        invite = await client.create_chat_invite_link(ch_id, creates_join_request=True)
-                        link_to_store = invite.invite_link
-                    except Exception:
-                        link_to_store = None
-
-            try:
-                member = await client.get_chat_member(ch_id, client.me.id)
-                is_admin = member.status.name in ["ADMINISTRATOR", "CREATOR"]
-            except Exception:
-                is_admin = False
-
-            if not is_admin:
+            ch_val = await resolve_channel_id(client, raw)
+            removed = await db.remove_fsub_channel(ch_val)
+            if removed:
+                await respond(f"✅ **Required channel `{ch_val}` removed.**", reply_markup=_BACK_BTN)
+            else:
                 await respond(
-                    f"❌ <b>Bot is not Admin in</b> <code>{_html(ch_title)}</code>.\n\n"
-                    "Make the bot an Admin first, then add it again.",
-                    parse_mode=ParseMode.HTML,
+                    f"ℹ️ **Channel `{ch_val}` was not in Required Access.**",
                     reply_markup=_BACK_BTN,
                 )
-                _clear_state(admin_id)
-                raise StopPropagation
+        except ChannelConfigurationError as error:
+            await respond(f"❌ **Channel not removed.**\n\n{str(error)}", reply_markup=_BACK_BTN)
 
-            await db.set_two_stage_channel(slot, ch_id)
-            if link_to_store:
-                await db.update_two_stage_channel_link(ch_id, link_to_store)
+    elif state in ("twostage1", "twostage2"):
+        raw = message.text.strip()
+        slot = 1 if state == "twostage1" else 2
+        try:
+            verified = await resolve_request_fsub_channel(client, raw)
+            await db.set_two_stage_channel(slot, verified.chat_id, verified.link)
 
             await respond(
-                f"✅ <b>Two-Stage Channel {slot} Set!</b>\n\n"
-                f"📢 <b>{_html(ch_title)}</b>\n"
-                f"🆔 <code>{ch_id}</code>\n"
-                f"🔗 <code>{_html(link_to_store or 'No link (set manually)')}</code>",
+                f"✅ <b>Two-Stage Channel {slot} Set</b>\n\n"
+                f"📢 <b>{_html(verified.title)}</b>\n"
+                f"🆔 <code>{verified.chat_id}</code>\n"
+                f"🔗 <code>{_html(verified.link)}</code>",
                 parse_mode=ParseMode.HTML,
                 reply_markup=_BACK_BTN,
             )
-
-        except StopPropagation:
-            raise
+        except ChannelConfigurationError as error:
+            logger.info("Two-stage channel rejected: %s", error)
+            await respond(
+                f"❌ <b>Two-Stage Channel {slot} Not Set</b>\n\n{_html(str(error))}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=_BACK_BTN,
+            )
         except Exception as error:
             reference = report_internal_error(logger, "admin_set_two_stage", error)
             await respond(
@@ -1063,28 +946,35 @@ async def catch_admin_input(client: Client, message: Message):
             if not ok:
                 raise ChannelConfigurationError(msg_r)
             await respond(
-                f"✅ **Verified Req FSub channel added**\n\n"
-                f"Channel: `{verified.chat_id}`\n"
-                f"Name: {verified.title}\n"
-                f"The numeric identity and join link are stored separately.",
+                "✅ <b>Timed Access Channel Added</b>\n\n"
+                f"📢 <b>{_html(verified.title)}</b>\n"
+                f"🆔 <code>{verified.chat_id}</code>\n"
+                f"🔗 <code>{_html(verified.link)}</code>",
+                parse_mode=ParseMode.HTML,
                 reply_markup=_BACK_BTN,
             )
         except ChannelConfigurationError as exc:
-            reference = report_internal_error(logger, "admin_add_request_fsub", exc)
+            logger.info("Timed access channel rejected: %s", exc)
             await respond(
-                "❌ **Channel not added.** Verify its numeric ID and ensure "
-                f"the bot is an administrator.\nReference: `{reference}`",
+                f"❌ <b>Timed Access Channel Not Added</b>\n\n{_html(str(exc))}",
+                parse_mode=ParseMode.HTML,
                 reply_markup=_BACK_BTN,
             )
 
     elif state == "req_fsub_remove":
         raw = message.text.strip()
         try:
-            ch_val = int(raw)
-        except ValueError:
-            ch_val = raw
-        await db.remove_req_fsub_channel(ch_val)
-        await respond(f"✅ Channel `{ch_val}` removed from Req FSub pool.", reply_markup=_BACK_BTN)
+            ch_val = await resolve_channel_id(client, raw)
+            removed = await db.remove_req_fsub_channel(ch_val)
+            if removed:
+                await respond(f"✅ Timed access channel `{ch_val}` removed.", reply_markup=_BACK_BTN)
+            else:
+                await respond(
+                    f"ℹ️ **Channel `{ch_val}` was not in Timed Access.**",
+                    reply_markup=_BACK_BTN,
+                )
+        except ChannelConfigurationError as error:
+            await respond(f"❌ **Channel not removed.**\n\n{str(error)}", reply_markup=_BACK_BTN)
 
     elif state == "req_fsub_interval":
         try:
@@ -1266,9 +1156,8 @@ async def help_cmd(client: Client, message: Message):
 
 
 # ── FSub REFRESH JOIN LINKS ──────────────────────────────────────────────────
-# Forces regeneration of join channel invite links.
-# Use this if a join channel's link has expired or been manually revoked.
-# Note: this will revoke the current stored link and create a new one.
+# Re-resolves public links and creates fresh direct-join links for private
+# chats. Existing valid links are not revoked as a side effect.
 
 
 @Client.on_callback_query(filters.regex(r"^fsub_refresh_links$") & filters.user(ADMIN_ID))
@@ -1292,23 +1181,17 @@ async def fsub_refresh_links(client: Client, callback: CallbackQuery):
             skipped += 1
             continue
 
-        ch_str = str(ch_id).strip()
-
-        # Public @username channels never need invite links — skip them.
-        # export_chat_invite_link on a public channel stores a private invite
-        # link which can expire, replacing the working @username link.
-        if ch_str.startswith("@") or not ch_str.startswith("-100"):
-            skipped += 1
-            continue
-
         try:
-            new_link = await telegram_call(
-                lambda: client.export_chat_invite_link(int(ch_str)),
-                route="admin_refresh_invite",
-                policy=BACKGROUND_RETRY,
-                retry_safe=True,
-                idempotency_key=f"refresh-invite:{ch_str}",
-            )
+            chat = await client.get_chat(ch_id)
+            username = getattr(chat, "username", None)
+            if username:
+                new_link = f"https://t.me/{username}"
+            else:
+                invite = await client.create_chat_invite_link(
+                    int(chat.id),
+                    creates_join_request=False,
+                )
+                new_link = invite.invite_link
             await db.update_fsub_channel_link(ch_id, new_link)
             refreshed += 1
         except Exception as error:
@@ -1321,9 +1204,8 @@ async def fsub_refresh_links(client: Client, callback: CallbackQuery):
     await callback.message.edit_text(
         f"♻️ **Links Refreshed!**\n\n"
         f"✅ Refreshed: `{refreshed}` join channel(s)\n"
-        f"⏭ Skipped: `{skipped}` (request channels or errors)\n\n"
-        f"All old FSub prompt messages are now invalid — users will need "
-        f"a fresh prompt to get working buttons.",
+        f"⏭ Skipped: `{skipped}` (invalid entries or errors)\n\n"
+        f"New prompts will use the refreshed links. Existing valid links were not revoked.",
         reply_markup=markup,
     )
 

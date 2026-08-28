@@ -10,7 +10,7 @@ from database.db import db
 from plugins.callbacks import answer_callback_safely
 from plugins.file_branding import build_branded_file_name, normalize_brand_text
 from plugins.state import clear_state, get_state
-from plugins.ui_helpers import begin_prompt, finish_prompt, restore_prompt
+from plugins.ui_helpers import begin_prompt, delete_prompt_input, finish_prompt, restore_prompt
 from utils import ADMIN_ID, report_internal_error
 
 
@@ -136,6 +136,7 @@ async def file_branding_input(client, message):
 
     if message.text.casefold() in {"cancel", "/cancel"}:
         await restore_prompt(client, admin_id, fallback_message=message)
+        await delete_prompt_input(message)
         raise StopPropagation
 
     if state == "branding_text":

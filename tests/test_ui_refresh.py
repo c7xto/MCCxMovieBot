@@ -52,7 +52,7 @@ async def test_prompt_result_reuses_existing_panel():
         return_text="Old menu",
     )
     client = SimpleNamespace(edit_message_text=AsyncMock())
-    fallback = SimpleNamespace(reply_text=AsyncMock())
+    fallback = SimpleNamespace(reply_text=AsyncMock(), delete=AsyncMock())
 
     await finish_prompt(
         client,
@@ -65,6 +65,7 @@ async def test_prompt_result_reuses_existing_panel():
 
     client.edit_message_text.assert_awaited_once()
     fallback.reply_text.assert_not_awaited()
+    fallback.delete.assert_awaited_once()
     assert get_state(admin_id) is None
 
 

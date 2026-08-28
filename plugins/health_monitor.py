@@ -107,7 +107,7 @@ async def check_all_channels(client, config):
                 idempotency_key=f"channel-health:{ch}",
             )
             status = member.status.name
-            if status == "ADMINISTRATOR":
+            if status in {"ADMINISTRATOR", "OWNER", "CREATOR"}:
                 return {"label": label, "ok": True, "fix": fix, "text": f"{label}: ✅ Admin — `{ch_id}`"}
             elif status == "MEMBER":
                 return {

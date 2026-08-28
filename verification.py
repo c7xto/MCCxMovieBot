@@ -69,6 +69,10 @@ async def check_channel_membership(
         try:
             member = await client.get_chat_member(channel, user_id)
             status = member.status
+            if status is ChatMemberStatus.RESTRICTED and not bool(
+                getattr(member, "is_member", True)
+            ):
+                return VerificationResult.deny("restricted_not_a_member")
             if status in {
                 ChatMemberStatus.MEMBER,
                 ChatMemberStatus.ADMINISTRATOR,

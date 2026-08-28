@@ -52,7 +52,7 @@ from plugins.workload import (
 )
 from plugins.access_gates import GRACE_SECONDS, get_access_gates
 from plugins.telegram_retry import DELIVERY_RETRY, telegram_call
-from utils import get_subscription_status_by_id, _parse_fsub_entry
+from utils import _parse_fsub_entry, get_subscription_status_by_id  # legacy import compatibility
 from verification import (
     VerificationResult,
     VerificationStatus,
@@ -63,6 +63,7 @@ from verification import (
 logger = logging.getLogger(__name__)
 _memory_gate_cache = OrderedDict()
 _MEMORY_GATE_CACHE_MAX = 10_000
+_VERIFICATION_IO_TIMEOUT = 2.0
 
 
 @dataclass(frozen=True)
@@ -77,12 +78,22 @@ def _gate_evaluation(result, missing=(), passed_due_gates=()):
 
 
 async def _persist_passed_gate_state(user_id: int, passed_due_gates):
+    writes = []
     if "request_fsub" in passed_due_gates:
-        await db.mark_req_fsub_verified(user_id)
+        writes.append(db.mark_req_fsub_verified(user_id))
     if "two_stage" in passed_due_gates:
-        cached = await db.mark_two_stage_verified(user_id)
-        if cached is False:
-            logger.warning("Two-stage verification passed but cache persistence failed")
+        writes.append(db.mark_two_stage_verified(user_id))
+    if not writes:
+        return
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(*writes, return_exceptions=True),
+            timeout=_VERIFICATION_IO_TIMEOUT,
+        )
+        if any(result is False or isinstance(result, BaseException) for result in results):
+            logger.warning("Legacy verification cache persistence was incomplete")
+    except TimeoutError:
+        logger.warning("Legacy verification cache persistence timed out")
 
 
 async def _get_link(client, entry) -> str | None:
@@ -115,20 +126,34 @@ async def _get_link(client, entry) -> str | None:
     except Exception:
         pass
 
-    # Private channel — auto-generate a "Request to Join" invite link
+    # Private channel — generate a direct join link. A request-to-join link
+    # cannot satisfy a required membership gate until an admin approves it.
     if ch_str.lstrip("-").isdigit():
         try:
-            link = await client.create_chat_invite_link(int(ch_str), creates_join_request=True)
-            gate_key = entry.get("key") if isinstance(entry, dict) else None
-            if gate_key:
-                await db.update_access_gate_link(gate_key, link.invite_link)
+            link = await asyncio.wait_for(
+                client.create_chat_invite_link(int(ch_str), creates_join_request=False),
+                timeout=_VERIFICATION_IO_TIMEOUT,
+            )
             source = entry.get("source") if isinstance(entry, dict) else None
-            if source == "main_fsub":
-                await db.update_fsub_channel_link(channel_id, link.invite_link)
-            elif source == "two_stage":
-                await db.update_two_stage_channel_link(channel_id, link.invite_link)
-            else:
-                await db.update_req_fsub_link(channel_id, link.invite_link)
+            gate_key = entry.get("key") if isinstance(entry, dict) else None
+            try:
+                if source == "main_fsub":
+                    update = db.update_fsub_channel_link(channel_id, link.invite_link)
+                elif source == "two_stage":
+                    update = db.update_two_stage_channel_link(channel_id, link.invite_link)
+                elif source == "request_fsub":
+                    update = db.update_req_fsub_link(channel_id, link.invite_link)
+                elif gate_key:
+                    update = db.update_access_gate_link(gate_key, link.invite_link)
+                else:
+                    update = None
+                if update is not None:
+                    await asyncio.wait_for(update, timeout=_VERIFICATION_IO_TIMEOUT)
+            except Exception as exc:
+                logger.warning(
+                    "Could not persist generated access-gate link error_type=%s",
+                    type(exc).__name__,
+                )
             return link.invite_link
         except Exception as e:
             logger.debug(f"req_fsub: no invite link for {channel_id}: {e}")
@@ -225,8 +250,9 @@ async def _deliver_file(client, chat_id, user_id: int, file_obj_id: str):
 async def _channel_display_name(client, channel_id) -> str:
     try:
         ch = int(str(channel_id)) if str(channel_id).lstrip("-").isdigit() else str(channel_id)
-        chat = await client.get_chat(ch)
-        return getattr(chat, "title", "this channel")
+        chat = await asyncio.wait_for(client.get_chat(ch), timeout=_VERIFICATION_IO_TIMEOUT)
+        title = str(getattr(chat, "title", None) or "this channel").strip()
+        return title[:48] or "this channel"
     except Exception:
         return "this channel"
 
@@ -284,10 +310,24 @@ async def _collect_outstanding_gates(client, user_id: int):
 
     legacy_status = {}
     sources = {gate.get("source") for gate in gates}
+    legacy_readers = {}
     if "request_fsub" in sources and hasattr(db, "get_req_fsub_gate_status"):
-        legacy_status["request_fsub"] = await db.get_req_fsub_gate_status(user_id)
+        legacy_readers["request_fsub"] = db.get_req_fsub_gate_status(user_id)
     if "two_stage" in sources and hasattr(db, "get_two_stage_gate_status"):
-        legacy_status["two_stage"] = await db.get_two_stage_gate_status(user_id)
+        legacy_readers["two_stage"] = db.get_two_stage_gate_status(user_id)
+    if legacy_readers:
+        try:
+            values = await asyncio.wait_for(
+                asyncio.gather(*legacy_readers.values(), return_exceptions=True),
+                timeout=_VERIFICATION_IO_TIMEOUT,
+            )
+            for source, value in zip(legacy_readers, values):
+                if isinstance(value, VerificationResult):
+                    legacy_status[source] = value
+                elif isinstance(value, BaseException):
+                    record_workload_metric("verification_legacy_cache_read_failure")
+        except TimeoutError:
+            record_workload_metric("verification_legacy_cache_read_timeout")
 
     due = []
     for gate in gates:
@@ -297,24 +337,35 @@ async def _collect_outstanding_gates(client, user_id: int):
         old_status = legacy_status.get(gate.get("source"))
         if old_status and old_status.status is VerificationStatus.PASS:
             continue
-        if old_status and old_status.status is VerificationStatus.INDETERMINATE:
-            return _gate_evaluation(old_status)
         due.append(gate)
     if not due:
         return _gate_evaluation(VerificationResult.allow("verification_cache_valid"))
 
-    membership_results = await asyncio.gather(
-        *[
-            _requested_or_joined_status(
-                client,
-                gate["id"],
-                user_id,
-                allow_pending_request=gate.get("mode") == "timed",
-            )
+    try:
+        membership_results = await asyncio.wait_for(
+            asyncio.gather(
+                *[
+                    _requested_or_joined_status(
+                        client,
+                        gate["id"],
+                        user_id,
+                        allow_pending_request=False,
+                    )
+                    for gate in due
+                ],
+                return_exceptions=True,
+            ),
+            timeout=_VERIFICATION_IO_TIMEOUT,
+        )
+    except TimeoutError:
+        if all(
+            _timestamp(cache.get(gate["key"], {}).get("grace_until")) > now
             for gate in due
-        ],
-        return_exceptions=True,
-    )
+        ):
+            record_workload_metric("verification_grace_pass")
+            logger.warning("verification_grace_pass reason=telegram_membership_timeout")
+            return _gate_evaluation(VerificationResult.allow("verification_timeout_grace"))
+        return _gate_evaluation(VerificationResult.indeterminate("telegram_membership_timeout"))
     missing, passed_due_gates = [], set()
     for gate, result in zip(due, membership_results):
         if isinstance(result, BaseException):

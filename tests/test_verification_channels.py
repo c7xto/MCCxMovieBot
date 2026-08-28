@@ -3,11 +3,12 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from pyrogram.enums import ChatMemberStatus
+from pyrogram.enums import ChatMemberStatus, ChatType
 
 from plugins.verification_channels import (
     ChannelConfigurationError,
     parse_request_fsub_input,
+    resolve_channel_id,
     resolve_request_fsub_channel,
 )
 
@@ -16,10 +17,23 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class FakeClient:
-    def __init__(self, *, username=None, bot_status=ChatMemberStatus.ADMINISTRATOR):
+    def __init__(
+        self,
+        *,
+        username=None,
+        bot_status=ChatMemberStatus.ADMINISTRATOR,
+        chat_type=ChatType.CHANNEL,
+        invite_error=None,
+    ):
         self.me = SimpleNamespace(id=99)
-        self.chat = SimpleNamespace(id=-100123, username=username, title="Gate")
+        self.chat = SimpleNamespace(
+            id=-100123,
+            username=username,
+            title="Gate",
+            type=chat_type,
+        )
         self.bot_status = bot_status
+        self.invite_error = invite_error
 
     async def get_chat(self, _identifier):
         return self.chat
@@ -28,6 +42,8 @@ class FakeClient:
         return SimpleNamespace(status=self.bot_status)
 
     async def create_chat_invite_link(self, _chat_id, **_kwargs):
+        if self.invite_error:
+            raise self.invite_error
         return SimpleNamespace(invite_link="https://t.me/+verified")
 
 
@@ -45,12 +61,51 @@ class VerificationChannelTests(unittest.TestCase):
         self.assertEqual(result.chat_id, -100123)
         self.assertEqual(result.link, "https://t.me/+verified")
 
+    def test_numeric_private_id_can_generate_its_own_link(self):
+        result = asyncio.run(resolve_request_fsub_channel(FakeClient(), "-100123"))
+        self.assertEqual(result.link, "https://t.me/+verified")
+
+    def test_supplied_private_link_is_used_when_link_creation_is_not_allowed(self):
+        result = asyncio.run(
+            resolve_request_fsub_channel(
+                FakeClient(invite_error=PermissionError("no invite permission")),
+                "-100123 t.me/+operator-link",
+            )
+        )
+        self.assertEqual(result.link, "https://t.me/+operator-link")
+
+    def test_public_link_without_scheme_and_post_link_are_supported(self):
+        self.assertEqual(parse_request_fsub_input("t.me/publicgate"), ("@publicgate", None))
+        self.assertEqual(
+            parse_request_fsub_input("https://t.me/publicgate/123?single"),
+            ("@publicgate", None),
+        )
+
+    def test_private_link_cannot_be_paired_with_public_username(self):
+        with self.assertRaises(ChannelConfigurationError):
+            parse_request_fsub_input("@publicgate https://t.me/+private")
+
     def test_public_username_is_resolved_to_numeric_id(self):
         result = asyncio.run(
             resolve_request_fsub_channel(FakeClient(username="publicgate"), "@publicgate")
         )
         self.assertEqual(result.chat_id, -100123)
         self.assertEqual(result.link, "https://t.me/publicgate")
+
+    def test_groups_are_valid_verification_targets(self):
+        result = asyncio.run(
+            resolve_request_fsub_channel(
+                FakeClient(username="publicgroup", chat_type=ChatType.SUPERGROUP),
+                "https://t.me/publicgroup",
+            )
+        )
+        self.assertEqual(result.chat_id, -100123)
+
+    def test_remove_by_public_link_resolves_stored_numeric_id(self):
+        result = asyncio.run(
+            resolve_channel_id(FakeClient(username="publicgate"), "https://t.me/publicgate")
+        )
+        self.assertEqual(result, -100123)
 
     def test_non_admin_bot_is_rejected(self):
         with self.assertRaises(ChannelConfigurationError):

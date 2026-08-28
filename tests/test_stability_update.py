@@ -163,6 +163,66 @@ async def test_definite_membership_denial_invalidates_cache():
     assert repository.invalidated == [(7, "gate-one")]
 
 
+@pytest.mark.asyncio
+async def test_legacy_cache_failure_falls_back_to_direct_membership_check():
+    repository = _GateRepository({}, VerificationResult.allow("joined"))
+
+    async def unavailable_legacy_cache(_user_id):
+        return VerificationResult.indeterminate("legacy_database_unavailable")
+
+    repository.get_req_fsub_gate_status = unavailable_legacy_cache
+
+    async def timed_config():
+        return {
+            "access_gates_schema_version": 1,
+            "access_gates": [
+                {
+                    "key": "gate-one",
+                    "id": -1001,
+                    "link": "https://t.me/gate",
+                    "label": "Gate",
+                    "mode": "timed",
+                    "interval_seconds": 900,
+                    "enabled": True,
+                    "source": "request_fsub",
+                }
+            ],
+        }
+
+    repository.get_config = timed_config
+    with (
+        patch.object(req_fsub, "db", repository),
+        patch.object(
+            req_fsub,
+            "_requested_or_joined_status",
+            AsyncMock(return_value=repository.membership_result),
+        ) as membership,
+    ):
+        evaluation = await req_fsub._collect_outstanding_gates(_GateClient(), 7)
+    assert evaluation.result.status is VerificationStatus.PASS
+    membership.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_membership_timeout_uses_recent_grace(monkeypatch):
+    now = time.time()
+    repository = _GateRepository(
+        {"gate-one": {"valid_until": now - 1, "grace_until": now + 60}},
+        VerificationResult.allow("unused"),
+    )
+
+    async def slow_membership(*_args, **_kwargs):
+        await asyncio.sleep(1)
+
+    monkeypatch.setattr(req_fsub, "_VERIFICATION_IO_TIMEOUT", 0.01)
+    with (
+        patch.object(req_fsub, "db", repository),
+        patch.object(req_fsub, "_requested_or_joined_status", slow_membership),
+    ):
+        evaluation = await req_fsub._collect_outstanding_gates(_GateClient(), 7)
+    assert evaluation.result.status is VerificationStatus.PASS
+
+
 def test_all_callback_handlers_acknowledge_before_io():
     accepted = {
         "answer_callback_safely",

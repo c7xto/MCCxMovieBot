@@ -37,6 +37,19 @@ async def begin_prompt(callback, state: str, text: str):
     await message.edit_text(text, reply_markup=cancel_button())
 
 
+async def delete_prompt_input(message) -> bool:
+    """Best-effort cleanup for an admin value already captured by a prompt."""
+    delete = getattr(message, "delete", None) if message is not None else None
+    if not callable(delete):
+        return False
+    try:
+        await delete()
+        return True
+    except Exception as exc:
+        logger.info("Could not remove consumed prompt input: %s", type(exc).__name__)
+        return False
+
+
 async def restore_prompt(client, admin_id: int, fallback_message=None) -> bool:
     """Restore the menu saved before an input prompt without a new bot bubble."""
     context = get_state_context(admin_id)
@@ -100,6 +113,7 @@ async def finish_prompt(
                 text,
                 **edit_kwargs,
             )
+            await delete_prompt_input(fallback_message)
             return
         except Exception as exc:
             logger.info("Could not finish prompt in place: %s", type(exc).__name__)
@@ -109,6 +123,7 @@ async def finish_prompt(
             reply_parameters=None,
             **edit_kwargs,
         )
+        await delete_prompt_input(fallback_message)
 
 
 @Client.on_callback_query(filters.regex(r"^ui_prompt_cancel$") & filters.user(ADMIN_ID))

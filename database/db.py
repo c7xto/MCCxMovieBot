@@ -3540,10 +3540,12 @@ class Database:
         _config_cache_ts = 0.0
         return True
 
-    async def add_fsub_channel(self, channel_id):
+    async def add_fsub_channel(self, channel_id, link=None):
         if self.config_col is None:
             return False
         entry = {"id": channel_id}
+        if isinstance(link, str) and link.startswith("https://t.me/"):
+            entry["link"] = link
         await self.config_col.update_one(
             {"_id": "bot_config"}, {"$pull": {"fsub_channels": {"id": channel_id}}}
         )
@@ -3578,15 +3580,17 @@ class Database:
     async def remove_fsub_channel(self, channel_id):
         if self.config_col is None:
             return False
-        await self.config_col.update_one(
+        dict_result = await self.config_col.update_one(
             {"_id": "bot_config"}, {"$pull": {"fsub_channels": {"id": channel_id}}}
         )
-        await self.config_col.update_one({"_id": "bot_config"}, {"$pull": {"fsub_channels": channel_id}})
+        scalar_result = await self.config_col.update_one(
+            {"_id": "bot_config"}, {"$pull": {"fsub_channels": channel_id}}
+        )
         global _config_cache, _config_cache_ts
         _config_cache = None
         _config_cache_ts = 0.0
         await self._sync_access_gates_from_legacy()
-        return True
+        return bool(dict_result.modified_count or scalar_result.modified_count)
 
     async def add_db_channel(self, channel_id):
         if self.config_col is None:
@@ -3619,12 +3623,12 @@ class Database:
             return False, "A verified Telegram invite/public link is required"
         config = await self.config_col.find_one({"_id": "bot_config"})
         existing = config.get("req_fsub_channels", []) if config else []
-        if len(existing) >= 5:
-            return False, "Max 5 reached"
         for e in existing:
             eid = e.get("id") if isinstance(e, dict) else e
             if str(eid) == str(channel_id):
-                return False, "Already exists"
+                return False, "That channel is already configured"
+        if len(existing) >= 5:
+            return False, "Remove one timed channel before adding another (maximum 5)"
         entry = {"id": channel_id, "link": link, "title": str(title)[:100]}
         await self.config_col.update_one(
             {"_id": "bot_config"},
@@ -3640,15 +3644,17 @@ class Database:
     async def remove_req_fsub_channel(self, channel_id):
         if self.config_col is None:
             return False
-        await self.config_col.update_one(
+        dict_result = await self.config_col.update_one(
             {"_id": "bot_config"}, {"$pull": {"req_fsub_channels": {"id": channel_id}}}
         )
-        await self.config_col.update_one({"_id": "bot_config"}, {"$pull": {"req_fsub_channels": channel_id}})
+        scalar_result = await self.config_col.update_one(
+            {"_id": "bot_config"}, {"$pull": {"req_fsub_channels": channel_id}}
+        )
         global _config_cache, _config_cache_ts
         _config_cache = None
         _config_cache_ts = 0.0
         await self._sync_access_gates_from_legacy()
-        return True
+        return bool(dict_result.modified_count or scalar_result.modified_count)
 
     async def update_req_fsub_link(self, channel_id, link):
         if self.config_col is None:
@@ -3668,7 +3674,7 @@ class Database:
         _config_cache_ts = 0.0
         await self._sync_access_gates_from_legacy()
 
-    async def set_two_stage_channel(self, slot: int, channel_id) -> bool:
+    async def set_two_stage_channel(self, slot: int, channel_id, link=None) -> bool:
         """slot is 1 or 2 — a fixed 2-slot list (unlike fsub_channels/
         req_fsub_channels, which are appendable pools), since the Two-Stage
         Verification gate is specifically a sequential Channel-1-then-
@@ -3679,7 +3685,10 @@ class Database:
         channels = list(config.get("two_stage_channels", [])) if config else []
         while len(channels) < 2:
             channels.append(None)
-        channels[slot - 1] = {"id": channel_id}
+        entry = {"id": channel_id}
+        if isinstance(link, str) and link.startswith("https://t.me/"):
+            entry["link"] = link
+        channels[slot - 1] = entry
         await self.config_col.update_one(
             {"_id": "bot_config"}, {"$set": {"two_stage_channels": channels}}, upsert=True
         )

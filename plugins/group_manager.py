@@ -8,7 +8,7 @@ from pyrogram.enums import ParseMode
 from database.db import db
 from plugins.state import get_state, set_state, clear_state
 from plugins.callbacks import answer_callback_safely
-from plugins.ui_helpers import begin_prompt, finish_prompt, restore_prompt
+from plugins.ui_helpers import begin_prompt, delete_prompt_input, finish_prompt, restore_prompt
 from utils import ADMIN_ID, _html
 
 load_dotenv()
@@ -341,6 +341,7 @@ async def gm_input_handler(client: Client, message: Message):
 
     if message.text.lower() in ("/cancel", "cancel"):
         await restore_prompt(client, admin_id, fallback_message=message)
+        await delete_prompt_input(message)
         raise StopPropagation
 
     if state == "gm_ban":

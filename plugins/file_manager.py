@@ -9,7 +9,13 @@ from database.db import db
 from plugins.state import get_state, get_state_context, set_state, clear_state
 from plugins.task_supervisor import TaskConflict, supervisor
 from plugins.callbacks import answer_callback_safely
-from plugins.ui_helpers import begin_prompt, cancel_button, finish_prompt, restore_prompt
+from plugins.ui_helpers import (
+    begin_prompt,
+    cancel_button,
+    delete_prompt_input,
+    finish_prompt,
+    restore_prompt,
+)
 from utils import ADMIN_ID, _html, report_internal_error
 
 load_dotenv()
@@ -744,6 +750,7 @@ async def fm_input_handler(client: Client, message: Message):
 
     if message.text.lower() in ("/cancel", "cancel"):
         await restore_prompt(client, admin_id, fallback_message=message)
+        await delete_prompt_input(message)
         raise StopPropagation
 
     # fm_search

@@ -159,6 +159,9 @@ def access_gate_health(gate: dict) -> tuple[bool, str]:
         return False, "missing channel ID"
     if gate.get("mode") not in {"required", "timed"}:
         return False, "invalid mode"
-    if not gate.get("link") and str(gate.get("id", "")).lstrip("@").lstrip("-").isdigit():
+    link = gate.get("link")
+    if not link and str(gate.get("id", "")).lstrip("@").lstrip("-").isdigit():
         return False, "private channel has no stored invite link"
+    if link and not str(link).startswith("https://t.me/"):
+        return False, "stored join link is invalid"
     return True, "configured"
