@@ -34,8 +34,10 @@ from database.db import (
     _read_duplicate_report,
     _stage_cleanup_registry_ids,
     _spool_duplicate_batch,
+    deduplicate_file_batch,
     normalize_duplicate_name,
     probable_duplicate_name,
+    registry_identity_document,
     telegram_file_identity,
 )
 
@@ -194,6 +196,16 @@ class BoundedCatalogTests(unittest.TestCase):
         self.assertEqual(
             telegram_file_identity(first), telegram_file_identity(refreshed)
         )
+
+        registry_doc = registry_identity_document(first, "unique-content")
+        self.assertEqual(registry_doc["telegram_identity"], telegram_file_identity(first))
+        self.assertEqual(registry_doc["file_unique_id"], "unique-content")
+
+        files, duplicate_count = deduplicate_file_batch(
+            [{"file_id": first}, {"file_id": refreshed}]
+        )
+        self.assertEqual([item["file_id"] for item in files], [first])
+        self.assertEqual(duplicate_count, 1)
 
     def test_verified_cleanup_classifies_only_same_telegram_media(self):
         def file_id(media_id, reference):

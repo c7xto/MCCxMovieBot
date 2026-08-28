@@ -181,12 +181,20 @@ class AutoFilterBot(Client):
             for i, db_instance in enumerate(db.dbs):
                 try:
                     await db_instance.command("ping")
+                    db.mark_shard_reachable(i, "startup_ping_ok")
                     logger.info(f"  ✅ Cluster {i + 1} — OK")
                 except Exception as e:
+                    db.mark_shard_error(i, e)
                     if i == 0:
                         await super().stop()
                         raise RuntimeError(f"Primary MongoDB cluster is unavailable: {e}") from e
                     logger.warning(f"  ⚠️ Optional cluster {i + 1} unavailable: {e}")
+
+            # Capture capacity and finish read/write routing before any user
+            # traffic or background catalog scan starts. Probes run in
+            # parallel, so one optional outage costs only its bounded timeout.
+            await db.probe_shards()
+            logger.info("🧭 MongoDB shard routing ready: %s", db.shard_health_snapshot())
 
         if db.operations_db is not None:
             try:

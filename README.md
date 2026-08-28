@@ -32,6 +32,8 @@ Premium plans and web streaming are deliberately outside this project's current 
 - Access gates use a TTL-backed verification cache and a short grace window for temporary Telegram failures.
 - An optional dedicated operations database keeps configuration, checkpoints and the cross-cluster registry away from movie-shard capacity limits.
 - The primary MongoDB cluster is required at startup; optional clusters degrade independently.
+- Failed optional shards are removed from search fan-out immediately and restored by live health probes.
+- Analytics is split into fast Overview, Library, Activity and Health pages; the Health page performs fresh shard checks.
 - Search sessions are bounded and expire automatically.
 - Message deletions use a persistent MongoDB queue, so restarts do not cancel them.
 - Broadcasts show live speed and ETA, support pause/resume/safe stop, and resume from durable recipient checkpoints after restarts.
@@ -136,6 +138,7 @@ overwrite an existing plaintext file.
 3. Configure source and required-subscription channels.
 4. Forward a storage-channel message to the bot to begin bulk indexing.
 5. Run `python tools/migrate_registry.py` once if upgrading an older database.
+6. Run the same migration after attaching a database that already contains movie rows. It is additive and safe to re-run.
 
 ## Development and verification
 
@@ -151,6 +154,8 @@ dependencies. The GitHub Actions workflow runs the same gate in a clean Python
 ## Important operational notes
 
 - New rows use indexed title tokens; older libraries automatically keep the compatible reference-bot search, with bounded RapidFuzz typo correction. No large database rewrite is required for an update.
+- Slash commands are never treated as movie searches and never enter missing-search analytics.
+- `tools/migrate_registry.py` now enriches legacy rows with stable Telegram identities as well as file IDs. It requires every configured shard to be online so it cannot produce a misleading partial registry.
 - Duplicate scans start in report-only mode. Verified exact copies can be removed only after a separate admin confirmation; probable matches are never auto-deleted, and language, quality, codec, size, season and episode variants are preserved.
 - Broadcast source messages must remain available in the administrator chat until a scheduled job completes.
 - Use only media you are legally authorized to distribute and follow Telegram and hosting-provider rules.

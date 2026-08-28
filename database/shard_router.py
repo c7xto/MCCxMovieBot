@@ -1,4 +1,4 @@
-"""In-memory movie-shard health routing; reads continue to fan out."""
+"""In-memory movie-shard health routing for reads and writes."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ def is_capacity_error(error: BaseException) -> bool:
 
 @dataclass
 class ShardHealth:
-    state: str = "healthy"
+    state: str = "checking"
     size_mb: float | None = None
     changed_at: float = 0.0
     retry_at: float = 0.0
@@ -37,19 +37,47 @@ class ShardRouter:
         self._health = [ShardHealth(changed_at=time.monotonic()) for _ in range(count)]
 
     def candidates(self) -> list[int]:
-        now = time.monotonic()
+        """Return shards that may accept a write.
+
+        Full, quarantined and currently unavailable shards are excluded.
+        An unavailable shard becomes probe-eligible after ``retry_at`` but is
+        not sent normal traffic until a health probe marks it reachable.
+        """
         candidates = []
         for index, health in enumerate(self._health):
-            if health.state == "full":
+            if health.state in {"full", "quarantined", "capacity_unknown"}:
                 continue
-            if health.state == "unavailable" and health.retry_at > now:
+            if health.state == "unavailable":
                 continue
             candidates.append(index)
         return candidates
 
+    def read_candidates(self) -> list[int]:
+        """Return shards safe for user-facing reads.
+
+        Full shards remain readable. Unavailable and quarantined shards are
+        kept out of request fan-out so one failed Atlas cluster cannot add a
+        server-selection timeout to every search, callback or admin screen.
+        """
+        return [
+            index
+            for index, health in enumerate(self._health)
+            if health.state not in {"unavailable", "quarantined"}
+        ]
+
+    def probe_candidates(self) -> list[int]:
+        """Return shards whose connectivity should be tested now."""
+        now = time.monotonic()
+        return [
+            index
+            for index, health in enumerate(self._health)
+            if health.state != "quarantined"
+            and (health.state != "unavailable" or health.retry_at <= now)
+        ]
+
     def record_size(self, index: int, size_mb: float):
         if size_mb == float("inf"):
-            self.mark_unavailable(index, "capacity_unknown")
+            self._set(index, "capacity_unknown", None, "capacity_unknown", retry_after=30)
         elif size_mb >= CAPACITY_LIMIT_MB:
             self._set(index, "full", size_mb, "capacity_limit", retry_after=300)
         elif size_mb >= NEAR_LIMIT_MB:
@@ -62,6 +90,16 @@ class ShardRouter:
             self._set(index, "full", self._health[index].size_mb, "quota_write_error", retry_after=300)
         else:
             self.mark_unavailable(index, type(error).__name__)
+
+    def mark_reachable(self, index: int, reason: str = "connection_ok"):
+        """Restore reads without accidentally clearing a known full state."""
+        health = self._health[index]
+        if health.state in {"checking", "unavailable"}:
+            self._set(index, "healthy", health.size_mb, reason)
+
+    def mark_quarantined(self, index: int, reason: str):
+        """Exclude a shard until an operator resolves a data-safety issue."""
+        self._set(index, "quarantined", self._health[index].size_mb, reason)
 
     def mark_unavailable(self, index: int, reason: str):
         self._set(index, "unavailable", self._health[index].size_mb, reason, retry_after=30)
@@ -85,4 +123,12 @@ class ShardRouter:
                 "reason": health.reason,
             }
             for index, health in enumerate(self._health)
+        ]
+
+    def unavailable(self) -> list[int]:
+        """Return one-based cluster numbers that cannot provide complete reads."""
+        return [
+            index + 1
+            for index, health in enumerate(self._health)
+            if health.state in {"unavailable", "quarantined", "checking"}
         ]

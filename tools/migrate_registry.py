@@ -21,8 +21,8 @@ Design notes:
     existing file documents, so it can run alongside normal bot traffic
     with no downtime and no locking.
   - Memory-efficient: each cluster is scanned with a single streaming async
-    cursor projected down to {"file_id": 1}, and only a bounded batch (up to
-    BATCH_SIZE file_ids) is ever held in memory per cluster at once — not
+    cursor projected down to its Telegram identity fields, and only a bounded
+    batch is ever held in memory per cluster at once — not
     the full ~1.5M-document result set.
   - Concurrent: all configured clusters are scanned in parallel via
     asyncio.gather, each with its own cursor and its own batching, so total
@@ -44,10 +44,10 @@ import logging
 # sys.path, so `from database.db import db` resolves correctly.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from pymongo import InsertOne
+from pymongo import UpdateOne
 from pymongo.errors import BulkWriteError
 
-from database.db import db
+from database.db import db, registry_identity_document
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,32 +55,46 @@ logging.basicConfig(
 )
 logger = logging.getLogger("migrate_registry")
 
-BATCH_SIZE      = 5000    # file_ids per bulk_write to file_registry
+BATCH_SIZE      = 5000    # identity records per bulk_write to file_registry
 PROGRESS_EVERY  = 100_000  # log a progress line at least this often
 MAX_BATCH_RETRIES = 5
 
 
 async def _flush_batch(batch: list) -> tuple:
-    """Bulk-inserts a batch of file_ids into file_registry.
-    Returns (inserted_count, duplicate_count). Duplicate-key errors (code
-    11000) are expected — both from cross-cluster collisions this backfill
-    is meant to surface, and from re-running this script — and are not
-    treated as failures. Any other error is logged and the batch is simply
-    not counted, safely retryable on a future run."""
-    if not batch:
-        return 0, 0
+    """Insert or enrich a batch of identities in file_registry.
 
-    ops = [InsertOne({"file_id": fid}) for fid in batch]
+    Returns (inserted_count, enriched_count, duplicate_count). Duplicate-key errors (code
+    11000) are expected when two legacy rows claim the same stable Telegram
+    identity and are not treated as failures. Re-running the script simply
+    leaves already-current registry rows unchanged. Any other error is
+    safely retryable on a future run."""
+    if not batch:
+        return 0, 0, 0
+
+    ops = []
+    for item in batch:
+        identity = registry_identity_document(
+            item.get("file_id", ""), item.get("file_unique_id", "") or ""
+        )
+        stable_fields = {key: value for key, value in identity.items() if key != "file_id"}
+        update = {"$setOnInsert": {"file_id": identity["file_id"]}}
+        if stable_fields:
+            update["$set"] = stable_fields
+        ops.append(UpdateOne({"file_id": identity["file_id"]}, update, upsert=True))
     for attempt in range(1, MAX_BATCH_RETRIES + 1):
         try:
             result = await db.registry_col.bulk_write(ops, ordered=False)
-            return result.inserted_count, 0
+            return result.upserted_count, result.modified_count, 0
         except BulkWriteError as bwe:
             write_errors = bwe.details.get("writeErrors", [])
             dup_count = sum(1 for e in write_errors if e.get("code") == 11000)
             other_errors = [e for e in write_errors if e.get("code") != 11000]
             if not other_errors:
-                return bwe.details.get("nInserted", 0), dup_count
+                return (
+                    bwe.details.get("nUpserted", 0),
+                    bwe.details.get("nModified", 0),
+                    dup_count,
+                )
             error = RuntimeError(
                 f"{len(other_errors)} non-duplicate write error(s); "
                 f"sample: {other_errors[0].get('errmsg', '')[:150]}"
@@ -117,12 +131,15 @@ async def _scan_cluster(cluster_idx: int, col, progress: dict, lock: asyncio.Loc
     with the other clusters via asyncio.gather in main()."""
     batch = []
 
-    cursor = col.find({"file_id": {"$exists": True, "$ne": ""}}, {"_id": 0, "file_id": 1})
+    cursor = col.find(
+        {"file_id": {"$exists": True, "$ne": ""}},
+        {"_id": 0, "file_id": 1, "file_unique_id": 1},
+    )
     async for doc in cursor:
         fid = doc.get("file_id")
         if not fid:
             continue
-        batch.append(fid)
+        batch.append(doc)
 
         if len(batch) >= BATCH_SIZE:
             await _drain(batch, progress, lock, total_estimate, start)
@@ -135,13 +152,14 @@ async def _scan_cluster(cluster_idx: int, col, progress: dict, lock: asyncio.Loc
 
 
 async def _drain(batch: list, progress: dict, lock: asyncio.Lock, total_estimate: int, start: float):
-    inserted, duplicates = await _flush_batch(batch)
+    inserted, enriched, duplicates = await _flush_batch(batch)
     n = len(batch)
 
     async with lock:
         prev_scanned = progress["scanned"]
         progress["scanned"]    += n
         progress["inserted"]   += inserted
+        progress["enriched"]   += enriched
         progress["duplicates"] += duplicates
         scanned = progress["scanned"]
 
@@ -156,7 +174,8 @@ def _log_progress(progress: dict, total_estimate: int, start: float):
     rate    = progress["scanned"] / elapsed if elapsed > 0 else 0
     logger.info(
         f"Processed {progress['scanned']:,} / {total_estimate:,} files... "
-        f"({progress['inserted']:,} newly registered, {progress['duplicates']:,} duplicates, "
+        f"({progress['inserted']:,} newly registered, {progress['enriched']:,} identity-enriched, "
+        f"{progress['duplicates']:,} duplicates, "
         f"{rate:,.0f} docs/sec)"
     )
 
@@ -201,6 +220,15 @@ async def _build_and_verify_registry_index():
 
     logger.info("✅ Verified: file_registry.file_id has a unique index. Safe to proceed.")
 
+    for field in ("file_unique_id", "telegram_identity"):
+        logger.info("📑 Ensuring sparse unique index on file_registry.%s...", field)
+        await db.registry_col.create_index(
+            field,
+            unique=True,
+            sparse=True,
+            name=f"{field}_unique",
+        )
+
 
 async def main():
     if not db.file_cols:
@@ -209,6 +237,22 @@ async def main():
 
     if db.registry_col is None:
         logger.error("No main_db configured — file_registry unavailable — aborting.")
+        sys.exit(1)
+
+    logger.info("🔌 Checking every configured movie cluster before migration...")
+    probes = await asyncio.gather(
+        *[db_instance.command("ping") for db_instance in db.dbs],
+        return_exceptions=True,
+    )
+    unavailable = [
+        index + 1 for index, result in enumerate(probes) if isinstance(result, BaseException)
+    ]
+    if unavailable:
+        logger.error(
+            "Migration not started: Cluster(s) %s are unavailable. A partial "
+            "registry migration would weaken cross-cluster duplicate protection.",
+            ", ".join(map(str, unavailable)),
+        )
         sys.exit(1)
 
     # Pre-migration indexing lock — must complete and verify successfully
@@ -222,7 +266,7 @@ async def main():
         logger.info(f"   Cluster {i + 1}: {c:,} documents")
     logger.info(f"📊 Estimated {total_estimate:,} total documents to scan.")
 
-    progress = {"scanned": 0, "inserted": 0, "duplicates": 0}
+    progress = {"scanned": 0, "inserted": 0, "enriched": 0, "duplicates": 0}
     lock     = asyncio.Lock()
     start    = time.time()
 
@@ -237,8 +281,9 @@ async def main():
         f"🎉 Migration complete in {elapsed:.1f}s — "
         f"{progress['scanned']:,} scanned, "
         f"{progress['inserted']:,} newly registered, "
-        f"{progress['duplicates']:,} already-registered duplicates skipped "
-        f"(cross-cluster collisions + files already covered by a prior run)."
+        f"{progress['enriched']:,} existing identities enriched, "
+        f"{progress['duplicates']:,} stable-identity conflicts safely skipped. "
+        "Already-current registry rows were left unchanged."
     )
 
 

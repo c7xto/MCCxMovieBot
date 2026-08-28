@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from pyrogram import ContinuePropagation, StopPropagation
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
+from pyrogram.errors import MessageNotModified
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from database.db import db, validate_config_restore
 from plugins.state import (
@@ -22,6 +23,7 @@ from plugins.verification_channels import (
 from plugins.config_backup import encrypt_config_export
 from plugins.callbacks import answer_callback_safely
 from plugins.access_gates import access_gate_health, get_access_gates
+from plugins.workload import workload_snapshot
 from plugins.ui_helpers import begin_prompt, delete_prompt_input, finish_prompt, restore_prompt
 from utils import (
     ADMIN_ID,
@@ -291,85 +293,183 @@ async def back_to_admin(client: Client, callback: CallbackQuery):
 # ── STATS ─────────────────────────────────────────────────────────────────────
 
 
-@Client.on_callback_query(filters.regex(r"^admin_stats$") & filters.user(ADMIN_ID))
-async def show_stats(client: Client, callback: CallbackQuery):
-    """Unified analytics — users, files, clusters, language breakdown, top groups."""
-    await answer_callback_safely(callback, "Loading analytics…")
-    await callback.message.edit_text("⏳ **Loading analytics...**")
-
-    total_users, total_banned, total_files, db_sizes, total_groups = await db.get_bot_stats()
-
-    # Cluster bars
-    cluster_text = ""
-    for db_num, size in db_sizes:
-        fill = max(0, min(10, round((size / 512) * 10)))
-        bar = "█" * fill + "░" * (10 - fill)
-        status = "⚠️" if size >= 450 else "✅"
-        cluster_text += f"{status} Cluster {db_num}  [{bar}]  `{size:.1f} MB`\n"
-    if db.operations_db is not None:
-        try:
-            size = await db.get_db_size(db.operations_db)
-            fill = max(0, min(10, round((size / 512) * 10)))
-            bar = "█" * fill + "░" * (10 - fill)
-            status = "⚠️" if size >= 450 else "✅"
-            cluster_text += f"{status} Operations  [{bar}]  `{size:.1f} MB`\n"
-        except Exception:
-            cluster_text += "⚠️ Operations storage unavailable\n"
-
-    # Language breakdown
-    try:
-        lang_counts = await db.get_files_by_language()
-        lang_lines = ""
-        lang_emojis = {
-            "Malayalam": "🌴",
-            "Tamil": "🎭",
-            "Telugu": "⭐",
-            "Hindi": "🇮🇳",
-            "English": "🌍",
-            "Kannada": "🏵",
-            "Dual Audio": "🎧",
-            "Multi Audio": "🎵",
-        }
-        largest_language = max(lang_counts.values(), default=0)
-        for lang, count in sorted(lang_counts.items(), key=lambda x: x[1], reverse=True):
-            if count == 0:
-                continue
-            emoji = lang_emojis.get(lang, "🔊")
-            pct = (count / total_files * 100) if total_files > 0 else 0
-            bar_f = max(1, round((count / largest_language) * 10)) if largest_language else 0
-            bar = "█" * bar_f + "░" * (10 - bar_f)
-            lang_lines += f"{emoji} {lang:<12} [{bar}] `{count:,}` • `{pct:.1f}%`\n"
-    except Exception:
-        lang_lines = "Language data unavailable.\n"
-
-    # Top 5 groups
-    try:
-        top_groups = await db.get_top_groups(limit=5)
-        group_lines = ""
-        for i, g in enumerate(top_groups, 1):
-            title = str(g.get("title") or "").strip()
-            if not title or title == "?":
-                title = "Unavailable group"
-            group_lines += f"{i}. {title[:25]} • `{g.get('search_count', 0):,}` searches\n"
-        if not group_lines:
-            group_lines = "No group activity yet.\n"
-    except Exception:
-        group_lines = "Group data unavailable.\n"
-
-    stats_text = (
-        f"📊 **MCCxBot Analytics**\n\n"
-        f"👥 Users: `{total_users:,}`  🚫 Banned: `{total_banned}`\n"
-        f"📁 Files: `{total_files:,}`  🏘 Groups: `{total_groups}`\n\n"
-        f"💾 **Storage:**\n{cluster_text}\n"
-        f"🌐 **Files by Language:**\n{lang_lines}\n"
-        f"🏆 **Top Active Groups:**\n{group_lines}"
+def _analytics_markup(active="overview"):
+    labels = {
+        "overview": "📊 Overview",
+        "library": "🌐 Library",
+        "activity": "🏆 Activity",
+        "health": "🩺 Health",
+    }
+    callbacks = {
+        "overview": "admin_stats",
+        "library": "admin_stats_library",
+        "activity": "admin_stats_activity",
+        "health": "admin_stats_health",
+    }
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(labels["overview"], callback_data=callbacks["overview"]),
+                InlineKeyboardButton(labels["library"], callback_data=callbacks["library"]),
+            ],
+            [
+                InlineKeyboardButton(labels["activity"], callback_data=callbacks["activity"]),
+                InlineKeyboardButton(labels["health"], callback_data=callbacks["health"]),
+            ],
+            [
+                InlineKeyboardButton("↻ Refresh", callback_data=callbacks[active]),
+                InlineKeyboardButton("‹ Control Center", callback_data="back_to_admin"),
+            ],
+        ]
     )
 
-    markup = InlineKeyboardMarkup([[InlineKeyboardButton("‹ Control Center", callback_data="back_to_admin")]])
+
+def _cluster_status_line(health: dict) -> str:
+    state = str(health.get("state") or "checking")
+    size = health.get("size_mb")
+    state_ui = {
+        "healthy": ("🟢", "Healthy"),
+        "near_limit": ("🟠", "Near limit"),
+        "full": ("🔴", "Full"),
+        "unavailable": ("🔴", "Offline"),
+        "capacity_unknown": ("🟡", "Capacity unknown"),
+        "quarantined": ("🔒", "Needs migration"),
+        "checking": ("🟡", "Checking"),
+    }
+    icon, label = state_ui.get(state, ("🟡", state.replace("_", " ").title()))
+    if isinstance(size, (int, float)) and size != float("inf"):
+        fill = max(0, min(10, round((float(size) / 450.0) * 10)))
+        bar = "▰" * fill + "▱" * (10 - fill)
+        usage = f"`{float(size):.1f} MB`"
+    else:
+        bar = "▱" * 10
+        usage = "`Unavailable`"
+    return f"{icon} C{health.get('cluster')}  {bar}  {usage} • {label}"
+
+
+async def _show_analytics_page(callback, text, active):
     try:
-        await callback.message.edit_text(stats_text, reply_markup=markup)
-    except Exception:
-        await callback.message.edit_text(stats_text[:4000], reply_markup=markup)
+        await callback.message.edit_text(text[:4000], reply_markup=_analytics_markup(active))
+    except MessageNotModified:
+        # A quick refresh can legitimately produce the same live snapshot.
+        # The callback was already acknowledged, so this is a successful no-op.
+        pass
+
+
+@Client.on_callback_query(filters.regex(r"^admin_stats$") & filters.user(ADMIN_ID))
+async def show_stats(client: Client, callback: CallbackQuery):
+    """Fast overview; expensive breakdowns live on their own pages."""
+    await answer_callback_safely(callback, "Refreshing analytics…")
+    total_users, total_banned, total_files, _, total_groups = await db.get_bot_stats()
+    health = db.shard_health_snapshot()
+    unavailable = db.unavailable_shards()
+    coverage = "Complete" if not unavailable else f"Last-known • C{', C'.join(map(str, unavailable))} offline"
+    cache = db.cache_metrics().get("queries", {})
+    hits = int(cache.get("hits", 0))
+    misses = int(cache.get("misses", 0))
+    hit_rate = (hits * 100 / (hits + misses)) if hits + misses else 0.0
+    workload = workload_snapshot()
+    ops_note = (
+        "🟢 Dedicated operations database"
+        if db.operations_db is not None
+        else "🟠 Operations share a movie cluster"
+    )
+    cluster_lines = "\n".join(_cluster_status_line(item) for item in health)
+    text = (
+        "📊 **MCCxBot Analytics**\n"
+        "Live, compact operational snapshot\n\n"
+        "👥 **Audience**\n"
+        f"Users  `{total_users:,}`   Groups  `{total_groups:,}`\n"
+        f"Banned  `{total_banned:,}`\n\n"
+        "📚 **Library**\n"
+        f"Files  `{total_files:,}`\n"
+        f"Coverage  `{coverage}`\n\n"
+        f"💾 **Movie Shards**\n{cluster_lines or 'No movie shards configured'}\n\n"
+        "⚡ **Live Performance**\n"
+        f"Searches active  `{int(workload.get('search_active', 0))}` / "
+        f"`{int(workload.get('search_capacity', 0))}`\n"
+        f"Queue  `{int(workload.get('search_queue_depth', 0))}`   "
+        f"Cache hit  `{hit_rate:.0f}%`\n"
+        f"{ops_note}"
+    )
+    await _show_analytics_page(callback, text, "overview")
+
+
+@Client.on_callback_query(filters.regex(r"^admin_stats_library$") & filters.user(ADMIN_ID))
+async def show_stats_library(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback, "Loading library breakdown…")
+    await callback.message.edit_text("🌐 **Library Analytics**\n\nCalculating language totals…")
+    total_files = await db.get_total_files()
+    lang_counts = await db.get_files_by_language()
+    largest = max(lang_counts.values(), default=0)
+    lines = []
+    for language, count in sorted(lang_counts.items(), key=lambda item: item[1], reverse=True):
+        if not count:
+            continue
+        fill = max(1, round((count / largest) * 8)) if largest else 0
+        bar = "▰" * fill + "▱" * (8 - fill)
+        percentage = count * 100 / total_files if total_files else 0.0
+        lines.append(f"{bar}  **{language}**\n`{count:,}` files • `{percentage:.1f}%`")
+    coverage = (
+        "Complete across all connected shards."
+        if not db.unavailable_shards()
+        else "Partial: unavailable shards are excluded until they recover."
+    )
+    text = (
+        "🌐 **Library Analytics**\n"
+        f"`{total_files:,}` files currently known\n\n"
+        + ("\n\n".join(lines) if lines else "No language tags detected.")
+        + f"\n\nℹ️ {coverage}"
+    )
+    await _show_analytics_page(callback, text, "library")
+
+
+@Client.on_callback_query(filters.regex(r"^admin_stats_activity$") & filters.user(ADMIN_ID))
+async def show_stats_activity(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback, "Loading activity…")
+    groups = await db.get_top_groups(limit=10)
+    lines = []
+    for position, group in enumerate(groups, 1):
+        title = str(group.get("title") or "").strip()
+        if not title or title == "?":
+            title = "Unavailable group"
+        lines.append(
+            f"**{position}. {title[:32]}**\n`{int(group.get('search_count', 0)):,}` searches"
+        )
+    text = (
+        "🏆 **Search Activity**\n"
+        "Most active connected groups\n\n"
+        + ("\n\n".join(lines) if lines else "No group search activity yet.")
+        + "\n\nℹ️ No user search text or private data is shown."
+    )
+    await _show_analytics_page(callback, text, "activity")
+
+
+@Client.on_callback_query(filters.regex(r"^admin_stats_health$") & filters.user(ADMIN_ID))
+async def show_stats_health(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback, "Checking every MongoDB cluster…")
+    await callback.message.edit_text("🩺 **System Health**\n\nRunning live connection checks…")
+    health = await db.probe_shards(force=True)
+    cluster_lines = "\n".join(_cluster_status_line(item) for item in health)
+    workload = workload_snapshot()
+    cache = db.cache_metrics()
+    operations = (
+        "🟢 Dedicated and isolated"
+        if db.operations_db is not None
+        else "🟠 Shared with Cluster 2 • configure OPERATIONS_DATABASE_URI"
+    )
+    text = (
+        "🩺 **System Health**\n"
+        "Fresh checks, not a stale snapshot\n\n"
+        f"💾 **MongoDB**\n{cluster_lines}\n\n"
+        f"🗂 **Operations Data**\n{operations}\n\n"
+        "⚡ **Runtime**\n"
+        f"Search queue  `{int(workload.get('search_queue_depth', 0))}`\n"
+        f"Active searches  `{int(workload.get('search_active', 0))}`\n"
+        f"Event-loop lag  `{int(workload.get('event_loop_lag_latest_ms', 0))} ms`\n"
+        f"Cached queries  `{int(cache.get('queries', {}).get('size', 0))}`"
+    )
+    await _show_analytics_page(callback, text, "health")
 
 
 # ── EDIT BUTTON DISPATCHER ───────────────────────────────────────────────────
@@ -1235,9 +1335,12 @@ async def stats_cmd(client: Client, message: Message):
         f"💾 **Clusters:**\n"
     )
     for db_num, size in db_sizes:
-        fill = int((size / 512) * 10)
-        bar = "█" * fill + "░" * (10 - fill)
-        text += f"├ Cluster {db_num}: [{bar}] `{size:.1f} MB`\n"
+        if isinstance(size, (int, float)) and size != float("inf"):
+            fill = max(0, min(10, int((size / 450) * 10)))
+            bar = "█" * fill + "░" * (10 - fill)
+            text += f"├ Cluster {db_num}: [{bar}] `{size:.1f} MB`\n"
+        else:
+            text += f"├ Cluster {db_num}: [{('░' * 10)}] `Unavailable`\n"
 
     await msg.edit_text(text)
 

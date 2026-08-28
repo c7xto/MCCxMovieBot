@@ -888,6 +888,13 @@ route_menu = show_results
     )
 )
 async def auto_filter(client: Client, message: Message, manual_query=None):
+    if not manual_query and (message.text or "").lstrip().startswith("/"):
+        # Commands belong to command handlers. A deny-list can never stay
+        # complete because Telegram also supports /command@botname and new
+        # admin commands are added over time. Never verify, search,
+        # rate-limit or log slash-prefixed text as a missing movie.
+        return
+
     user_id = message.from_user.id
 
     access = await enforce_user_action(message, "search")

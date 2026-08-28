@@ -19,7 +19,7 @@ from urllib.parse import parse_qsl, unquote
 from bson.objectid import ObjectId
 import certifi
 from pymongo import AsyncMongoClient, InsertOne, ReturnDocument, UpdateOne
-from pymongo.errors import DuplicateKeyError, BulkWriteError
+from pymongo.errors import AutoReconnect, BulkWriteError, ConnectionFailure, DuplicateKeyError
 from dotenv import load_dotenv
 from rapidfuzz import fuzz, process
 from pyrogram.file_id import DOCUMENT_TYPES, FileId
@@ -62,6 +62,15 @@ MAX_REQUEST_MATCHES_PER_JOB = 100
 MAX_CONFIG_BACKUP_KEYS = 50
 MAX_CONFIG_BACKUP_DEPTH = 4
 BROADCAST_LEASE_SECONDS = 360
+MOVIE_MONGO_SELECTION_TIMEOUT_MS = max(
+    2000, min(15000, int(os.getenv("MOVIE_MONGO_SELECTION_TIMEOUT_MS", "5000")))
+)
+MOVIE_MONGO_SOCKET_TIMEOUT_MS = max(
+    5000, min(30000, int(os.getenv("MOVIE_MONGO_SOCKET_TIMEOUT_MS", "15000")))
+)
+SHARD_OPERATION_TIMEOUT_SECONDS = max(
+    2.0, min(15.0, float(os.getenv("SHARD_OPERATION_TIMEOUT_SECONDS", "6")))
+)
 
 _RESTORABLE_CONFIG_TYPES = {
     "start_media": str,
@@ -539,16 +548,25 @@ def deduplicate_file_batch(files_list):
     unique_files = []
     seen_file_ids = set()
     seen_unique_ids = set()
+    seen_telegram_ids = set()
     duplicate_count = 0
     for file_doc in files_list:
         fid = file_doc.get("file_id")
         unique_id = file_doc.get("file_unique_id") or ""
-        if not fid or fid in seen_file_ids or (unique_id and unique_id in seen_unique_ids):
+        telegram_identity = telegram_file_identity(fid)
+        if (
+            not fid
+            or fid in seen_file_ids
+            or (unique_id and unique_id in seen_unique_ids)
+            or (telegram_identity and telegram_identity in seen_telegram_ids)
+        ):
             duplicate_count += 1
             continue
         seen_file_ids.add(fid)
         if unique_id:
             seen_unique_ids.add(unique_id)
+        if telegram_identity:
+            seen_telegram_ids.add(telegram_identity)
         unique_files.append(file_doc)
     return unique_files, duplicate_count
 
@@ -615,6 +633,17 @@ def telegram_file_identity(file_id: str) -> str:
     if decoded.file_type not in DOCUMENT_TYPES or decoded.media_id is None:
         return ""
     return f"telegram-document:{int(decoded.media_id)}"
+
+
+def registry_identity_document(file_id: str, file_unique_id: str = "") -> dict:
+    """Build every stable identity protected by the central registry."""
+    document = {"file_id": file_id}
+    if file_unique_id:
+        document["file_unique_id"] = file_unique_id
+    telegram_identity = telegram_file_identity(file_id)
+    if telegram_identity:
+        document["telegram_identity"] = telegram_identity
+    return document
 
 
 def _duplicate_fingerprints(document: dict) -> tuple[bytes | None, bytes | None]:
@@ -964,9 +993,9 @@ class Database:
                 try:
                     client = AsyncMongoClient(
                         uri,
-                        serverSelectionTimeoutMS=30000,
-                        connectTimeoutMS=30000,
-                        socketTimeoutMS=30000,
+                        serverSelectionTimeoutMS=MOVIE_MONGO_SELECTION_TIMEOUT_MS,
+                        connectTimeoutMS=MOVIE_MONGO_SELECTION_TIMEOUT_MS,
+                        socketTimeoutMS=MOVIE_MONGO_SOCKET_TIMEOUT_MS,
                         retryWrites=True,
                         retryReads=True,
                         # Bounded explicitly rather than left at the driver default
@@ -1011,6 +1040,9 @@ class Database:
         self._db_size_cache = {}  # id(db_instance) -> (fetched_at, size_mb)
         self.shard_router = ShardRouter(len(self.dbs))
         self._file_count_cache = (0.0, 0)
+        self._cluster_file_count_cache = {}
+        self._language_count_cache = (0.0, {})
+        self._operations_stats_cache = {"users": 0, "banned": 0, "groups": 0}
         self._catalog_building = False
         self._catalog_worker_semaphore = asyncio.Semaphore(1)
         self._fuzzy_worker_semaphore = asyncio.Semaphore(2)
@@ -1432,9 +1464,20 @@ class Database:
 
     async def search_tokens_need_migration(self) -> bool:
         """Return whether any legacy movie row lacks the indexed token field."""
-        for col in self.file_cols:
-            if await col.find_one({"search_tokens": {"$exists": False}}, {"_id": 1}):
-                return True
+        for index in self.readable_shard_indices():
+            try:
+                async with asyncio.timeout(SHARD_OPERATION_TIMEOUT_SECONDS):
+                    if await self.file_cols[index].find_one(
+                        {"search_tokens": {"$exists": False}}, {"_id": 1}
+                    ):
+                        return True
+            except Exception as exc:
+                self.mark_shard_error(index, exc)
+                logger.warning(
+                    "Search-token readiness skipped Cluster %s error_type=%s",
+                    index + 1,
+                    type(exc).__name__,
+                )
         return False
 
     async def ensure_indexes(self):
@@ -1452,20 +1495,24 @@ class Database:
         )
         try:
             indexes = await self.registry_col.index_information()
-            unique_id_ready = any(
-                spec.get("key") == [("file_unique_id", 1)] and spec.get("unique") is True
-                for spec in indexes.values()
-            )
-            if not unique_id_ready:
-                await self.registry_col.create_index(
-                    "file_unique_id",
-                    unique=True,
-                    sparse=True,
-                    name="file_unique_id_unique",
+            for field, name in (
+                ("file_unique_id", "file_unique_id_unique"),
+                ("telegram_identity", "telegram_identity_unique"),
+            ):
+                identity_ready = any(
+                    spec.get("key") == [(field, 1)] and spec.get("unique") is True
+                    for spec in indexes.values()
                 )
+                if not identity_ready:
+                    await self.registry_col.create_index(
+                        field,
+                        unique=True,
+                        sparse=True,
+                        name=name,
+                    )
         except Exception as exc:
             raise RequiredIndexError(
-                "Could not create the file content identity index: "
+                "Could not create a required file content identity index: "
                 f"{exc}. Run the duplicate report before retrying startup."
             ) from exc
         logger.info("✅ Required unique index verified on file_registry.file_id")
@@ -1827,19 +1874,67 @@ class Database:
         router = getattr(self, "shard_router", None)
         return router.snapshot() if router is not None else []
 
-    async def probe_shards(self):
-        """Refresh write-routing state; full shards remain available to reads."""
+    def readable_shard_indices(self) -> list[int]:
+        """Return shards that can serve reads without known outage delays."""
+        router = getattr(self, "shard_router", None)
+        if router is None:
+            return list(range(len(self.file_cols)))
+        return router.read_candidates()
+
+    def unavailable_shards(self) -> list[int]:
+        router = getattr(self, "shard_router", None)
+        return router.unavailable() if router is not None else []
+
+    def mark_shard_reachable(self, index: int, reason: str = "connection_ok"):
+        router = getattr(self, "shard_router", None)
+        if router is not None:
+            router.mark_reachable(index, reason)
+
+    def mark_shard_error(self, index: int, error: BaseException):
+        """Remove a shard from reads only for connectivity/capacity failures.
+
+        A Mongo ``maxTimeMS`` query timeout or an invalid admin pattern is an
+        operation failure, not proof that the whole cluster is offline.
+        """
+        router = getattr(self, "shard_router", None)
+        if router is not None and (
+            is_capacity_error(error)
+            or isinstance(error, (AutoReconnect, ConnectionFailure, OSError))
+            or type(error).__name__
+            in {"NetworkTimeout", "ServerSelectionTimeoutError", "TLSHandshakeError"}
+        ):
+            router.mark_error(index, error)
+
+    async def probe_shards(self, *, force: bool = False):
+        """Refresh read/write routing concurrently with bounded probes."""
         router = getattr(self, "shard_router", None)
         if router is None:
             return []
-        for index, db_instance in enumerate(self.dbs):
+
+        async def _probe(index: int):
+            db_instance = self.dbs[index]
             try:
-                await db_instance.command("ping")
+                async with asyncio.timeout(SHARD_OPERATION_TIMEOUT_SECONDS):
+                    await db_instance.command("ping")
+                router.mark_reachable(index, "health_probe_ok")
                 self._db_size_cache.pop(id(db_instance), None)
-                size = await self.get_db_size(db_instance)
+                async with asyncio.timeout(SHARD_OPERATION_TIMEOUT_SECONDS):
+                    size = await self.get_db_size(db_instance)
                 router.record_size(index, size)
             except Exception as exc:
                 router.mark_error(index, exc)
+
+        candidates = (
+            [
+                index
+                for index, health in enumerate(router.snapshot())
+                if health.get("state") != "quarantined"
+            ]
+            if force
+            else router.probe_candidates()
+        )
+        if candidates:
+            await asyncio.gather(*[_probe(index) for index in candidates])
         return router.snapshot()
 
     async def get_total_files(self):
@@ -1847,13 +1942,38 @@ class Database:
         if time.time() - cached_at < 30:
             return cached_count
 
-        async def _count(col):
+        async def _count(index: int):
+            col = self.file_cols[index]
             try:
-                return await col.count_documents({})
-            except Exception:
-                return 0
+                async with asyncio.timeout(SHARD_OPERATION_TIMEOUT_SECONDS):
+                    count = await col.estimated_document_count()
+                self._cluster_file_count_cache[index] = count
+                self.mark_shard_reachable(index, "count_ok")
+                return count
+            except TimeoutError:
+                logger.warning(
+                    "File count timed out on Cluster %s; using last-known value",
+                    index + 1,
+                )
+                return int(self._cluster_file_count_cache.get(index, 0))
+            except Exception as exc:
+                self.mark_shard_error(index, exc)
+                logger.warning(
+                    "File count using last-known value for Cluster %s error_type=%s",
+                    index + 1,
+                    type(exc).__name__,
+                )
+                return int(self._cluster_file_count_cache.get(index, 0))
 
-        counts = await asyncio.gather(*[_count(col) for col in self.file_cols])
+        readable = self.readable_shard_indices()
+        counts_by_index = {
+            index: count
+            for index, count in zip(readable, await asyncio.gather(*[_count(index) for index in readable]))
+        }
+        counts = [
+            counts_by_index.get(index, int(self._cluster_file_count_cache.get(index, 0)))
+            for index in range(len(self.file_cols))
+        ]
         total = sum(counts)
         self._file_count_cache = (time.time(), total)
         return total
@@ -1895,7 +2015,9 @@ class Database:
         started = time.monotonic()
         logger.info("🔤 Building fuzzy-search title catalog in background...")
         try:
-            for cluster_number, collection in enumerate(self.file_cols, 1):
+            for shard_index in self.readable_shard_indices():
+                cluster_number = shard_index + 1
+                collection = self.file_cols[shard_index]
                 cluster_count = 0
                 name_batch = []
                 try:
@@ -1928,6 +2050,7 @@ class Database:
                             if len(titles) >= MAX_SEARCH_CATALOG_TITLES:
                                 break
                 except Exception as exc:
+                    self.mark_shard_error(shard_index, exc)
                     logger.warning(
                         "Search-catalog scan skipped remainder of cluster %s: %s",
                         cluster_number,
@@ -2005,9 +2128,7 @@ class Database:
         physical_present = False
         if self.registry_col is not None:
             try:
-                reservation = {"file_id": file_id}
-                if file_unique_id:
-                    reservation["file_unique_id"] = file_unique_id
+                reservation = registry_identity_document(file_id, file_unique_id)
                 await self.registry_col.insert_one(reservation)
                 reservation_created = True
             except DuplicateKeyError:
@@ -2104,7 +2225,14 @@ class Database:
                 await self._release_registry_ids([file_id])
 
     async def reconcile_registry_locations(self, limit=250):
-        """Repair missing or stale registry locations from physical rows."""
+        """Repair registry locations with one bounded query per movie shard.
+
+        The former per-row fan-out issued up to ``limit × shards`` MongoDB
+        lookups every health cycle. A 250-row repair over four shards meant
+        roughly 1,000 small queries. This batches the same non-destructive
+        repair into one registry read, one lookup per readable shard and one
+        unordered registry write.
+        """
         if self.registry_col is None:
             return {"checked": 0, "repaired": 0, "unresolved": 0}
         cursor = self.registry_col.find(
@@ -2113,63 +2241,77 @@ class Database:
                     {"cluster": {"$exists": False}},
                     {"movie_id": {"$exists": False}},
                 ]
-            }
+            },
+            {"_id": 1, "file_id": 1},
         ).limit(max(1, int(limit)))
-        checked = repaired = unresolved = 0
-        async for registry_doc in cursor:
-            checked += 1
-            file_id = registry_doc.get("file_id")
-            if not file_id:
-                unresolved += 1
-                continue
+        registry_docs = [document async for document in cursor]
+        checked = len(registry_docs)
+        file_ids = list(
+            dict.fromkeys(
+                document.get("file_id") for document in registry_docs if document.get("file_id")
+            )
+        )
+        if not file_ids:
+            return {"checked": checked, "repaired": 0, "unresolved": checked}
 
-            current_cluster = registry_doc.get("cluster")
-            current_movie_id = registry_doc.get("movie_id")
-            location_valid = False
-            if (
-                isinstance(current_cluster, int)
-                and 1 <= current_cluster <= len(self.file_cols)
-                and current_movie_id
-            ):
-                try:
-                    location_valid = (
-                        await self.file_cols[current_cluster - 1].find_one(
-                            {"_id": ObjectId(current_movie_id), "file_id": file_id},
-                            {"_id": 1},
-                        )
-                        is not None
+        async def _lookup(index: int):
+            try:
+                async with asyncio.timeout(SHARD_OPERATION_TIMEOUT_SECONDS):
+                    movie_cursor = self.file_cols[index].find(
+                        {"file_id": {"$in": file_ids}},
+                        {"_id": 1, "file_id": 1},
                     )
-                except Exception:
-                    location_valid = False
-            if location_valid:
-                continue
+                    documents = [document async for document in movie_cursor]
+                self.mark_shard_reachable(index, "registry_reconcile_ok")
+                return index + 1, documents
+            except TimeoutError:
+                logger.warning("Registry batch lookup timed out on Cluster %s", index + 1)
+                return index + 1, []
+            except Exception as error:
+                self.mark_shard_error(index, error)
+                logger.warning(
+                    "Registry batch lookup skipped Cluster %s error_type=%s",
+                    index + 1,
+                    type(error).__name__,
+                )
+                return index + 1, []
 
-            lookups = await asyncio.gather(
-                *[col.find_one({"file_id": file_id}, {"_id": 1}) for col in self.file_cols],
-                return_exceptions=True,
-            )
-            if any(isinstance(value, BaseException) for value in lookups):
-                unresolved += 1
+        readable = self.readable_shard_indices()
+        lookup_results = await asyncio.gather(*[_lookup(index) for index in readable])
+        locations = {}
+        for cluster_number, movie_docs in lookup_results:
+            for movie_doc in movie_docs:
+                file_id = movie_doc.get("file_id")
+                if file_id and file_id not in locations:
+                    locations[file_id] = (cluster_number, str(movie_doc["_id"]))
+
+        repairs = []
+        for registry_doc in registry_docs:
+            location = locations.get(registry_doc.get("file_id"))
+            if not location:
                 continue
-            found = next(
-                ((index, doc) for index, doc in enumerate(lookups, 1) if doc),
-                None,
+            cluster_number, movie_id = location
+            repairs.append(
+                UpdateOne(
+                    {
+                        "_id": registry_doc["_id"],
+                        "$or": [
+                            {"cluster": {"$exists": False}},
+                            {"movie_id": {"$exists": False}},
+                        ],
+                    },
+                    {"$set": {"cluster": cluster_number, "movie_id": movie_id}},
+                )
             )
-            if not found:
-                unresolved += 1
-                continue
-            cluster_index, movie_doc = found
-            await self.registry_col.update_one(
-                {"_id": registry_doc["_id"], "file_id": file_id},
-                {
-                    "$set": {
-                        "cluster": cluster_index,
-                        "movie_id": str(movie_doc["_id"]),
-                    }
-                },
-            )
-            repaired += 1
-        return {"checked": checked, "repaired": repaired, "unresolved": unresolved}
+        repaired = 0
+        if repairs:
+            result = await self.registry_col.bulk_write(repairs, ordered=False)
+            repaired = int(result.modified_count)
+        return {
+            "checked": checked,
+            "repaired": repaired,
+            "unresolved": max(0, checked - repaired),
+        }
 
     async def _registry_bulk_reserve(self, files: list) -> tuple:
         """Attempts to atomically reserve every file_id in the centralized
@@ -2183,13 +2325,14 @@ class Database:
             file_ids = [item["file_id"] for item in files]
             registry_docs = []
             for item in files:
-                document = {"file_id": item["file_id"]}
-                if item.get("file_unique_id"):
-                    document["file_unique_id"] = item["file_unique_id"]
-                registry_docs.append(document)
+                registry_docs.append(
+                    registry_identity_document(
+                        item["file_id"], item.get("file_unique_id") or ""
+                    )
+                )
         else:
             file_ids = list(files)
-            registry_docs = [{"file_id": fid} for fid in file_ids]
+            registry_docs = [registry_identity_document(fid) for fid in file_ids]
         if self.registry_col is None:
             return file_ids, 0
 
@@ -2408,15 +2551,30 @@ class Database:
         mongo_query = {"search_tokens": {"$all": words}}
 
         async def _search_cluster(i, col):
-            docs = []
-            cursor = col.find(mongo_query).limit(limit)
-            async for doc in cursor:
-                doc["_cluster"] = i + 1
-                docs.append(doc)
-            return docs
+            try:
+                docs = []
+                async with asyncio.timeout(5.0):
+                    cursor = col.find(mongo_query).limit(limit).max_time_ms(4500)
+                    async for doc in cursor:
+                        doc["_cluster"] = i + 1
+                        docs.append(doc)
+                self.mark_shard_reachable(i, "admin_search_ok")
+                return docs
+            except TimeoutError:
+                logger.warning("Admin search skipped slow Cluster %s", i + 1)
+                return []
+            except Exception as exc:
+                self.mark_shard_error(i, exc)
+                logger.warning(
+                    "Admin search skipped Cluster %s error_type=%s",
+                    i + 1,
+                    type(exc).__name__,
+                )
+                return []
 
+        readable = self.readable_shard_indices()
         cluster_results = await asyncio.gather(
-            *[_search_cluster(i, col) for i, col in enumerate(self.file_cols)]
+            *[_search_cluster(i, self.file_cols[i]) for i in readable]
         )
         results = [doc for docs in cluster_results for doc in docs]
         return results[:limit]
@@ -2426,7 +2584,8 @@ class Database:
             obj_id = ObjectId(file_obj_id)
         except Exception:
             return False
-        for col in self.file_cols:
+        for index in self.readable_shard_indices():
+            col = self.file_cols[index]
             try:
                 doc = await col.find_one({"_id": obj_id}, {"file_id": 1})
             except Exception as e:
@@ -2451,16 +2610,21 @@ class Database:
         except Exception:
             return False
         normalized_name = normalize_file_name(new_name)
-        for col in self.file_cols:
-            result = await col.update_one(
-                {"_id": obj_id},
-                {
-                    "$set": {
-                        "file_name": normalized_name,
-                        "search_tokens": search_tokens_for_name(normalized_name),
-                    }
-                },
-            )
+        for index in self.readable_shard_indices():
+            col = self.file_cols[index]
+            try:
+                result = await col.update_one(
+                    {"_id": obj_id},
+                    {
+                        "$set": {
+                            "file_name": normalized_name,
+                            "search_tokens": search_tokens_for_name(normalized_name),
+                        }
+                    },
+                )
+            except Exception as exc:
+                self.mark_shard_error(index, exc)
+                continue
             if result.matched_count > 0:
                 self._invalidate_file_count()
                 return True
@@ -2468,6 +2632,10 @@ class Database:
 
     async def get_files_by_language(self):
         from plugins.filter import LANGUAGES
+
+        cached_at, cached_counts = getattr(self, "_language_count_cache", (0.0, {}))
+        if cached_counts and time.time() - cached_at < 300:
+            return dict(cached_counts)
 
         facet_stage = {
             lang: [
@@ -2477,22 +2645,37 @@ class Database:
             for lang in LANGUAGES
         }
 
-        async def _cluster_counts(col):
+        async def _cluster_counts(index, col):
             try:
-                cursor = await col.aggregate([{"$facet": facet_stage}], allowDiskUse=True)
-                docs = await cursor.to_list(length=1)
+                async with asyncio.timeout(15.0):
+                    cursor = await col.aggregate([{"$facet": facet_stage}], allowDiskUse=True)
+                    docs = await cursor.to_list(length=1)
+                self.mark_shard_reachable(index, "language_stats_ok")
                 return docs[0] if docs else {}
+            except TimeoutError:
+                logger.warning("Language analytics timed out on Cluster %s", index + 1)
+                return {}
             except Exception as e:
-                logger.warning(f"get_files_by_language facet error: {e}")
+                self.mark_shard_error(index, e)
+                logger.warning(
+                    "Language analytics skipped Cluster %s error_type=%s",
+                    index + 1,
+                    type(e).__name__,
+                )
                 return {}
 
-        per_cluster = await asyncio.gather(*[_cluster_counts(col) for col in self.file_cols])
+        readable = self.readable_shard_indices()
+        per_cluster = await asyncio.gather(
+            *[_cluster_counts(index, self.file_cols[index]) for index in readable]
+        )
 
         results = {lang: 0 for lang in LANGUAGES}
         for cluster_doc in per_cluster:
             for lang in LANGUAGES:
                 bucket = cluster_doc.get(lang, [])
                 results[lang] += bucket[0]["n"] if bucket else 0
+        if not self.unavailable_shards():
+            self._language_count_cache = (time.time(), dict(results))
         return results
 
     async def scan_duplicate_report(self, progress_callback=None):
@@ -2503,6 +2686,16 @@ class Database:
             self._duplicate_scan_lock = scan_lock
 
         async with scan_lock:
+            await self.probe_shards()
+            unavailable = self.unavailable_shards()
+            if unavailable:
+                cluster_list = ", ".join(str(number) for number in unavailable)
+                raise RuntimeError(
+                    "A complete duplicate report cannot start while MongoDB "
+                    f"Cluster {cluster_list} is unavailable. Partial scans are "
+                    "blocked because they can hide cross-cluster duplicates. "
+                    "Retry after the cluster health check is green."
+                )
             total = await self.get_total_files()
             started = time.monotonic()
             total_work = max(1, total * 3)
@@ -2522,19 +2715,25 @@ class Database:
             async def _show_phase_progress(phase, phase_scanned, cluster, phase_started, work_offset):
                 if not progress_callback:
                     return
-                await progress_callback(
-                    {
-                        "phase": phase,
-                        "scanned": phase_scanned,
-                        "total": total,
-                        "overall_scanned": min(total_work, work_offset + phase_scanned),
-                        "overall_total": total_work,
-                        "cluster": cluster,
-                        "clusters": len(self.file_cols),
-                        "elapsed": time.monotonic() - started,
-                        "phase_elapsed": time.monotonic() - phase_started,
-                    }
-                )
+                try:
+                    await progress_callback(
+                        {
+                            "phase": phase,
+                            "scanned": phase_scanned,
+                            "total": total,
+                            "overall_scanned": min(total_work, work_offset + phase_scanned),
+                            "overall_total": total_work,
+                            "cluster": cluster,
+                            "clusters": len(self.file_cols),
+                            "elapsed": time.monotonic() - started,
+                            "phase_elapsed": time.monotonic() - phase_started,
+                        }
+                    )
+                except Exception as error:
+                    logger.warning(
+                        "Duplicate progress update skipped error_type=%s",
+                        type(error).__name__,
+                    )
 
             async def _scan_aggregate_phase(mode: str, work_offset: int):
                 phase_started = time.monotonic()
@@ -2546,10 +2745,12 @@ class Database:
                 )
                 await asyncio.to_thread(os.close, descriptor)
                 phase_scanned = 0
+                active_cluster = 0
                 try:
                     await asyncio.to_thread(_initialize_duplicate_spool, spool_path, mode)
                     await _show_phase_progress(mode, 0, 1, phase_started, work_offset)
                     for cluster_index, col in enumerate(self.file_cols, 1):
+                        active_cluster = cluster_index
                         batch = []
                         cursor = col.find(
                             {"file_name": {"$exists": True, "$ne": ""}},
@@ -2604,6 +2805,16 @@ class Database:
                             "server disk space, then run the duplicate report again."
                         ) from error
                     raise
+                except RuntimeError:
+                    raise
+                except Exception as error:
+                    if active_cluster:
+                        self.mark_shard_error(active_cluster - 1, error)
+                    raise RuntimeError(
+                        "The complete duplicate report stopped because MongoDB "
+                        f"Cluster {active_cluster or '?'} became unavailable "
+                        f"({type(error).__name__}). Nothing was deleted."
+                    ) from error
                 finally:
                     await asyncio.to_thread(Path(spool_path).unlink, missing_ok=True)
 
@@ -3011,9 +3222,9 @@ class Database:
         filter_mongo = {"file_name": regex}
         limit = max_results + 1
 
-        async def _search_cluster(col):
+        async def _search_cluster(index, col):
             try:
-                async with asyncio.timeout(9.0):
+                async with asyncio.timeout(5.0):
                     cursor = (
                         col.find(filter_mongo)
                         # The result UI performs its own movie/series ordering.
@@ -3023,20 +3234,30 @@ class Database:
                         .sort("$natural", -1)
                         .skip(offset)
                         .limit(limit)
-                        .max_time_ms(8000)
+                        .max_time_ms(4500)
                     )
-                    return [doc async for doc in cursor]
+                    documents = [doc async for doc in cursor]
+                    self.mark_shard_reachable(index, "search_ok")
+                    return documents
             except TimeoutError:
-                logger.warning("Compatibility search cluster skipped after 9 seconds")
+                logger.warning(
+                    "Compatibility search Cluster %s skipped after 5 seconds",
+                    index + 1,
+                )
                 return []
             except Exception as exc:
+                self.mark_shard_error(index, exc)
                 logger.warning(
-                    "Compatibility search cluster failed error_type=%s",
+                    "Compatibility search Cluster %s failed error_type=%s",
+                    index + 1,
                     type(exc).__name__,
                 )
                 return []
 
-        cluster_results = await asyncio.gather(*[_search_cluster(col) for col in self.file_cols])
+        readable = self.readable_shard_indices()
+        cluster_results = await asyncio.gather(
+            *[_search_cluster(index, self.file_cols[index]) for index in readable]
+        )
         # Legacy branding states are intentionally ignored. The removed
         # branding worker left some original Telegram file IDs marked
         # ``pending``; those originals are valid and must stay searchable.
@@ -3101,7 +3322,7 @@ class Database:
         filter_mongo = filters[0] if len(filters) == 1 else {"$or": filters}
         limit = max_results + 1
 
-        async def _search_cluster(col):
+        async def _search_cluster(index, col):
             try:
                 # A cold/unindexed Atlas shard must not make every healthy
                 # shard wait five or thirty seconds. Mongo gets its own time
@@ -3114,17 +3335,30 @@ class Database:
                     cursor = (
                         col.find(filter_mongo).sort("_id", -1).skip(offset).limit(limit).max_time_ms(3000)
                     )
-                    return [doc async for doc in cursor]
+                    documents = [doc async for doc in cursor]
+                    self.mark_shard_reachable(index, "search_ok")
+                    return documents
             except TimeoutError:
-                logger.warning("Indexed search cluster skipped after the 4s latency budget")
+                logger.warning(
+                    "Indexed search Cluster %s skipped after the 4s latency budget",
+                    index + 1,
+                )
                 return []
             except Exception as e:
                 # A secondary cluster outage should degrade result coverage,
                 # not take the entire search feature down.
-                logger.warning(f"Search cluster failed: {e}")
+                self.mark_shard_error(index, e)
+                logger.warning(
+                    "Indexed search Cluster %s failed error_type=%s",
+                    index + 1,
+                    type(e).__name__,
+                )
                 return []
 
-        cluster_results = await asyncio.gather(*[_search_cluster(col) for col in self.file_cols])
+        readable = self.readable_shard_indices()
+        cluster_results = await asyncio.gather(
+            *[_search_cluster(index, self.file_cols[index]) for index in readable]
+        )
 
         files = deduplicate_search_results([doc for docs in cluster_results for doc in docs])
         return files[:max_results]
@@ -3212,13 +3446,20 @@ class Database:
         except Exception:
             return None
 
-        async def _bounded_find(collection, query, timeout_seconds):
+        async def _bounded_find(collection, query, timeout_seconds, shard_index=None):
             try:
                 async with asyncio.timeout(timeout_seconds):
-                    return await collection.find_one(query, max_time_ms=max(100, int(timeout_seconds * 800)))
+                    document = await collection.find_one(
+                        query, max_time_ms=max(100, int(timeout_seconds * 800))
+                    )
+                if shard_index is not None:
+                    self.mark_shard_reachable(shard_index, "file_lookup_ok")
+                return document
             except TimeoutError:
                 return None
             except Exception as exc:
+                if shard_index is not None:
+                    self.mark_shard_error(shard_index, exc)
                 logger.warning(
                     "Bounded file lookup failed error_type=%s",
                     type(exc).__name__,
@@ -3231,16 +3472,23 @@ class Database:
         if registry_doc:
             cluster_number = registry_doc.get("cluster")
             if isinstance(cluster_number, int) and 1 <= cluster_number <= len(self.file_cols):
-                doc = await _bounded_find(self.file_cols[cluster_number - 1], {"_id": obj_id}, 2.5)
+                shard_index = cluster_number - 1
+                if shard_index not in self.readable_shard_indices():
+                    doc = None
+                else:
+                    doc = await _bounded_find(
+                        self.file_cols[shard_index], {"_id": obj_id}, 2.5, shard_index
+                    )
                 if doc:
                     return doc
 
-        async def _fallback(cluster_index, collection):
-            document = await _bounded_find(collection, {"_id": obj_id}, 3.0)
-            return cluster_index, document
+        async def _fallback(shard_index, collection):
+            document = await _bounded_find(collection, {"_id": obj_id}, 3.0, shard_index)
+            return shard_index + 1, document
 
+        readable = self.readable_shard_indices()
         lookups = await asyncio.gather(
-            *[_fallback(index, collection) for index, collection in enumerate(self.file_cols, 1)]
+            *[_fallback(index, self.file_cols[index]) for index in readable]
         )
         found = next(
             (
@@ -3326,22 +3574,63 @@ class Database:
         await self.main_db["missed_searches"].delete_one({"_id": query_id})
 
     async def get_bot_stats(self):
-        async def _count(col):
-            return await col.count_documents({}) if col is not None else 0
+        async def _banned_count():
+            return await self.banned_col.count_documents({}) if self.banned_col is not None else 0
+
+        async def _control_count(label, awaitable):
+            cache = getattr(self, "_operations_stats_cache", {})
+            try:
+                async with asyncio.timeout(SHARD_OPERATION_TIMEOUT_SECONDS):
+                    value = int(await awaitable)
+                cache[label] = value
+                self._operations_stats_cache = cache
+                return value
+            except Exception as exc:
+                logger.warning(
+                    "Analytics using last-known %s count error_type=%s",
+                    label,
+                    type(exc).__name__,
+                )
+                return int(cache.get(label, 0))
 
         async def _cluster_stats(i, db_instance):
-            files_in_db = await self.file_cols[i].count_documents({})
-            size = await self.get_db_size(db_instance)
-            return i + 1, files_in_db, size
+            if i not in self.readable_shard_indices():
+                snapshot = self.shard_health_snapshot()
+                cached_size = snapshot[i].get("size_mb") if i < len(snapshot) else None
+                count_cache = getattr(self, "_cluster_file_count_cache", {})
+                return i + 1, int(count_cache.get(i, 0)), cached_size
+            try:
+                async with asyncio.timeout(SHARD_OPERATION_TIMEOUT_SECONDS):
+                    files_in_db = await self.file_cols[i].estimated_document_count()
+                count_cache = getattr(self, "_cluster_file_count_cache", {})
+                count_cache[i] = files_in_db
+                self._cluster_file_count_cache = count_cache
+                async with asyncio.timeout(SHARD_OPERATION_TIMEOUT_SECONDS):
+                    size = await self.get_db_size(db_instance)
+                self.mark_shard_reachable(i, "analytics_ok")
+                return i + 1, files_in_db, size
+            except TimeoutError:
+                snapshot = self.shard_health_snapshot()
+                cached_size = snapshot[i].get("size_mb") if i < len(snapshot) else None
+                count_cache = getattr(self, "_cluster_file_count_cache", {})
+                logger.warning("Analytics timed out on Cluster %s; using last-known values", i + 1)
+                return i + 1, int(count_cache.get(i, 0)), cached_size
+            except Exception as exc:
+                self.mark_shard_error(i, exc)
+                snapshot = self.shard_health_snapshot()
+                cached_size = snapshot[i].get("size_mb") if i < len(snapshot) else None
+                count_cache = getattr(self, "_cluster_file_count_cache", {})
+                return i + 1, int(count_cache.get(i, 0)), cached_size
 
-        total_users, total_banned, total_groups, total_files, *cluster_stats = await asyncio.gather(
-            self.get_user_count(),
-            _count(self.banned_col),
-            self.get_group_count(),
-            self.get_total_files(),
+        total_users, total_banned, total_groups, *cluster_stats = await asyncio.gather(
+            _control_count("users", self.get_user_count()),
+            _control_count("banned", _banned_count()),
+            _control_count("groups", self.get_group_count()),
             *[_cluster_stats(i, db_instance) for i, db_instance in enumerate(self.dbs)],
         )
 
+        total_files = sum(files for _, files, _ in cluster_stats)
+        self._file_count_cache = (time.time(), total_files)
         db_sizes = [(idx, size) for idx, _, size in cluster_stats]
         return total_users, total_banned, total_files, db_sizes, total_groups
 

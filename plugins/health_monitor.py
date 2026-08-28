@@ -343,7 +343,6 @@ async def run_health_monitor(client):
         issues = []
         logger.info("workload_metrics %s", workload_snapshot())
         logger.info("telegram_retry_metrics %s", telegram_retry_snapshot())
-        logger.info("shard_router %s", db.shard_health_snapshot())
         try:
             logger.info(
                 "notification_outbox_depth %s",
@@ -357,28 +356,30 @@ async def run_health_monitor(client):
 
         # ── 1. Ping all clusters ──────────────────────────────────────────────
         try:
-            await db.probe_shards()
+            shard_snapshot = await db.probe_shards()
         except Exception as exc:
             logger.warning("Shard health probe failed: %s", type(exc).__name__)
-        for i, db_instance in enumerate(db.dbs):
+            shard_snapshot = db.shard_health_snapshot()
+        logger.info("shard_router %s", shard_snapshot)
+
+        for i, health in enumerate(shard_snapshot):
             key = f"cluster_{i + 1}_down"
-            try:
-                await db_instance.command("ping")
-                # If we previously alerted about this cluster, send recovery notice
+            state = health.get("state")
+            if state not in {"unavailable", "quarantined", "checking"}:
                 if key in _last_alert:
                     await _clear_alert(key)
                     await send_smart_log(
                         client, f"✅ **#ClusterRecovered**\n\nCluster {i + 1} is back online."
                     )
-            except Exception as error:
-                reference = report_internal_error(logger, "cluster_health", error, cluster=i + 1)
-                issues.append(f"Cluster {i + 1} unreachable ({reference})")
+            else:
+                reason = str(health.get("reason") or state)
+                issues.append(f"Cluster {i + 1} {state} ({reason})")
                 if await _should_alert(key):
                     await send_smart_log(
                         client,
                         f"🚨 **#HealthAlert — Cluster {i + 1} Down**\n\n"
-                        f"MongoDB Cluster {i + 1} is not responding.\n"
-                        f"Reference: `{reference}`",
+                        f"MongoDB Cluster {i + 1} is not available for user reads.\n"
+                        f"State: `{state}`\nReason: `{reason}`",
                     )
 
         if db.operations_db is not None:

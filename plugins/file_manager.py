@@ -9,6 +9,7 @@ from database.db import db
 from plugins.state import get_state, get_state_context, set_state, clear_state
 from plugins.task_supervisor import TaskConflict, supervisor
 from plugins.callbacks import answer_callback_safely
+from plugins.workload import background_turn
 from plugins.ui_helpers import (
     begin_prompt,
     cancel_button,
@@ -341,6 +342,10 @@ async def _run_duplicate_scan(client, status_msg, admin_id):
 
     async def show_progress(progress):
         nonlocal last_update
+        # The scan yields every bounded database batch while interactive
+        # searches or callbacks are active. UI edits remain throttled below,
+        # but the workload gate is consulted on every progress callback.
+        await background_turn("duplicate_scan")
         now = time.monotonic()
         if now - last_update < 3.0 and int(progress.get("scanned", 0)) > 0:
             return
@@ -401,7 +406,11 @@ async def _run_duplicate_scan(client, status_msg, admin_id):
         await _show_dupes_page(status_msg, report, page=0)
 
     except RuntimeError as error:
-        if "host storage is full" in str(error).casefold():
+        public_runtime_errors = (
+            "host storage is full",
+            "complete duplicate report cannot start",
+        )
+        if any(marker in str(error).casefold() for marker in public_runtime_errors):
             await status_msg.edit_text(
                 f"❌ **Duplicate Report Paused**\n\n{error}\n\n🔒 Nothing was deleted or changed.",
                 reply_markup=_BACK_BTN,
@@ -433,13 +442,14 @@ async def _show_dupes_page(msg_or_callback, report, page=0):
     text = (
         f"🧬 **Duplicate Report • Page {page + 1}/{total_pages}**\n\n"
         f"📨 Scanned: `{summary['scanned']:,}` files\n"
-        f"🟢 Telegram-verified: `{summary['exact_groups']:,}` groups • "
+        f"🟢 Confirmed exact copies: `{summary['exact_groups']:,}` groups • "
         f"`{summary['exact_extras']:,}` extra copies\n"
-        f"🟡 Metadata-only: `{summary['probable_groups']:,}` groups • "
+        f"🟡 Review only, not duplicates: `{summary['probable_groups']:,}` groups • "
         f"`{summary['probable_matches']:,}` matches\n\n"
         f"🔒 **Nothing was deleted during this report.**\n"
         f"Only green Telegram-verified copies can be cleaned.\n"
-        f"Yellow matches and release variants remain protected.\n\n"
+        f"Large yellow counts are expected; they are similar labels, not "
+        f"confirmed copies, and remain protected.\n\n"
     )
 
     buttons = []
