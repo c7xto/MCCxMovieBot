@@ -1,31 +1,88 @@
+x-bot-service: &bot-service
+  image: ${BOT_IMAGE:-mccxmoviebot:local}
+  build: .
+  restart: unless-stopped
+  env_file:
+    - .env
+  init: true
+  read_only: true
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 256
+  mem_limit: 768m
+  cpus: 1.5
+  depends_on:
+    redis:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD", "python", "tools/container_healthcheck.py"]
+    interval: 30s
+    timeout: 5s
+    start_period: 120s
+    retries: 3
+
 services:
-  bot:
-    image: ${BOT_IMAGE:-mccxmoviebot:local}
-    build: .
+  redis:
+    image: redis:alpine
     restart: unless-stopped
-    env_file:
-      - .env
-    environment:
-      SESSION_WORKDIR: /app/runtime
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
     volumes:
-      - bot-runtime:/app/runtime
-    init: true
-    read_only: true
-    tmpfs:
-      - /tmp:size=64m,mode=1777
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
-    pids_limit: 256
-    mem_limit: 768m
-    cpus: 1.5
-    healthcheck:
-      test: ["CMD", "python", "tools/container_healthcheck.py"]
-      interval: 60s
-      timeout: 5s
-      start_period: 90s
-      retries: 3
+
+  bot-interactive:
+    <<: *bot-service
+    environment:
+      SERVICE_ROLE: bot-interactive
+      REDIS_URL: redis://redis:6379/0
+      SESSION_WORKDIR: /app/runtime
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+      - /app/runtime:size=32m,mode=0700
+    deploy:
+      replicas: 2
+
+  worker-broadcast:
+    <<: *bot-service
+    environment:
+      SERVICE_ROLE: worker-broadcast
+      REDIS_URL: redis://redis:6379/0
+      SESSION_WORKDIR: /app/runtime
+    volumes:
+      - broadcast-runtime:/app/runtime
+
+  worker-indexer:
+    <<: *bot-service
+    environment:
+      SERVICE_ROLE: worker-indexer
+      REDIS_URL: redis://redis:6379/0
+      SESSION_WORKDIR: /app/runtime
+    volumes:
+      - indexer-runtime:/app/runtime
+
+  worker-maintenance:
+    <<: *bot-service
+    environment:
+      SERVICE_ROLE: worker-maintenance
+      REDIS_URL: redis://redis:6379/0
+      SESSION_WORKDIR: /app/runtime
+    volumes:
+      - maintenance-runtime:/app/runtime
 
 volumes:
-  bot-runtime:
+  redis-data:
+  broadcast-runtime:
+  indexer-runtime:
+  maintenance-runtime:

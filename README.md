@@ -4,7 +4,7 @@
 
 Fast Telegram movie and series search for the Malayalam Cinema Club.
 
-**Kurigram · PyMongo Async · MongoDB · TMDB · Docker**
+**Kurigram · PyMongo Async · MongoDB · Redis · TMDB · Docker**
 
 </div>
 
@@ -15,7 +15,6 @@ Fast Telegram movie and series search for the Malayalam Cinema Club.
 - Delivers cached Telegram files privately with durable auto-deletion.
 - Supports group-to-private search handoff, spell suggestions and series grouping.
 - Indexes storage channels in real time or through the resumable bulk indexer.
-- Can give each new upload a clean branded filename before it becomes searchable.
 - Shows live indexing speed, ETA and separate scanned, saved, existing and skipped counters.
 - Scans the existing library for exact and probable duplicates without deleting anything.
 - Provides a Telegram-native control center for files, groups, channels, access gates, analytics and health.
@@ -30,7 +29,8 @@ Premium plans and web streaming are deliberately outside this project's current 
 - Live searches and file delivery take priority over each bounded indexer batch without starving background work.
 - Every Telegram button is acknowledged before database or membership checks, preventing stale callback errors.
 - Access gates use a TTL-backed verification cache and a short grace window for temporary Telegram failures.
-- An optional dedicated operations database keeps configuration, checkpoints and the cross-cluster registry away from movie-shard capacity limits.
+- A required dedicated operations database keeps configuration, checkpoints and the cross-cluster registry away from movie-shard capacity limits.
+- Redis shares short-lived sessions, cooldowns, callback deduplication, shard health and workload admission across replicas.
 - The primary MongoDB cluster is required at startup; optional clusters degrade independently.
 - Failed optional shards are removed from search fan-out immediately and restored by live health probes.
 - Analytics is split into fast Overview, Library, Activity and Health pages; the Health page performs fresh shard checks.
@@ -45,6 +45,8 @@ Premium plans and web streaming are deliberately outside this project's current 
 - Python 3.13 recommended
 - Telegram `API_ID`, `API_HASH` and bot token
 - MongoDB connection URI
+- A separate Operations MongoDB URI
+- Redis 5 or newer
 - A numeric Telegram administrator ID
 
 Runtime versions are pinned in `requirements.txt`. The project uses Kurigram as the maintained Pyrogram-compatible Telegram client and PyMongo's native async API instead of deprecated Motor.
@@ -78,7 +80,7 @@ The bot stops immediately with an actionable error when a required setting or th
 cp .env.example .env
 # Edit .env
 docker compose up -d --build
-docker compose logs -f bot
+docker compose logs -f bot-interactive worker-indexer worker-broadcast worker-maintenance
 ```
 
 ## Required environment variables
@@ -90,14 +92,16 @@ docker compose logs -f bot
 | `BOT_TOKEN` | BotFather token |
 | `ADMIN_ID` | One or more comma-separated numeric admin IDs |
 | `DATABASE_URI` | Required primary MongoDB cluster |
-| `OPERATIONS_DATABASE_URI` | Optional dedicated database for settings, users, registry, caches and job checkpoints |
+| `OPERATIONS_DATABASE_URI` | Required dedicated database for settings, users, registry, counters and durable jobs |
+| `REDIS_URL` | Required Redis endpoint for shared ephemeral state and coordination |
+| `SERVICE_ROLE` | `all-in-one` on a one-process panel; Compose assigns dedicated roles |
 
 `DATABASE_URI_2` through `DATABASE_URI_5` are optional. Channel IDs,
 community links and the TMDB API Read Access Token (`TMDB_BEARER_TOKEN`) are
 documented in `.env.example`; most presentation and access settings can then
 be managed live through `/admin`.
 
-When `OPERATIONS_DATABASE_URI` is added, startup copies operational data in
+When `OPERATIONS_DATABASE_URI` is first added, startup copies operational data in
 resumable batches, validates the copy, and leaves the old data untouched. Do
 not point it at a movie shard if you want true storage isolation.
 
@@ -139,6 +143,7 @@ overwrite an existing plaintext file.
 4. Forward a storage-channel message to the bot to begin bulk indexing.
 5. Run `python tools/migrate_registry.py` once if upgrading an older database.
 6. Run the same migration after attaching a database that already contains movie rows. It is additive and safe to re-run.
+7. Run `python tools/migrate_search_tokens.py --apply` to backfill strict search tokens and initialize language counters.
 
 ## Development and verification
 
@@ -153,7 +158,7 @@ dependencies. The GitHub Actions workflow runs the same gate in a clean Python
 
 ## Important operational notes
 
-- New rows use indexed title tokens; older libraries automatically keep the compatible reference-bot search, with bounded RapidFuzz typo correction. No large database rewrite is required for an update.
+- User search uses indexed title tokens only, with bounded RapidFuzz typo correction. Legacy rows must be backfilled with `python tools/migrate_search_tokens.py --apply`; filename regex scans are not used as a fallback.
 - Slash commands are never treated as movie searches and never enter missing-search analytics.
 - `tools/migrate_registry.py` now enriches legacy rows with stable Telegram identities as well as file IDs. It requires every configured shard to be online so it cannot produce a misleading partial registry.
 - Duplicate scans start in report-only mode. Verified exact copies can be removed only after a separate admin confirmation; probable matches are never auto-deleted, and language, quality, codec, size, season and episode variants are preserved.

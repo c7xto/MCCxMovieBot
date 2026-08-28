@@ -114,12 +114,18 @@ async def _edit_live_status(chat_id: int, state: str):
         pass
 
 # --- THE BACKGROUND WORKER ---
-async def run_indexer(client: Client, status_message: Message, chat_id: int, last_msg_id: int, start_id: int):
+async def run_indexer(
+    client: Client,
+    status_message: Message,
+    chat_id: int,
+    last_msg_id: int,
+    start_id: int,
+    lock_token: str,
+):
     current_id = max(1, int(start_id))
     batch_size = 50
     progress = IndexProgress(current_id, last_msg_id)
     _active_indexes[chat_id] = (progress, status_message)
-    await db.set_index_task(chat_id, "running")
     await _edit_live_status(chat_id, "running")
     next_ui_update = time.monotonic() + 3.0
 
@@ -132,7 +138,11 @@ async def run_indexer(client: Client, status_message: Message, chat_id: int, las
 
     try:
         while current_id <= last_msg_id:
-            state = await db.get_index_task(chat_id)
+            task = await db.get_index_task_document(chat_id)
+            state = (task or {}).get("state")
+            if not task or task.get("lock_token") != lock_token:
+                logger.warning("Indexer lease lost for channel %s; worker exiting", chat_id)
+                return
             if state == "stopped":
                 await _edit_live_status(chat_id, "stopped")
                 _spawn_index_log(
@@ -147,10 +157,16 @@ async def run_indexer(client: Client, status_message: Message, chat_id: int, las
                     chat_id,
                     "stopped",
                 )
+                await db.release_index_task(chat_id, lock_token, "stopped")
                 return
             if state == "paused":
-                await asyncio.sleep(1.5)
-                continue
+                await _edit_live_status(chat_id, "paused")
+                await db.release_index_task(chat_id, lock_token, "paused")
+                return
+
+            if not await db.renew_index_task(chat_id, lock_token):
+                logger.warning("Indexer lease renewal failed for channel %s", chat_id)
+                return
 
             end_id = min(current_id + batch_size - 1, last_msg_id)
             message_ids = list(range(current_id, end_id + 1))
@@ -190,7 +206,7 @@ async def run_indexer(client: Client, status_message: Message, chat_id: int, las
                 await _record_failed_range(
                     chat_id, current_id, end_id, "telegram_read", error, 1
                 )
-                await db.set_index_task(chat_id, "paused")
+                await db.release_index_task(chat_id, lock_token, "paused")
                 await status_message.edit_text(
                     f"❌ **Indexer paused safely**\n\n"
                     f"Telegram could not read messages `{current_id:,}-{end_id:,}`.\n"
@@ -220,7 +236,7 @@ async def run_indexer(client: Client, status_message: Message, chat_id: int, las
                 await _record_failed_range(
                     chat_id, current_id, end_id, "cluster_capacity", error, 1
                 )
-                await db.set_index_task(chat_id, "paused")
+                await db.release_index_task(chat_id, lock_token, "paused")
                 next_slot = len(db.file_cols) + 1
                 await status_message.edit_text(
                     f"🛑 **Indexer paused • Database full**\n\n"
@@ -234,7 +250,7 @@ async def run_indexer(client: Client, status_message: Message, chat_id: int, las
                 await _record_failed_range(
                     chat_id, current_id, end_id, "batch_save", error, 4
                 )
-                await db.set_index_task(chat_id, "paused")
+                await db.release_index_task(chat_id, lock_token, "paused")
                 await status_message.edit_text(
                     f"❌ **Indexer paused safely**\n\n"
                     f"Database saving failed after retries for messages "
@@ -257,7 +273,7 @@ async def run_indexer(client: Client, status_message: Message, chat_id: int, las
                 await _record_failed_range(
                     chat_id, current_id, end_id, "checkpoint", error, 3
                 )
-                await db.set_index_task(chat_id, "paused")
+                await db.release_index_task(chat_id, lock_token, "paused")
                 await status_message.edit_text(
                     f"❌ **Checkpoint not confirmed**\n\n"
                     f"Messages `{current_id:,}-{end_id:,}` may already be saved. "
@@ -286,8 +302,8 @@ async def run_indexer(client: Client, status_message: Message, chat_id: int, las
                 next_ui_update = time.monotonic() + 3.0
             await asyncio.sleep(0.35)
 
-        await db.clear_index_task(chat_id)
         await _edit_live_status(chat_id, "complete")
+        await db.release_index_task(chat_id, lock_token, "complete")
         total_in_db = await db.get_total_files()
         _spawn_index_log(
             send_smart_log(
@@ -303,10 +319,62 @@ async def run_indexer(client: Client, status_message: Message, chat_id: int, las
             "complete",
         )
     except asyncio.CancelledError:
-        await db.set_index_task(chat_id, "paused")
+        await db.release_index_task(chat_id, lock_token, "queued")
         raise
     finally:
         _active_indexes.pop(chat_id, None)
+
+
+async def run_indexer_worker(client: Client):
+    """Claim resumable indexing jobs from MongoDB across worker replicas."""
+    while True:
+        task = await db.claim_index_task()
+        if not task:
+            await asyncio.sleep(1)
+            continue
+        chat_id = int(task["chat_id"])
+        lock_token = str(task["lock_token"])
+        try:
+            status_message = await telegram_call(
+                lambda: client.get_messages(
+                    int(task["admin_chat_id"]), int(task["status_message_id"])
+                ),
+                route="indexer_status_lookup",
+                policy=BACKGROUND_RETRY,
+                retry_safe=True,
+                idempotency_key=f"index-status:{chat_id}:{task['status_message_id']}",
+            )
+            if not status_message or getattr(status_message, "empty", False):
+                status_message = await telegram_call(
+                    lambda: client.send_message(
+                        int(task["admin_chat_id"]),
+                        f"⏳ Resuming index for `{chat_id}`…",
+                    ),
+                    route="indexer_status_recreate",
+                    policy=BACKGROUND_RETRY,
+                    retry_safe=False,
+                )
+            start_id = max(
+                int(task.get("start_id", 1)),
+                (await db.get_index_progress(chat_id)) + 1,
+            )
+            await run_indexer(
+                client,
+                status_message,
+                chat_id,
+                int(task["last_msg_id"]),
+                start_id,
+                lock_token,
+            )
+        except asyncio.CancelledError:
+            await db.release_index_task(chat_id, lock_token, "queued")
+            raise
+        except Exception as error:
+            reference = report_internal_error(
+                logger, "indexer_worker", error, channel_id=chat_id
+            )
+            await db.release_index_task(chat_id, lock_token, "queued")
+            logger.error("Indexer job requeued reference=%s", reference)
 
 
 # --- UI HANDLERS & COMMANDS ---
@@ -430,17 +498,17 @@ async def start_bulk_index(client: Client, callback: CallbackQuery):
     )
     # ----------------------------------------
     
-    # Offload the massive task to the background
-    try:
-        supervisor.spawn(
-            run_indexer(client, status_msg, chat_id, last_msg_id, start_id),
-            key=f"index:{chat_id}",
-            owner=f"admin:{callback.from_user.id}",
-            resources=("movie-catalog", f"index-channel:{chat_id}"),
-            drain_on_shutdown=True,
-        )
-    except TaskConflict as exc:
-        await status_msg.edit_text(f"⚠️ **Indexer not started:** `{exc}`")
+    await db.enqueue_index_task(
+        chat_id,
+        last_msg_id,
+        start_id,
+        callback.message.chat.id,
+        status_msg.id,
+        callback.from_user.id,
+    )
+    await status_msg.edit_text(
+        "✅ **Indexer queued**\n\nThe dedicated indexer worker will begin shortly."
+    )
 
 
 @Client.on_callback_query(filters.regex(r"^resetidx#") & filters.user(ADMIN_ID))
@@ -458,17 +526,17 @@ async def reset_and_index(client: Client, callback: CallbackQuery):
     await answer_callback_safely(callback, "🔄 Resetting progress…")
     await db.clear_index_progress(chat_id)
     status_msg = await callback.message.edit_text("⏳ **Progress reset. Starting from message 1...**")
-    try:
-        supervisor.spawn(
-            run_indexer(client, status_msg, chat_id, last_msg_id, 1),
-            key=f"index:{chat_id}",
-            owner=f"admin:{callback.from_user.id}",
-            resources=("movie-catalog", f"index-channel:{chat_id}"),
-            drain_on_shutdown=True,
-        )
-    except TaskConflict as exc:
-        await status_msg.edit_text(f"⚠️ **Indexer not started:** `{exc}`")
-        return
+    await db.enqueue_index_task(
+        chat_id,
+        last_msg_id,
+        1,
+        callback.message.chat.id,
+        status_msg.id,
+        callback.from_user.id,
+    )
+    await status_msg.edit_text(
+        "✅ **Fresh index queued**\n\nThe dedicated indexer worker will begin shortly."
+    )
     _spawn_index_log(send_smart_log(client,
         f"🔄 **#IndexReset**\n\n📦 Channel: `{chat_id}`\n"
         f"🎯 Total: `{last_msg_id}`\nStarting fresh from message 1."
@@ -497,8 +565,8 @@ async def resume_index(client: Client, callback: CallbackQuery):
             callback, "❌ Malformed callback.", show_alert=True
         )
     await answer_callback_safely(callback, "Indexer resumed ▶️")
-    await db.set_index_task(chat_id, "running")
-    await _edit_live_status(chat_id, "running")
+    await db.set_index_task(chat_id, "queued")
+    await _edit_live_status(chat_id, "queued")
 
 @Client.on_callback_query(filters.regex(r"^stop_idx#") & filters.user(ADMIN_ID))
 async def stop_index(client: Client, callback: CallbackQuery):

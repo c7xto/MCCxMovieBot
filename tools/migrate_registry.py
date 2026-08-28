@@ -77,6 +77,13 @@ async def _flush_batch(batch: list) -> tuple:
             item.get("file_id", ""), item.get("file_unique_id", "") or ""
         )
         stable_fields = {key: value for key, value in identity.items() if key != "file_id"}
+        stable_fields.update(
+            {
+                "cluster": int(item["cluster"]),
+                "movie_id": str(item["_id"]),
+                "location_pending": False,
+            }
+        )
         update = {"$setOnInsert": {"file_id": identity["file_id"]}}
         if stable_fields:
             update["$set"] = stable_fields
@@ -133,12 +140,13 @@ async def _scan_cluster(cluster_idx: int, col, progress: dict, lock: asyncio.Loc
 
     cursor = col.find(
         {"file_id": {"$exists": True, "$ne": ""}},
-        {"_id": 0, "file_id": 1, "file_unique_id": 1},
+        {"file_id": 1, "file_unique_id": 1},
     )
     async for doc in cursor:
         fid = doc.get("file_id")
         if not fid:
             continue
+        doc["cluster"] = cluster_idx + 1
         batch.append(doc)
 
         if len(batch) >= BATCH_SIZE:

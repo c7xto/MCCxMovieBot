@@ -70,6 +70,8 @@ def _verify_environment():
         "API_HASH": os.getenv("API_HASH"),
         "BOT_TOKEN": os.getenv("BOT_TOKEN"),
         "DATABASE_URI": os.getenv("DATABASE_URI"),
+        "OPERATIONS_DATABASE_URI": os.getenv("OPERATIONS_DATABASE_URI"),
+        "REDIS_URL": os.getenv("REDIS_URL"),
         "ADMIN_ID": os.getenv("ADMIN_ID"),
     }
     missing = [name for name, value in required.items() if not value]
@@ -110,6 +112,7 @@ except ProcessLockError as error:
 from pyrogram import Client
 from database.db import db
 from database.index_policy import RequiredIndexError
+from database.redis_client import redis_state
 from plugins.health_monitor import (
     run_health_monitor,
     run_cache_reaper,
@@ -130,6 +133,17 @@ logging.getLogger("aiohttp").setLevel(logging.WARNING)
 API_ID = int(os.getenv("API_ID", 0))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+SERVICE_ROLE = os.getenv("SERVICE_ROLE", "all-in-one").strip().casefold()
+SERVICE_ROLES = {
+    "all-in-one",
+    "bot-interactive",
+    "worker-broadcast",
+    "worker-indexer",
+    "worker-maintenance",
+}
+if SERVICE_ROLE not in SERVICE_ROLES:
+    logger.critical("Unknown SERVICE_ROLE=%s", SERVICE_ROLE)
+    sys.exit(1)
 READY_FILE = SESSION_WORKDIR / "ready"
 
 
@@ -146,12 +160,15 @@ class AutoFilterBot(Client):
     def __init__(self):
         SESSION_WORKDIR.mkdir(parents=True, exist_ok=True)
         super().__init__(
-            name="MCCxBot",
+            name=f"MCCxBot-{SERVICE_ROLE}",
             api_id=API_ID,
             api_hash=API_HASH,
             bot_token=BOT_TOKEN,
-            plugins=dict(root="plugins"),
-            sleep_threshold=60,
+            plugins=dict(root="plugins")
+            if SERVICE_ROLE in {"all-in-one", "bot-interactive"}
+            else None,
+            no_updates=SERVICE_ROLE not in {"all-in-one", "bot-interactive"},
+            sleep_threshold=10,
             max_concurrent_transmissions=3,
             workdir=str(SESSION_WORKDIR),
         )
@@ -163,19 +180,13 @@ class AutoFilterBot(Client):
         start(). Keep them explicit so an outdated deployed entry file is
         immediately visible and future keyword options still pass through.
         """
-        await super().start(
-            *args,
-            use_qr=use_qr,
-            except_ids=except_ids if except_ids is not None else [],
-            **kwargs,
-        )
-        me = await self.get_me()
-        logger.info(f"🚀 Bot started as @{me.username}")
-        await start_tmdb_client()
+        from plugins.readiness import mark_not_ready, mark_ready
 
-        logger.info("🔌 Validating MongoDB connections...")
+        mark_not_ready()
+        await redis_state.start()
+        logger.info("✅ Redis state plane ready.")
+        logger.info("🔌 Validating MongoDB connections before Telegram startup...")
         if not db.dbs:
-            await super().stop()
             raise RuntimeError("No MongoDB clusters configured. Check DATABASE_URI.")
         else:
             for i, db_instance in enumerate(db.dbs):
@@ -186,7 +197,6 @@ class AutoFilterBot(Client):
                 except Exception as e:
                     db.mark_shard_error(i, e)
                     if i == 0:
-                        await super().stop()
                         raise RuntimeError(f"Primary MongoDB cluster is unavailable: {e}") from e
                     logger.warning(f"  ⚠️ Optional cluster {i + 1} unavailable: {e}")
 
@@ -201,8 +211,9 @@ class AutoFilterBot(Client):
                 await db.operations_db.command("ping")
                 logger.info("  ✅ Dedicated operations database — OK")
             except Exception as e:
-                await super().stop()
                 raise RuntimeError(f"Dedicated operations database is unavailable: {e}") from e
+        else:
+            raise RuntimeError("OPERATIONS_DATABASE_URI is required and was not initialized.")
 
         logger.info("🔄 Migrating legacy control data → operations database...")
         await db.migrate_legacy_control_data()
@@ -219,7 +230,7 @@ class AutoFilterBot(Client):
         recovered_indexes = await db.recover_index_tasks_on_startup()
         if recovered_indexes:
             logger.warning(
-                "Paused %s interrupted indexer task(s); checkpoints were retained.",
+                "Requeued %s expired indexer lease(s); checkpoints were retained.",
                 recovered_indexes,
             )
 
@@ -230,11 +241,9 @@ class AutoFilterBot(Client):
         try:
             await db.ensure_indexes()
         except RequiredIndexError:
-            await super().stop()
             raise
 
         if await db.registry_needs_migration():
-            await super().stop()
             raise RuntimeError(
                 "Existing movie files were found but file_registry is empty. "
                 "Run `python tools/migrate_registry.py` once before starting the bot."
@@ -250,53 +259,81 @@ class AutoFilterBot(Client):
 
         db._search_tokens_complete = not await db.search_tokens_need_migration()
         if not db._search_tokens_complete:
-            logger.info(
-                "ℹ️ Legacy movie rows detected; using the compatible reference "
-                "search without expanding existing Atlas records."
+            raise RuntimeError(
+                "Legacy movie rows are missing search_tokens. Run "
+                "`python tools/migrate_search_tokens.py --apply` before startup."
             )
+        if not await db.analytics_counters_ready():
+            logger.warning(
+                "Language analytics counters are not initialized. Run "
+                "`python tools/migrate_search_tokens.py --apply` while the bot remains online."
+            )
+
+        # Only now connect the Kurigram client.  All required persistence and
+        # indexes are ready before the dispatcher can receive an update.
+        await super().start(
+            *args,
+            use_qr=use_qr,
+            except_ids=except_ids if except_ids is not None else [],
+            **kwargs,
+        )
+        me = await self.get_me()
+        logger.info("🚀 %s started as @%s", SERVICE_ROLE, me.username)
+        if SERVICE_ROLE in {"all-in-one", "bot-interactive", "worker-maintenance"}:
+            await start_tmdb_client()
 
         logger.info("✅ Bot fully ready.")
         await asyncio.to_thread(_write_ready_marker)
+        mark_ready()
 
         supervisor.start_accepting()
-        supervisor.spawn(
-            db.ensure_search_catalog(),
-            key="worker:search_catalog",
-            owner="bot",
-            resources=("search-catalog",),
-            drain_on_shutdown=True,
-        )
-        logger.info("✅ Fuzzy-search catalog worker started.")
+        supervisor.spawn(self._ready_heartbeat(), key="worker:ready", owner=SERVICE_ROLE)
 
-        supervisor.spawn(run_health_monitor(self), key="worker:health", owner="bot")
-        logger.info("✅ Health monitor started.")
+        if SERVICE_ROLE in {"all-in-one", "worker-broadcast"}:
+            from plugins.broadcast import run_broadcast_worker
 
-        supervisor.spawn(run_cache_reaper(), key="worker:cache_reaper", owner="bot")
-        logger.info("✅ Search-cache reaper started.")
+            supervisor.spawn(run_broadcast_worker(self), key="worker:broadcast", owner=SERVICE_ROLE)
+            logger.info("✅ Durable broadcast worker started.")
+        if SERVICE_ROLE in {"all-in-one", "worker-indexer"}:
+            from plugins.bulk_indexer import run_indexer_worker
 
-        supervisor.spawn(run_deletion_worker(self), key="worker:deletion", owner="bot")
-        logger.info("✅ Durable deletion worker started.")
+            supervisor.spawn(run_indexer_worker(self), key="worker:indexer", owner=SERVICE_ROLE)
+            logger.info("✅ Durable indexer worker started.")
+        if SERVICE_ROLE in {"all-in-one", "worker-maintenance"}:
+            from plugins.realtime_indexer import run_notification_worker
 
-        from plugins.broadcast import run_broadcast_worker
+            supervisor.spawn(
+                db.ensure_search_catalog(),
+                key="worker:search_catalog",
+                owner=SERVICE_ROLE,
+                resources=("search-catalog",),
+                drain_on_shutdown=True,
+            )
+            supervisor.spawn(run_health_monitor(self), key="worker:health", owner=SERVICE_ROLE)
+            supervisor.spawn(run_cache_reaper(), key="worker:cache_reaper", owner=SERVICE_ROLE)
+            supervisor.spawn(run_deletion_worker(self), key="worker:deletion", owner=SERVICE_ROLE)
+            supervisor.spawn(
+                run_notification_worker(self),
+                key="worker:announcement-outbox",
+                owner=SERVICE_ROLE,
+            )
+            logger.info("✅ Maintenance workers started.")
 
-        supervisor.spawn(run_broadcast_worker(self), key="worker:broadcast", owner="bot")
-        logger.info("✅ Durable broadcast worker started.")
-
-        from plugins.realtime_indexer import run_notification_worker
-
-        supervisor.spawn(
-            run_notification_worker(self),
-            key="worker:announcement-outbox",
-            owner="bot",
-        )
-        logger.info("✅ Durable notification worker started.")
+    async def _ready_heartbeat(self):
+        while True:
+            await asyncio.to_thread(_write_ready_marker)
+            await asyncio.sleep(60)
 
     async def stop(self, *args, **kwargs):
+        from plugins.readiness import mark_not_ready
+
+        mark_not_ready()
         await asyncio.to_thread(_remove_ready_marker)
         await supervisor.shutdown(drain_timeout=10, cancel_timeout=10)
         await close_tmdb_client()
         await super().stop(*args, **kwargs)
         await db.close()
+        await redis_state.close()
         _lock_file.close()
         logger.info("🛑 Bot stopped.")
 

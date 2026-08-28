@@ -9,6 +9,7 @@ from plugins.callbacks import answer_callback_safely
 from plugins.filter import route_menu
 from plugins.search_indicator import show_search_indicator, remove_search_indicator
 from plugins.workload import WorkloadRejected, enforce_search_rate_limits, search_slot, validate_search_query
+from plugins.telegram_retry import send_message_resilient
 from utils import (
     _no_preview,
     _html,
@@ -179,7 +180,9 @@ async def _show_workload_rejection(client, status_msg, message):
     if getattr(status_msg, "sticker", None):
         chat_id = status_msg.chat.id
         await remove_search_indicator(status_msg)
-        return await client.send_message(chat_id, message)
+        return await send_message_resilient(
+            client, chat_id, message, route="start_workload_rejection"
+        )
     return await status_msg.edit_text(message)
 
 
@@ -229,7 +232,14 @@ async def _execute_search(client, status_msg, query: str, config: dict, user_id=
         if getattr(status_msg, "sticker", None):
             chat_id = status_msg.chat.id
             await remove_search_indicator(status_msg)
-            return await client.send_message(chat_id, text, reply_markup=markup, parse_mode=ParseMode.HTML)
+            return await send_message_resilient(
+                client,
+                chat_id,
+                text,
+                reply_markup=markup,
+                parse_mode=ParseMode.HTML,
+                route="start_no_results",
+            )
         return await status_msg.edit_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
 
     await db.clear_old_searches()
@@ -346,13 +356,15 @@ async def start_handler(client: Client, message: Message):
     if is_new and LOG_CHANNEL_ID:
         try:
             user_count = await db.get_user_count()
-            await client.send_message(
+            await send_message_resilient(
+                client,
                 LOG_CHANNEL_ID,
                 "🆕 <b>New User Alert</b>\n\n"
                 f"👤 <b>User:</b> {html_user_mention(message.from_user)}\n"
                 f"🆔 <b>ID:</b> <code>{message.from_user.id}</code>\n"
                 f"📊 <b>Total Users:</b> <code>{user_count:,}</code>",
                 parse_mode=ParseMode.HTML,
+                route="new_user_log",
             )
         except Exception:
             pass

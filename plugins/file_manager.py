@@ -6,6 +6,7 @@ from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.enums import ParseMode
 from database.db import db
+from database.redis_client import redis_state
 from plugins.state import get_state, get_state_context, set_state, clear_state
 from plugins.task_supervisor import TaskConflict, supervisor
 from plugins.callbacks import answer_callback_safely
@@ -27,9 +28,19 @@ _BACK_BTN = InlineKeyboardMarkup(
     [[InlineKeyboardButton("‹ File Manager", callback_data="file_manager_menu")]]
 )
 
-# In-memory cache for duplicate scan results, keyed by admin user_id so
-# concurrent admin sessions don't overwrite each other's scan results.
-_cached_dupes = {}
+_DUPLICATE_REPORT_TTL = 30 * 60
+
+
+async def _get_duplicate_report(admin_id: int):
+    return await redis_state.get_json("duplicate-report", admin_id)
+
+
+async def _set_duplicate_report(admin_id: int, report: dict):
+    await redis_state.set_json("duplicate-report", admin_id, report, _DUPLICATE_REPORT_TTL)
+
+
+async def _clear_duplicate_report(admin_id: int):
+    await redis_state.delete("duplicate-report", admin_id)
 
 
 # ── FILE MANAGER MENU ─────────────────────────────────────────────────────────
@@ -37,8 +48,8 @@ _cached_dupes = {}
 
 @Client.on_callback_query(filters.regex(r"^file_manager_menu$") & filters.user(ADMIN_ID))
 async def file_manager_menu(client: Client, callback: CallbackQuery):
-    clear_state(callback.from_user.id)
     await answer_callback_safely(callback)
+    await clear_state(callback.from_user.id)
     total_files = await db.get_total_files()
     markup = InlineKeyboardMarkup(
         [
@@ -194,7 +205,7 @@ async def fm_dupes_page(client: Client, callback: CallbackQuery):
     except (ValueError, IndexError):
         return await answer_callback_safely(callback, "❌ Malformed callback.", show_alert=True)
     await answer_callback_safely(callback)
-    report = _cached_dupes.get(callback.from_user.id)
+    report = await _get_duplicate_report(callback.from_user.id)
     if not report:
         await callback.message.edit_text(
             "⚠️ Scan results expired. Please re-run duplicate scan.", reply_markup=_BACK_BTN
@@ -224,7 +235,7 @@ async def fm_delete_duplicate_group(client: Client, callback: CallbackQuery):
 @Client.on_callback_query(filters.regex(r"^fm_dupes_cleanup$") & filters.user(ADMIN_ID))
 async def fm_verified_cleanup_prompt(client: Client, callback: CallbackQuery):
     await answer_callback_safely(callback)
-    report = _cached_dupes.get(callback.from_user.id)
+    report = await _get_duplicate_report(callback.from_user.id)
     if not report:
         await callback.message.edit_text(
             "⚠️ Scan results expired. Run the duplicate report again.",
@@ -316,7 +327,7 @@ async def _run_verified_cleanup(status_msg, admin_id):
 
     try:
         result = await db.delete_verified_duplicates(show_progress)
-        _cached_dupes.pop(admin_id, None)
+        await _clear_duplicate_report(admin_id)
         await status_msg.edit_text(
             "✅ **Verified Exact Cleanup Complete**\n\n"
             f"🗑 Removed: `{result['deleted']:,}` exact copies\n"
@@ -402,7 +413,7 @@ async def _run_duplicate_scan(client, status_msg, admin_id):
             )
             return
 
-        _cached_dupes[admin_id] = report
+        await _set_duplicate_report(admin_id, report)
         await _show_dupes_page(status_msg, report, page=0)
 
     except RuntimeError as error:
@@ -767,7 +778,7 @@ from pyrogram import ContinuePropagation, StopPropagation
 )
 async def fm_input_handler(client: Client, message: Message):
     admin_id = message.from_user.id
-    state = get_state(admin_id)
+    state = await get_state(admin_id)
 
     if not state or not state.startswith("fm_"):
         raise ContinuePropagation
@@ -889,8 +900,8 @@ async def fm_input_handler(client: Client, message: Message):
                 "Try again or use the Cancel button."
             )
             return  # keep state alive
-        set_state(admin_id, f"fm_rename#{obj_id}")
-        context = get_state_context(admin_id)
+        await set_state(admin_id, f"fm_rename#{obj_id}")
+        context = await get_state_context(admin_id)
         if context and context.get("prompt_chat_id") and context.get("prompt_message_id"):
             await client.edit_message_text(
                 context["prompt_chat_id"],

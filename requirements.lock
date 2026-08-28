@@ -883,6 +883,10 @@ rapidfuzz==3.14.3 \
     --hash=sha256:fa7c8f26f009f8c673fbfb443792f0cf8cf50c4e18121ff1e285b5e08a94fbdb \
     --hash=sha256:fce3152f94afcfd12f3dd8cf51e48fa606e3cb56719bccebe3b401f43d0714f9
     # via -r requirements.txt
+redis==6.4.0 \
+    --hash=sha256:b01bc7282b8444e28ec36b261df5375183bb47a07eb9c603f284e89cbc5ef010 \
+    --hash=sha256:f0544fa9604264e9464cdf4814e7d4830f74b165d52f2a330a760a88dd248b7f
+    # via -r requirements.txt
 tgcrypto==1.2.5 \
     --hash=sha256:0133936eac63cc9529b497d759b7d0ca21e491bb42481b40b603ee63bb8c10b7 \
     --hash=sha256:0d28aa317364a5c27317fe97a48267aa1c65c9aaf589909e97489ebe82a714e3 \

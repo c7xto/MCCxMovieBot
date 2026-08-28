@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import random
+import secrets
 import time
 from collections import Counter
 from dataclasses import dataclass
@@ -86,3 +87,58 @@ async def telegram_call(operation, *, route: str, policy: TelegramRetryPolicy,
 
 def telegram_retry_snapshot() -> dict:
     return dict(_metrics)
+
+
+async def send_message_resilient(client, *args, route="interactive_send", **kwargs):
+    operation_id = secrets.token_hex(12)
+    return await telegram_call(
+        lambda: client.send_message(*args, **kwargs),
+        route=route,
+        policy=INTERACTIVE_RETRY,
+        retry_safe=True,
+        idempotency_key=f"{route}:{operation_id}",
+    )
+
+
+async def edit_message_text_resilient(client, *args, route="interactive_edit", **kwargs):
+    operation_id = secrets.token_hex(12)
+    return await telegram_call(
+        lambda: client.edit_message_text(*args, **kwargs),
+        route=route,
+        policy=INTERACTIVE_RETRY,
+        retry_safe=True,
+        idempotency_key=f"{route}:{operation_id}",
+    )
+
+
+async def copy_message_resilient(client, *args, route="interactive_copy", **kwargs):
+    operation_id = secrets.token_hex(12)
+    return await telegram_call(
+        lambda: client.copy_message(*args, **kwargs),
+        route=route,
+        policy=DELIVERY_RETRY,
+        retry_safe=True,
+        idempotency_key=f"{route}:{operation_id}",
+    )
+
+
+async def reply_text_resilient(message, *args, route="interactive_reply", **kwargs):
+    operation_id = secrets.token_hex(12)
+    return await telegram_call(
+        lambda: message.reply_text(*args, **kwargs),
+        route=route,
+        policy=INTERACTIVE_RETRY,
+        retry_safe=True,
+        idempotency_key=f"{route}:{operation_id}",
+    )
+
+
+async def edit_text_resilient(message, *args, route="interactive_edit", **kwargs):
+    operation_id = secrets.token_hex(12)
+    return await telegram_call(
+        lambda: message.edit_text(*args, **kwargs),
+        route=route,
+        policy=INTERACTIVE_RETRY,
+        retry_safe=True,
+        idempotency_key=f"{route}:{operation_id}",
+    )

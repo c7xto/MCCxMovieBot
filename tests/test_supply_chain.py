@@ -30,7 +30,7 @@ class SupplyChainTests(unittest.TestCase):
             "pids_limit:",
             "mem_limit:",
             "healthcheck:",
-            "bot-runtime:/app/runtime",
+            "redis-data:/data",
         ):
             with self.subTest(value=value):
                 self.assertIn(value, compose)

@@ -2,14 +2,14 @@
 
 import logging
 import time
-from collections import OrderedDict
 
 from pyrogram.errors import QueryIdInvalid
+from database.redis_client import redis_state
+from plugins.telegram_retry import INTERACTIVE_RETRY, telegram_call
 
 
 logger = logging.getLogger(__name__)
-_answered_callback_ids = OrderedDict()
-_MAX_ANSWERED_CALLBACKS = 4096
+_CALLBACK_DEDUP_TTL = 30
 
 
 async def answer_callback_safely(callback, text=None, *, show_alert=False) -> bool:
@@ -19,22 +19,21 @@ async def answer_callback_safely(callback, text=None, *, show_alert=False) -> bo
     # create QUERY_ID_INVALID noise after the UI lock has already been freed.
     telegram_callback_id = getattr(callback, "id", "")
     callback_key = f"telegram:{telegram_callback_id}" if telegram_callback_id else None
-    if getattr(callback, "_mccx_answered", False) or (
-        callback_key is not None and callback_key in _answered_callback_ids
-    ):
+    already_answered = getattr(callback, "_mccx_answered", False)
+    if already_answered:
         if text and show_alert and getattr(callback, "message", None) is not None:
             # Telegram cannot show a second popup after the early ACK. Preserve
             # important error feedback as a normal chat message instead.
             await callback.message.reply_text(str(text), reply_parameters=None)
         return True
-    if callback_key is not None:
-        _answered_callback_ids[callback_key] = None
-        _answered_callback_ids.move_to_end(callback_key)
-        while len(_answered_callback_ids) > _MAX_ANSWERED_CALLBACKS:
-            _answered_callback_ids.popitem(last=False)
     started = time.monotonic()
     try:
-        await callback.answer(text, show_alert=show_alert)
+        await telegram_call(
+            lambda: callback.answer(text, show_alert=show_alert),
+            route="callback_answer",
+            policy=INTERACTIVE_RETRY,
+            retry_safe=False,
+        )
         try:
             from plugins.workload import record_workload_metric
 
@@ -49,6 +48,10 @@ async def answer_callback_safely(callback, text=None, *, show_alert=False) -> bo
             setattr(callback, "_mccx_answered", True)
         except Exception:
             pass
+        if callback_key is not None:
+            await redis_state.set_json(
+                "answered-callback", callback_key, True, _CALLBACK_DEDUP_TTL
+            )
         return True
     except QueryIdInvalid:
         logger.info("Ignored expired Telegram callback data=%s", callback.data)
@@ -61,5 +64,5 @@ async def answer_callback_safely(callback, text=None, *, show_alert=False) -> bo
         # A transport error may occur before Telegram receives the answer;
         # permit an explicit retry instead of treating it as acknowledged.
         if callback_key is not None:
-            _answered_callback_ids.pop(callback_key, None)
+            await redis_state.delete("answered-callback", callback_key)
         raise

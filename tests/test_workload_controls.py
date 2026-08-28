@@ -122,7 +122,7 @@ class WorkloadControlTests(unittest.TestCase):
                 await asyncio.sleep(0)
 
         asyncio.run(run())
-        snapshot = workload_snapshot()
+        snapshot = asyncio.run(workload_snapshot())
         self.assertGreaterEqual(snapshot["search_completed:test_route"], 1)
         self.assertEqual(snapshot["search_queue_depth"], 0)
 

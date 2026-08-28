@@ -35,7 +35,8 @@ EXPECTED_LANGUAGES = [
     "English", "Kannada", "Dual Audio", "Multi Audio"
 ]
 
-from database.db import db, _SearchCache  # noqa: E402
+from database.db import db  # noqa: E402
+from database.redis_client import redis_state  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("verify_db_performance")
@@ -60,72 +61,32 @@ def _section(title):
 
 # ── 1. Cache Mechanics Validation ────────────────────────────────────────
 
-def test_cache_mechanics():
+async def test_cache_mechanics():
     section = "Cache Mechanics"
     _section(section)
-
-    # 1a. Seed with a representative search-session payload and confirm an
-    # immediate read returns it unmodified.
-    cache = _SearchCache(maxsize=5, default_ttl=1)
-    sample_payload = {
-        "results": [{"file_id": f"f{i}", "file_name": f"Movie {i}.mkv", "file_size": 123456} for i in range(3)],
-        "query": "test movie",
-        "tmdb": None,
-        "speed": "0.010s",
-        "time": time.time(),
-        "auto_delete_time": 300,
-    }
-    cache.set("session_a", sample_payload)
-    record(section, "seed + immediate get() round-trips payload", _pf(cache.get("session_a") == sample_payload))
-
-    # 1b. LRU cap: inserting past maxsize must evict the oldest entry, never
-    # grow unbounded.
-    for i in range(10):
-        cache.set(f"lru_{i}", {"n": i})
-    record(
-        section, "LRU cap holds steady at maxsize under overflow",
-        _pf(len(cache._data) == cache.maxsize),
-        f"len={len(cache._data)}, maxsize={cache.maxsize}"
-    )
-    record(
-        section, "LRU evicted the oldest entries, kept the newest",
-        _pf("lru_0" not in cache._data and "lru_9" in cache._data)
-    )
-
-    # 1c. Explicit TTL expiration — fresh immediately after set(), gone once
-    # past default_ttl.
-    cache2 = _SearchCache(maxsize=100, default_ttl=1)
-    cache2.set("expiring", {"payload": "x"})
-    still_fresh = cache2.get("expiring") is not None
-    time.sleep(1.2)
-    expired_now = cache2.get("expiring") is None
-    record(section, "TTL expiration fires via lazy get()", _pf(still_fresh and expired_now))
-
-    # 1d. purge() — the exact call run_cache_reaper() makes every 300s in
-    # production (plugins/health_monitor.py: db._search_cache.purge(...)).
-    # Verifies the reaper's underlying mechanism actually frees memory for
-    # sessions nobody happened to read after they expired.
-    cache3 = _SearchCache(maxsize=1000, default_ttl=1)
-    for i in range(50):
-        cache3.set(f"reap_{i}", {"n": i})
-    before = len(cache3._data)
-    time.sleep(1.2)
-    cache3.purge(cache3.default_ttl)
-    after = len(cache3._data)
-    record(
-        section, "purge() (reaper mechanism) frees all expired entries",
-        _pf(before == 50 and after == 0),
-        f"before={before}, after={after}"
-    )
-
-    # 1e. Confirm the live Database instance's cache is actually a
-    # _SearchCache — i.e. save_search()/get_search()/clear_old_searches()
-    # are wired to the same object this section just exercised.
-    record(
-        section, "db._search_cache is wired up as a _SearchCache instance",
-        _pf(isinstance(db._search_cache, _SearchCache)),
-        f"maxsize={db._search_cache.maxsize}, default_ttl={db._search_cache.default_ttl}"
-    )
+    try:
+        await redis_state.start()
+        sample_payload = {
+            "results": [{"file_id": "f1", "file_name": "Movie.mkv"}],
+            "query": "test movie",
+        }
+        await redis_state.set_json("verify:search-session", sample_payload, ttl=30)
+        restored = await redis_state.get_json("verify:search-session")
+        record(
+            section,
+            "Redis search-session JSON round-trips",
+            _pf(restored == sample_payload),
+        )
+        first_claim = await redis_state.claim_once("verify:callback", ttl=30)
+        second_claim = await redis_state.claim_once("verify:callback", ttl=30)
+        record(
+            section,
+            "Redis callback deduplication is atomic",
+            _pf(first_claim and not second_claim),
+        )
+        await redis_state.delete("verify:search-session", "verify:callback")
+    except Exception as exc:
+        record(section, "Redis ephemeral-state backend reachable", "FAIL", str(exc)[:300])
 
 
 # ── 2. Aggregation Pipeline Health ───────────────────────────────────────
@@ -134,22 +95,9 @@ async def test_aggregation_pipeline_health():
     section = "Aggregation Pipeline"
     _section(section)
 
-    if not db.file_cols:
-        record(section, "get_files_by_language()", "SKIP", "no clusters configured")
+    if db.analytics_col is None:
+        record(section, "get_files_by_language()", "SKIP", "operations database not configured")
         return
-
-    # Per-cluster probe: a minimal $facet + allowDiskUse pipeline, isolated
-    # from the real query shape, to pinpoint exactly which cluster (if any)
-    # rejects the pipeline on permission or syntax grounds before trusting
-    # the full aggregate result below.
-    for i, col in enumerate(db.file_cols):
-        try:
-            probe = [{"$facet": {"n": [{"$count": "n"}]}}]
-            cursor = await col.aggregate(probe, allowDiskUse=True)
-            await cursor.to_list(length=1)
-            record(section, f"Cluster {i+1}: accepts $facet + allowDiskUse", "PASS")
-        except Exception as e:
-            record(section, f"Cluster {i+1}: accepts $facet + allowDiskUse", "FAIL", str(e)[:200])
 
     try:
         start = time.time()
@@ -284,7 +232,7 @@ async def main():
             "search checks will be reported as SKIP, not PASS."
         )
 
-    test_cache_mechanics()
+    await test_cache_mechanics()
     await test_aggregation_pipeline_health()
     await test_search_traversal()
 
@@ -293,6 +241,7 @@ async def main():
             await client.close()
         except Exception:
             pass
+    await redis_state.close()
 
     _section("SUMMARY")
     passed  = sum(1 for _, _, s, _ in RESULTS if s == "PASS")

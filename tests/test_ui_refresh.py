@@ -74,8 +74,8 @@ def test_cached_media_delivery_has_one_shared_implementation():
 @pytest.mark.asyncio
 async def test_prompt_result_reuses_existing_panel():
     admin_id = 7001
-    clear_state(admin_id)
-    set_state(
+    await clear_state(admin_id)
+    await set_state(
         admin_id,
         "example",
         prompt_chat_id=123,
@@ -97,14 +97,14 @@ async def test_prompt_result_reuses_existing_panel():
     client.edit_message_text.assert_awaited_once()
     fallback.reply_text.assert_not_awaited()
     fallback.delete.assert_awaited_once()
-    assert get_state(admin_id) is None
+    assert await get_state(admin_id) is None
 
 
 @pytest.mark.asyncio
 async def test_cancel_restores_previous_panel_without_cancelled_bubble():
     admin_id = 7002
-    clear_state(admin_id)
-    set_state(
+    await clear_state(admin_id)
+    await set_state(
         admin_id,
         "example",
         prompt_chat_id=123,
@@ -130,8 +130,8 @@ async def test_cancel_restores_previous_panel_without_cancelled_bubble():
 @pytest.mark.asyncio
 async def test_cancel_fallback_keeps_menu_buttons_and_formatting():
     admin_id = 7003
-    clear_state(admin_id)
-    set_state(
+    await clear_state(admin_id)
+    await set_state(
         admin_id,
         "example",
         prompt_chat_id=123,

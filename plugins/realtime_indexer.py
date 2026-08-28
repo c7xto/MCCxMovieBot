@@ -4,12 +4,12 @@ import time
 import random
 import asyncio
 import logging
-from collections import OrderedDict
 from dotenv import load_dotenv
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.enums import ParseMode
 from database.db import db
+from database.redis_client import redis_state
 from tmdb import get_movie_data
 from pyrogram.errors import FloodWait, InputUserDeactivated, UserIsBlocked
 from plugins.filter import send_smart_log
@@ -22,9 +22,6 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# Cap to prevent unbounded RAM growth — LRU: oldest entry is first
-RECENT_POSTS = OrderedDict()
-_RECENT_POSTS_MAX = 1000
 POST_COOLDOWN = 300
 
 
@@ -60,18 +57,6 @@ async def run_notification_worker(client: Client):
                 delay = min(3600, 30 * (2 ** min(job.get("attempts", 1), 7)))
                 await db.retry_announcement(job["_id"], delay, job.get("revision"))
         await asyncio.sleep(3)
-
-
-async def _ensure_queue_worker(client: Client):
-    """Starts the queue worker once on first use."""
-    try:
-        supervisor.spawn(
-            run_notification_worker(client),
-            key="worker:announcement-outbox",
-            owner="realtime_indexer",
-        )
-    except TaskConflict:
-        pass
 
 
 # ── FILE INFO PARSER ──────────────────────────────────────────────────────────
@@ -164,75 +149,70 @@ async def _do_post(client: Client, filename: str):
     if not clean_title or len(clean_title) < 2:
         return
 
-    current_time = time.time()
     title_key = clean_title.lower()
-    last_posted = RECENT_POSTS.get(title_key, 0)
-    if current_time - last_posted < POST_COOLDOWN:
+    if not await redis_state.claim_once("recent-announcement", title_key, POST_COOLDOWN):
         return
+    try:
+        tmdb_data = await get_movie_data(clean_title)
+        display_title = tmdb_data["title"] if tmdb_data else clean_title.title()
 
-    tmdb_data = await get_movie_data(clean_title)
-    display_title = tmdb_data["title"] if tmdb_data else clean_title.title()
+        metadata = []
+        if year:
+            metadata.append(f"<code>{year}</code>")
+        if language:
+            metadata.append(f"#{language.replace(' ', '')}")
+        if quality:
+            metadata.append(quality)
+        meta_string = "  •  ".join(metadata)
 
-    metadata = []
-    if year:
-        metadata.append(f"<code>{year}</code>")
-    if language:
-        metadata.append(f"#{language.replace(' ', '')}")
-    if quality:
-        metadata.append(quality)
-    meta_string = "  •  ".join(metadata)
-
-    caption = (
-        f"🎬 <b>{_html(display_title)}</b>\n"
-        f"{meta_string}\n\n"
-        f"<blockquote>Tap the button below to get this file instantly.</blockquote>"
-    )
-
-    safe_title = re.sub(r"[^a-zA-Z0-9\s\-]", " ", display_title)
-    safe_query = re.sub(r"\s+", "_", safe_title.strip())[:45]
-    bot_url = f"https://t.me/{client.me.username}?start=search_{safe_query}"
-
-    btn_text = "📥 Get Series" if is_series else "📥 Get Movie"
-
-    buttons = [[InlineKeyboardButton(btn_text, url=bot_url)]]
-    if main_group:
-        buttons[0].append(InlineKeyboardButton("💬 Request Group", url=main_group))
-
-    markup = InlineKeyboardMarkup(buttons)
-
-    if tmdb_data and tmdb_data.get("poster"):
-        await telegram_call(
-            lambda: client.send_photo(
-                chat_id=update_channel,
-                photo=tmdb_data["poster"],
-                caption=caption,
-                reply_markup=markup,
-                parse_mode=ParseMode.HTML,
-            ),
-            route="update_channel_photo",
-            policy=BACKGROUND_RETRY,
-            retry_safe=True,
-            idempotency_key=f"announcement:{title_key}",
-        )
-    else:
-        await telegram_call(
-            lambda: client.send_message(
-                chat_id=update_channel,
-                text=caption,
-                reply_markup=markup,
-                parse_mode=ParseMode.HTML,
-            ),
-            route="update_channel_text",
-            policy=BACKGROUND_RETRY,
-            retry_safe=True,
-            idempotency_key=f"announcement:{title_key}",
+        caption = (
+            f"🎬 <b>{_html(display_title)}</b>\n"
+            f"{meta_string}\n\n"
+            f"<blockquote>Tap the button below to get this file instantly.</blockquote>"
         )
 
-    if title_key in RECENT_POSTS:
-        RECENT_POSTS.move_to_end(title_key)
-    elif len(RECENT_POSTS) >= _RECENT_POSTS_MAX:
-        RECENT_POSTS.popitem(last=False)
-    RECENT_POSTS[title_key] = current_time
+        safe_title = re.sub(r"[^a-zA-Z0-9\s\-]", " ", display_title)
+        safe_query = re.sub(r"\s+", "_", safe_title.strip())[:45]
+        bot_url = f"https://t.me/{client.me.username}?start=search_{safe_query}"
+
+        btn_text = "📥 Get Series" if is_series else "📥 Get Movie"
+
+        buttons = [[InlineKeyboardButton(btn_text, url=bot_url)]]
+        if main_group:
+            buttons[0].append(InlineKeyboardButton("💬 Request Group", url=main_group))
+
+        markup = InlineKeyboardMarkup(buttons)
+
+        if tmdb_data and tmdb_data.get("poster"):
+            await telegram_call(
+                lambda: client.send_photo(
+                    chat_id=update_channel,
+                    photo=tmdb_data["poster"],
+                    caption=caption,
+                    reply_markup=markup,
+                    parse_mode=ParseMode.HTML,
+                ),
+                route="update_channel_photo",
+                policy=BACKGROUND_RETRY,
+                retry_safe=True,
+                idempotency_key=f"announcement:{title_key}",
+            )
+        else:
+            await telegram_call(
+                lambda: client.send_message(
+                    chat_id=update_channel,
+                    text=caption,
+                    reply_markup=markup,
+                    parse_mode=ParseMode.HTML,
+                ),
+                route="update_channel_text",
+                policy=BACKGROUND_RETRY,
+                retry_safe=True,
+                idempotency_key=f"announcement:{title_key}",
+            )
+    except Exception:
+        await redis_state.delete("recent-announcement", title_key)
+        raise
 
 
 # ── NEW FILE HANDLER ──────────────────────────────────────────────────────────
@@ -299,7 +279,6 @@ async def index_new_files(client: Client, message: Message):
             logger.info("Realtime capacity log skipped during shutdown")
 
     if success:
-        await _ensure_queue_worker(client)
         await db.enqueue_announcement(media.file_name, delay_seconds=random.uniform(1.0, 3.0))
         await db.enqueue_request_fulfillment(media.file_name, delay_seconds=random.uniform(1.0, 3.0))
 

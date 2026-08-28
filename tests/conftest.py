@@ -1,9 +1,22 @@
-"""Test bootstrap for Kurigram on Python versions without a default loop."""
+"""Hermetic shared-state configuration for the unit-test process."""
 
-import asyncio
+import os
+
+import pytest
 
 
-try:
-    asyncio.get_event_loop()
-except RuntimeError:
-    asyncio.set_event_loop(asyncio.new_event_loop())
+os.environ.setdefault("REDIS_URL", "memory://")
+os.environ.setdefault("MCCX_ALLOW_MEMORY_REDIS_FOR_TESTS", "1")
+
+
+@pytest.fixture(autouse=True)
+def clear_memory_redis():
+    from database.redis_client import redis_state
+
+    redis_state._memory.clear()
+    redis_state._memory_hashes.clear()
+    redis_state._memory_semaphores.clear()
+    yield
+    redis_state._memory.clear()
+    redis_state._memory_hashes.clear()
+    redis_state._memory_semaphores.clear()

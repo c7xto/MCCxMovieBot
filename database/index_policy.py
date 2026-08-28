@@ -18,6 +18,14 @@ def has_exact_index(indexes: dict, field: str) -> bool:
     return any(spec.get("key") == expected for spec in indexes.values())
 
 
+def has_compound_index(indexes: dict, keys: list[tuple[str, int]], *, unique=False) -> bool:
+    expected = list(keys)
+    return any(
+        spec.get("key") == expected and (not unique or spec.get("unique") is True)
+        for spec in indexes.values()
+    )
+
+
 async def ensure_required_index(collection, field: str, label: str):
     indexes = await collection.index_information()
     if has_exact_index(indexes, field):
@@ -65,4 +73,27 @@ async def ensure_required_unique_index(collection, field: str, label: str):
     if not has_exact_unique_index(verified, field):
         raise RequiredIndexError(
             f"MongoDB did not report required index {label} as unique after creation."
+        )
+
+
+async def ensure_required_compound_index(
+    collection,
+    keys: list[tuple[str, int]],
+    label: str,
+    *,
+    unique: bool = False,
+):
+    """Create and verify an exact compound index used by a critical route."""
+    indexes = await collection.index_information()
+    if has_compound_index(indexes, keys, unique=unique):
+        return
+    try:
+        await collection.create_index(keys, unique=unique, name=label.replace(".", "_"))
+    except Exception as exc:
+        raise RequiredIndexError(f"Could not create required index {label}: {exc}") from exc
+    verified = await collection.index_information()
+    if not has_compound_index(verified, keys, unique=unique):
+        qualifier = " unique" if unique else ""
+        raise RequiredIndexError(
+            f"MongoDB did not report required{qualifier} compound index {label} after creation."
         )

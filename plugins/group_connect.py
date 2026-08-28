@@ -220,8 +220,7 @@ async def group_search(client: Client, message: Message):
                 f"<blockquote>Type a Movie or Series name only.</blockquote>",
                 parse_mode=ParseMode.HTML,
             )
-            await asyncio.sleep(5)
-            await warning.delete()
+            await db.schedule_deletion(warning.chat.id, warning.id, 5)
         except Exception:
             pass
         return
@@ -295,11 +294,7 @@ async def group_search(client: Client, message: Message):
             parse_mode=ParseMode.HTML,
             **_no_preview(),
         )
-        await asyncio.sleep(15)
-        try:
-            await not_found_msg.delete()
-        except Exception:
-            pass
+        await db.schedule_deletion(not_found_msg.chat.id, not_found_msg.id, 15)
         return
 
     # ── Results found ─────────────────────────────────────────────────────────

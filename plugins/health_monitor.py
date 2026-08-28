@@ -280,9 +280,8 @@ async def check_known_issues(client, config):
         findings.append(
             {
                 "label": "Operations Database",
-                "ok": None,
-                "text": "ℹ️ OPERATIONS_DATABASE_URI is not set. Control data and the file registry "
-                "still use a movie cluster; a dedicated operations database is recommended.",
+                "ok": False,
+                "text": "⛔ OPERATIONS_DATABASE_URI is unavailable. Readiness must fail until it is restored.",
             }
         )
 
@@ -341,7 +340,7 @@ async def run_health_monitor(client):
             logger.warning("Could not refresh readiness marker: %s", type(exc).__name__)
 
         issues = []
-        logger.info("workload_metrics %s", workload_snapshot())
+        logger.info("workload_metrics %s", await workload_snapshot())
         logger.info("telegram_retry_metrics %s", telegram_retry_snapshot())
         try:
             logger.info(
@@ -450,13 +449,7 @@ async def run_health_monitor(client):
 
 
 async def run_cache_reaper():
-    """
-    Sweeps the in-process search-session cache every 5 minutes. _SearchCache
-    normally evicts lazily (on read) or via the LRU cap, so a burst of unique
-    searches followed by a long quiet period would otherwise leave stale
-    sessions resident in memory until something else happens to touch the
-    cache. This is the timer-driven backstop for that gap.
-    """
+    """Report Redis TTL cache policy; Redis expires entries independently."""
     while True:
         await asyncio.sleep(300)
         try:

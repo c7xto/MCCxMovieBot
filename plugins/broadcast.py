@@ -9,6 +9,7 @@ from pyrogram.errors import InputUserDeactivated, MessageNotModified, UserIsBloc
 from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from database.db import db
+from database.redis_client import redis_state
 from plugins.callbacks import answer_callback_safely
 from plugins.telegram_retry import BACKGROUND_RETRY, BROADCAST_RETRY, INTERACTIVE_RETRY, telegram_call
 from utils import ADMIN_ID
@@ -16,8 +17,8 @@ from utils import ADMIN_ID
 
 logger = logging.getLogger(__name__)
 
-# Preview state is intentionally short-lived. Confirmed jobs are persisted in MongoDB.
-_pending_broadcasts = {}
+# Preview state is intentionally short-lived in Redis. Confirmed jobs are
+# persisted in MongoDB, so any interactive replica may process confirmation.
 _PROGRESS_EDIT_SECONDS = 5.0
 _CONTROL_CHECK_SECONDS = 2.0
 
@@ -535,7 +536,10 @@ async def bc_stop_confirm(client: Client, callback: CallbackQuery):
 @Client.on_callback_query(filters.regex(r"^bc_confirm$") & filters.user(ADMIN_ID))
 async def bc_confirm(client: Client, callback: CallbackQuery):
     await answer_callback_safely(callback, "Saving broadcast…")
-    pending = _pending_broadcasts.pop(callback.message.chat.id, None)
+    pending = await redis_state.get_json(
+        "broadcast-preview", callback.message.chat.id
+    )
+    await redis_state.delete("broadcast-preview", callback.message.chat.id)
     if not pending:
         await callback.message.edit_text("⚠️ **Broadcast preview expired.** Run `/broadcast` again.")
         return
@@ -581,7 +585,7 @@ async def bc_confirm(client: Client, callback: CallbackQuery):
 @Client.on_callback_query(filters.regex(r"^bc_cancel$") & filters.user(ADMIN_ID))
 async def bc_cancel(client: Client, callback: CallbackQuery):
     await answer_callback_safely(callback, "Broadcast cancelled")
-    _pending_broadcasts.pop(callback.message.chat.id, None)
+    await redis_state.delete("broadcast-preview", callback.message.chat.id)
     await callback.message.edit_text("✕ **Broadcast cancelled.**")
 
 
@@ -668,7 +672,7 @@ async def broadcast_handler(client: Client, message: Message):
         reply_markup=confirm_markup,
         reply_parameters=None,
     )
-    _pending_broadcasts[message.chat.id] = {
+    await redis_state.set_json("broadcast-preview", message.chat.id, {
         "source_chat_id": message.reply_to_message.chat.id,
         "source_message_id": message.reply_to_message.id,
         "do_pin": do_pin,
@@ -677,4 +681,4 @@ async def broadcast_handler(client: Client, message: Message):
         "target": target,
         "user_count": user_count,
         "group_count": group_count,
-    }
+    }, ttl=300)

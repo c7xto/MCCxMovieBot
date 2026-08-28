@@ -21,7 +21,7 @@ def cancel_button(label="✕ Cancel"):
 async def begin_prompt(callback, state: str, text: str):
     """Turn the current menu into an input prompt and remember its old view."""
     message = callback.message
-    set_state(
+    await set_state(
         callback.from_user.id,
         state,
         prompt_chat_id=message.chat.id,
@@ -52,8 +52,8 @@ async def delete_prompt_input(message) -> bool:
 
 async def restore_prompt(client, admin_id: int, fallback_message=None) -> bool:
     """Restore the menu saved before an input prompt without a new bot bubble."""
-    context = get_state_context(admin_id)
-    clear_state(admin_id)
+    context = await get_state_context(admin_id)
+    await clear_state(admin_id)
     if not context:
         return False
 
@@ -97,8 +97,8 @@ async def finish_prompt(
     parse_mode=None,
 ):
     """Replace the active prompt with its result and a concise back button."""
-    context = get_state_context(admin_id)
-    clear_state(admin_id)
+    context = await get_state_context(admin_id)
+    await clear_state(admin_id)
     markup = reply_markup or InlineKeyboardMarkup(
         [[InlineKeyboardButton(back_label, callback_data=back_callback)]]
     )

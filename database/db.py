@@ -25,10 +25,12 @@ from rapidfuzz import fuzz, process
 from pyrogram.file_id import DOCUMENT_TYPES, FileId
 from database.index_policy import (
     RequiredIndexError,
+    ensure_required_compound_index,
     ensure_required_index,
     ensure_required_unique_index,
 )
 from database.shard_router import ShardRouter, is_capacity_error
+from database.redis_client import redis_state, stable_cache_key
 from plugins.duplicate_safety import stable_duplicate_key
 from verification import VerificationResult, VerificationStatus
 
@@ -68,9 +70,32 @@ MOVIE_MONGO_SELECTION_TIMEOUT_MS = max(
 MOVIE_MONGO_SOCKET_TIMEOUT_MS = max(
     5000, min(30000, int(os.getenv("MOVIE_MONGO_SOCKET_TIMEOUT_MS", "15000")))
 )
+MONGO_WAIT_QUEUE_TIMEOUT_MS = 5000
+MONGO_MAX_CONNECTING = 10
 SHARD_OPERATION_TIMEOUT_SECONDS = max(
     2.0, min(15.0, float(os.getenv("SHARD_OPERATION_TIMEOUT_SECONDS", "6")))
 )
+ANALYTICS_LANGUAGES = (
+    "Malayalam",
+    "Tamil",
+    "Telugu",
+    "Hindi",
+    "English",
+    "Kannada",
+    "Dual Audio",
+    "Multi Audio",
+)
+
+
+def language_tags_for_name(file_name: str) -> list[str]:
+    """Return stable language labels stored at write time for analytics."""
+    normalized = " ".join(re.findall(r"[a-z0-9]+", str(file_name).casefold()))
+    padded = f" {normalized} "
+    return [
+        language
+        for language in ANALYTICS_LANGUAGES
+        if f" {' '.join(re.findall(r'[a-z0-9]+', language.casefold()))} " in padded
+    ]
 
 _RESTORABLE_CONFIG_TYPES = {
     "start_media": str,
@@ -637,7 +662,7 @@ def telegram_file_identity(file_id: str) -> str:
 
 def registry_identity_document(file_id: str, file_unique_id: str = "") -> dict:
     """Build every stable identity protected by the central registry."""
-    document = {"file_id": file_id}
+    document = {"file_id": file_id, "location_pending": True}
     if file_unique_id:
         document["file_unique_id"] = file_unique_id
     telegram_identity = telegram_file_identity(file_id)
@@ -1006,6 +1031,8 @@ class Database:
                         # holding idle connections open on a quiet bot.
                         maxPoolSize=50,
                         minPoolSize=0,
+                        waitQueueTimeoutMS=MONGO_WAIT_QUEUE_TIMEOUT_MS,
+                        maxConnecting=MONGO_MAX_CONNECTING,
                         **tls_options,
                     )
                     self.clients.append(client)
@@ -1029,14 +1056,10 @@ class Database:
         self.broadcast_col = None
         self.groups_col = None
         self.verification_cache_col = None
+        self.analytics_col = None
         self.main_db = None
         self.legacy_main_db = None
         self.legacy_operations_db = None
-        self._search_cache = _SearchCache(maxsize=2000, default_ttl=600)
-        # Popular movie searches are highly repetitive. Keep their already
-        # merged results briefly so groups and DMs do not rescan three Atlas
-        # shards for the same title every time.
-        self._query_cache = _SearchCache(maxsize=512, default_ttl=120)
         self._db_size_cache = {}  # id(db_instance) -> (fetched_at, size_mb)
         self.shard_router = ShardRouter(len(self.dbs))
         self._file_count_cache = (0.0, 0)
@@ -1047,19 +1070,18 @@ class Database:
         self._catalog_worker_semaphore = asyncio.Semaphore(1)
         self._fuzzy_worker_semaphore = asyncio.Semaphore(2)
         self._duplicate_scan_lock = asyncio.Lock()
-        self._duplicate_group_cache = _SearchCache(maxsize=250, default_ttl=600)
         catalog_size = load_search_catalog()
         if catalog_size:
             logger.info("✅ Loaded fuzzy-search catalog: %s titles", catalog_size)
 
         if self.dbs:
-            # Keep movie shards in their original numbered databases, but put
-            # the writable control plane on cluster 2 when available.  Atlas
-            # blocks *all* writes on an over-quota cluster, so users, settings,
-            # groups and request bookkeeping must not depend on cluster 1.
+            # Movie shards retain their original numbered databases. The
+            # operational control plane is intentionally never placed on a
+            # movie shard: a full catalogue shard must not disable sessions,
+            # registry writes, rate limits, or durable jobs.
             self.legacy_main_db = self.dbs[0]
             self.legacy_operations_db = self.dbs[1] if len(self.dbs) > 1 else self.legacy_main_db
-            _ops_db = self.legacy_operations_db
+            _ops_db = None
             if self.operations_uri:
                 tls_options = mongo_tls_options(
                     self.operations_uri,
@@ -1075,15 +1097,19 @@ class Database:
                     retryReads=True,
                     maxPoolSize=50,
                     minPoolSize=0,
+                    waitQueueTimeoutMS=MONGO_WAIT_QUEUE_TIMEOUT_MS,
+                    maxConnecting=MONGO_MAX_CONNECTING,
                     **tls_options,
                 )
                 self.clients.append(self.operations_client)
                 self.operations_db = self.operations_client["MCCxBot_Operations"]
                 _ops_db = self.operations_db
             self.main_db = _ops_db
-            self.users_col = self.main_db["users"]
-            self.banned_col = self.main_db["banned_users"]
-            self.config_col = self.main_db["bot_config"]
+            if _ops_db is None:
+                return
+            self.users_col = _ops_db["users"]
+            self.banned_col = _ops_db["banned_users"]
+            self.config_col = _ops_db["bot_config"]
             self.indexer_col = _ops_db["indexer_tasks"]
             self.index_failures_col = _ops_db["index_failures"]
             self.rate_limits_col = _ops_db["rate_limits"]
@@ -1103,6 +1129,7 @@ class Database:
             self.broadcast_col = _ops_db["broadcast_jobs"]
             self.groups_col = _ops_db["connected_groups"]
             self.verification_cache_col = _ops_db["verification_cache"]
+            self.analytics_col = _ops_db["analytics_counters"]
 
     async def migrate_legacy_control_data(self):
         """Copy the small writable control plane off legacy cluster 1 once.
@@ -1493,6 +1520,11 @@ class Database:
             "movie_id",
             "file_registry.movie_id",
         )
+        await ensure_required_index(
+            self.registry_col,
+            "location_pending",
+            "file_registry.location_pending",
+        )
         try:
             indexes = await self.registry_col.index_information()
             for field, name in (
@@ -1522,19 +1554,11 @@ class Database:
         for i, col in enumerate(self.file_cols):
             try:
                 indexes = await col.index_information()
-                file_name_indexes = [
-                    spec for spec in indexes.values() if ("file_name", 1) in spec.get("key", [])
-                ]
-                if not file_name_indexes:
-                    await col.create_index("file_name")
                 search_token_indexes = [
                     spec for spec in indexes.values() if ("search_tokens", 1) in spec.get("key", [])
                 ]
                 if not search_token_indexes:
-                    # Sparse keeps the compatibility index small: legacy
-                    # libraries can continue using the reference regex search
-                    # without adding one index entry per old document.
-                    await col.create_index("search_tokens", sparse=True)
+                    await col.create_index("search_tokens")
                 file_id_indexes = [spec for spec in indexes.values() if ("file_id", 1) in spec.get("key", [])]
                 if not file_id_indexes:
                     await col.create_index("file_id", unique=True)
@@ -1550,11 +1574,23 @@ class Database:
                     )
                 logger.info(f"✅ Indexes verified on Cluster {i + 1}")
             except Exception as e:
-                logger.warning(f"⚠️ Could not create index on Cluster {i + 1}: {e}")
+                raise RequiredIndexError(
+                    f"Could not verify required movie indexes on Cluster {i + 1}: {e}"
+                ) from e
         if self.main_db is not None:
             try:
                 await self.main_db["missed_searches"].create_index([("count", -1)])
-                await self.main_db["pending_requests"].create_index("movie_name")
+                await ensure_required_compound_index(
+                    self.main_db["pending_requests"],
+                    [("user_id", 1), ("movie_name", 1)],
+                    "pending_requests.user_movie",
+                    unique=True,
+                )
+                await ensure_required_compound_index(
+                    self.main_db["indexer_tasks"],
+                    [("state", 1), ("updated", 1)],
+                    "indexer_tasks.state_updated",
+                )
                 # TTL cleanup — additive only, never touches existing
                 # documents. Both fields are populated going forward
                 # (log_missed_search() / save_pending_request());
@@ -1573,12 +1609,18 @@ class Database:
                     * 3600,  # 180 days — generous so a slow-to-fulfill request still gets auto-notified
                 )
             except Exception as e:
-                logger.warning("Could not ensure auxiliary indexes: %s", e)
+                raise RequiredIndexError(f"Could not ensure operations indexes: {e}") from e
         if self.deletion_col is not None:
             try:
                 await self.deletion_col.create_index("due_at")
+                await ensure_required_compound_index(
+                    self.deletion_col,
+                    [("chat_id", 1), ("message_id", 1)],
+                    "scheduled_deletions.chat_message",
+                    unique=True,
+                )
             except Exception as e:
-                logger.warning("Could not ensure scheduled-deletion index: %s", e)
+                raise RequiredIndexError(f"Could not ensure scheduled-deletion indexes: {e}") from e
         if self.deletion_dead_letter_col is not None:
             try:
                 await self.deletion_dead_letter_col.create_index("failed_at")
@@ -1905,6 +1947,20 @@ class Database:
         ):
             router.mark_error(index, error)
 
+    async def hydrate_shard_health(self):
+        router = getattr(self, "shard_router", None)
+        if router is None:
+            return []
+        shared = await redis_state.get_json("shard-health", "movie-shards")
+        if shared:
+            router.apply_snapshot(shared)
+        return router.snapshot()
+
+    async def publish_shard_health(self):
+        snapshot = self.shard_health_snapshot()
+        await redis_state.set_json("shard-health", "movie-shards", snapshot, ttl=120)
+        return snapshot
+
     async def probe_shards(self, *, force: bool = False):
         """Refresh read/write routing concurrently with bounded probes."""
         router = getattr(self, "shard_router", None)
@@ -1935,7 +1991,7 @@ class Database:
         )
         if candidates:
             await asyncio.gather(*[_probe(index) for index in candidates])
-        return router.snapshot()
+        return await self.publish_shard_health()
 
     async def get_total_files(self):
         cached_at, cached_count = self._file_count_cache
@@ -1982,14 +2038,14 @@ class Database:
         self._file_count_cache = (0.0, 0)
 
     def purge_caches(self):
-        """Expire both bounded caches without flushing hot queries on writes."""
-        for cache in (self._search_cache, self._query_cache):
-            cache.purge(cache.default_ttl)
+        """Redis TTLs expire ephemeral caches without process-local sweeps."""
+        return None
 
     def cache_metrics(self):
         return {
-            "sessions": self._search_cache.snapshot(),
-            "queries": self._query_cache.snapshot(),
+            "backend": "redis",
+            "sessions": {"ttl_seconds": 600},
+            "queries": {"ttl_seconds": 120},
         }
 
     async def ensure_search_catalog(self, force=False):
@@ -2120,6 +2176,7 @@ class Database:
         if not file_id or not file_name:
             return False, "Invalid media"
 
+        await self.hydrate_shard_health()
         # Centralized registry is the single source of truth for cross-cluster
         # uniqueness — one atomic insert instead of an O(clusters) fan-out.
         # A DuplicateKeyError here means the file_id is already claimed,
@@ -2138,6 +2195,7 @@ class Database:
             "file_id": file_id,
             "file_name": file_name,
             "search_tokens": search_tokens_for_name(file_name),
+            "language_tags": language_tags_for_name(file_name),
             "file_size": file_size,
             "mime_type": mime_type,
         }
@@ -2161,6 +2219,7 @@ class Database:
                 if size >= 450:
                     if router is not None:
                         router.record_size(i, size)
+                        await self.publish_shard_health()
                     continue
 
                 try:
@@ -2178,6 +2237,7 @@ class Database:
                                     "$set": {
                                         "cluster": i + 1,
                                         "movie_id": str(existing["_id"]),
+                                        "location_pending": False,
                                     }
                                 },
                             )
@@ -2191,6 +2251,7 @@ class Database:
                 except Exception as exc:
                     if router is not None:
                         router.mark_error(i, exc)
+                        await self.publish_shard_health()
                     logger.warning(
                         "Cluster %s insert failed for %s: %s",
                         i + 1,
@@ -2208,6 +2269,7 @@ class Database:
                                 "$set": {
                                     "cluster": i + 1,
                                     "movie_id": str(result.inserted_id),
+                                    "location_pending": False,
                                 }
                             },
                         )
@@ -2218,6 +2280,7 @@ class Database:
                             type(exc).__name__,
                         )
                 self._invalidate_file_count()
+                await self.increment_language_counters([file_doc], 1)
                 return True, f"Saved to Cluster {i + 1}"
             return False, "All clusters full"
         finally:
@@ -2236,12 +2299,7 @@ class Database:
         if self.registry_col is None:
             return {"checked": 0, "repaired": 0, "unresolved": 0}
         cursor = self.registry_col.find(
-            {
-                "$or": [
-                    {"cluster": {"$exists": False}},
-                    {"movie_id": {"$exists": False}},
-                ]
-            },
+            {"location_pending": True},
             {"_id": 1, "file_id": 1},
         ).limit(max(1, int(limit)))
         registry_docs = [document async for document in cursor]
@@ -2293,14 +2351,14 @@ class Database:
             cluster_number, movie_id = location
             repairs.append(
                 UpdateOne(
+                    {"_id": registry_doc["_id"], "location_pending": True},
                     {
-                        "_id": registry_doc["_id"],
-                        "$or": [
-                            {"cluster": {"$exists": False}},
-                            {"movie_id": {"$exists": False}},
-                        ],
+                        "$set": {
+                            "cluster": cluster_number,
+                            "movie_id": movie_id,
+                            "location_pending": False,
+                        }
                     },
-                    {"$set": {"cluster": cluster_number, "movie_id": movie_id}},
                 )
             )
         repaired = 0
@@ -2378,7 +2436,13 @@ class Database:
         ops = [
             UpdateOne(
                 {"file_id": doc["file_id"]},
-                {"$set": {"cluster": cluster_index + 1, "movie_id": str(doc["_id"])}},
+                {
+                    "$set": {
+                        "cluster": cluster_index + 1,
+                        "movie_id": str(doc["_id"]),
+                        "location_pending": False,
+                    }
+                },
             )
             for doc in docs
             if doc.get("file_id") and doc.get("_id")
@@ -2394,6 +2458,7 @@ class Database:
     async def save_files_bulk(self, files_list):
         if not files_list:
             return 0, 0
+        await self.hydrate_shard_health()
 
         # Normalize defensively here too. The bulk indexer already cleans its
         # input, but keeping the database boundary authoritative guarantees
@@ -2403,6 +2468,7 @@ class Database:
             file_doc = dict(incoming)
             file_doc["file_name"] = normalize_file_name(file_doc.get("file_name", ""))
             file_doc["search_tokens"] = search_tokens_for_name(file_doc["file_name"])
+            file_doc["language_tags"] = language_tags_for_name(file_doc["file_name"])
             if not file_doc.get("file_unique_id"):
                 file_doc.pop("file_unique_id", None)
             normalized_files.append(file_doc)
@@ -2420,6 +2486,7 @@ class Database:
             return 0, duplicates
 
         saved_total = 0
+        saved_documents = []
         remaining = new_files[:]
         router = getattr(self, "shard_router", None)
         candidates = router.candidates() if router is not None else range(len(self.file_cols))
@@ -2441,6 +2508,7 @@ class Database:
                     inserted.append(stored)
                 await self._mark_registry_locations(inserted, i)
                 saved_total += len(inserted)
+                saved_documents.extend(inserted)
                 remaining = []
             except BulkWriteError as bwe:
                 if router is not None and is_capacity_error(bwe):
@@ -2465,6 +2533,7 @@ class Database:
                             stored_docs = []
                     await self._mark_registry_locations(stored_docs, i)
                     saved_total += len(successful)
+                    saved_documents.extend(successful)
 
                 retry = []
                 for err in errors:
@@ -2508,10 +2577,13 @@ class Database:
             # insert — this batch is genuinely unstorable right now. Raise
             # instead of returning (0, duplicates) so callers can't mistake
             # "database full" for "everything was a duplicate".
+            await self.publish_shard_health()
             raise AllClustersFullError(len(remaining), duplicates)
 
         if saved_total:
             self._invalidate_file_count()
+            await self.increment_language_counters(saved_documents, 1)
+        await self.publish_shard_health()
         return saved_total, duplicates
 
     async def _release_registry_ids(self, file_ids, batch_size=500):
@@ -2587,7 +2659,7 @@ class Database:
         for index in self.readable_shard_indices():
             col = self.file_cols[index]
             try:
-                doc = await col.find_one({"_id": obj_id}, {"file_id": 1})
+                doc = await col.find_one({"_id": obj_id}, {"file_id": 1, "file_name": 1})
             except Exception as e:
                 logger.warning("File lookup failed during delete: %s", e)
                 continue
@@ -2600,6 +2672,7 @@ class Database:
                 continue
             if result.deleted_count > 0:
                 await self._release_registry_ids([doc.get("file_id")])
+                await self.increment_language_counters([doc], -1)
                 self._invalidate_file_count()
                 return True
         return False
@@ -2613,12 +2686,14 @@ class Database:
         for index in self.readable_shard_indices():
             col = self.file_cols[index]
             try:
+                existing = await col.find_one({"_id": obj_id}, {"file_name": 1})
                 result = await col.update_one(
                     {"_id": obj_id},
                     {
                         "$set": {
                             "file_name": normalized_name,
                             "search_tokens": search_tokens_for_name(normalized_name),
+                            "language_tags": language_tags_for_name(normalized_name),
                         }
                     },
                 )
@@ -2626,57 +2701,89 @@ class Database:
                 self.mark_shard_error(index, exc)
                 continue
             if result.matched_count > 0:
+                if existing:
+                    await self.increment_language_counters([existing], -1)
+                await self.increment_language_counters(
+                    [{"file_name": normalized_name}], 1
+                )
                 self._invalidate_file_count()
                 return True
         return False
 
     async def get_files_by_language(self):
-        from plugins.filter import LANGUAGES
+        if self.analytics_col is None:
+            raise RuntimeError("Analytics counters collection is unavailable")
+        document = await self.analytics_col.find_one({"_id": "files_by_language"})
+        counts = (document or {}).get("counts", {})
+        return {language: max(0, int(counts.get(language, 0))) for language in ANALYTICS_LANGUAGES}
 
-        cached_at, cached_counts = getattr(self, "_language_count_cache", (0.0, {}))
-        if cached_counts and time.time() - cached_at < 300:
-            return dict(cached_counts)
-
-        facet_stage = {
-            lang: [
-                {"$match": {"file_name": {"$regex": rf"\b{re.escape(lang)}\b", "$options": "i"}}},
-                {"$count": "n"},
-            ]
-            for lang in LANGUAGES
-        }
-
-        async def _cluster_counts(index, col):
-            try:
-                async with asyncio.timeout(15.0):
-                    cursor = await col.aggregate([{"$facet": facet_stage}], allowDiskUse=True)
-                    docs = await cursor.to_list(length=1)
-                self.mark_shard_reachable(index, "language_stats_ok")
-                return docs[0] if docs else {}
-            except TimeoutError:
-                logger.warning("Language analytics timed out on Cluster %s", index + 1)
-                return {}
-            except Exception as e:
-                self.mark_shard_error(index, e)
-                logger.warning(
-                    "Language analytics skipped Cluster %s error_type=%s",
-                    index + 1,
-                    type(e).__name__,
-                )
-                return {}
-
-        readable = self.readable_shard_indices()
-        per_cluster = await asyncio.gather(
-            *[_cluster_counts(index, self.file_cols[index]) for index in readable]
+    async def analytics_counters_ready(self) -> bool:
+        return bool(
+            self.analytics_col is not None
+            and await self.analytics_col.find_one(
+                {"_id": "files_by_language"}, {"_id": 1}
+            )
         )
 
-        results = {lang: 0 for lang in LANGUAGES}
-        for cluster_doc in per_cluster:
-            for lang in LANGUAGES:
-                bucket = cluster_doc.get(lang, [])
-                results[lang] += bucket[0]["n"] if bucket else 0
-        if not self.unavailable_shards():
-            self._language_count_cache = (time.time(), dict(results))
-        return results
+    async def increment_language_counters(self, documents, direction: int):
+        """Atomically maintain language totals as file rows change."""
+        if getattr(self, "analytics_col", None) is None or not documents or not direction:
+            return
+        deltas = {}
+        for document in documents:
+            tags = document.get("language_tags")
+            if tags is None:
+                tags = language_tags_for_name(document.get("file_name", ""))
+            for tag in set(tags):
+                if tag in ANALYTICS_LANGUAGES:
+                    deltas[f"counts.{tag}"] = deltas.get(f"counts.{tag}", 0) + int(direction)
+        if not deltas:
+            return
+        try:
+            await self.analytics_col.update_one(
+                {"_id": "files_by_language"},
+                {
+                    "$inc": deltas,
+                    "$set": {"updated_at": datetime.now(timezone.utc)},
+                    "$setOnInsert": {"created_at": datetime.now(timezone.utc)},
+                },
+                upsert=True,
+            )
+        except Exception as exc:
+            # A completed movie-row write must not be reported as failed just
+            # because its derived analytics counter could not be updated.
+            # Mark the projection dirty so maintenance can rebuild it with
+            # tools/migrate_search_tokens.py --apply.
+            logger.warning("Language analytics counter update deferred: %s", exc)
+            try:
+                await redis_state.set_json(
+                    "analytics:files_by_language:dirty",
+                    {
+                        "dirty": True,
+                        "recorded_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                    ttl=86400,
+                )
+            except Exception:
+                logger.debug("Could not record the analytics dirty marker", exc_info=True)
+
+    async def replace_language_counters(self, counts: dict):
+        if self.analytics_col is None:
+            raise RuntimeError("Analytics counters collection is unavailable")
+        normalized = {
+            language: max(0, int(counts.get(language, 0)))
+            for language in ANALYTICS_LANGUAGES
+        }
+        await self.analytics_col.replace_one(
+            {"_id": "files_by_language"},
+            {
+                "_id": "files_by_language",
+                "counts": normalized,
+                "rebuilt_at": datetime.now(timezone.utc),
+                "updated_at": datetime.now(timezone.utc),
+            },
+            upsert=True,
+        )
 
     async def scan_duplicate_report(self, progress_callback=None):
         """Build a conservative, low-disk report without deleting any data."""
@@ -2903,10 +3010,8 @@ class Database:
 
             report = {"summary": summary, "groups": groups}
 
-        cache = getattr(self, "_duplicate_group_cache", None)
-        if cache is not None:
-            for group in report["groups"]:
-                cache.set(group["key"], group)
+        for group in report["groups"]:
+            await redis_state.set_json("duplicate-group", group["key"], group, ttl=900)
         return report
 
     async def find_duplicate_files(self):
@@ -2914,8 +3019,7 @@ class Database:
         return (await self.scan_duplicate_report())["groups"]
 
     async def get_duplicate_group(self, group_key: str):
-        cache = getattr(self, "_duplicate_group_cache", None)
-        group = cache.get(group_key) if cache is not None else None
+        group = await redis_state.get_json("duplicate-group", group_key)
         if group is None:
             groups = await self.find_duplicate_files()
             group = next((item for item in groups if item.get("key") == group_key), None)
@@ -2955,7 +3059,13 @@ class Database:
                 repairs = [
                     UpdateOne(
                         {"file_id": file_id},
-                        {"$set": {"cluster": cluster, "movie_id": movie_id}},
+                    {
+                        "$set": {
+                            "cluster": cluster,
+                            "movie_id": movie_id,
+                            "location_pending": False,
+                        }
+                    },
                         upsert=True,
                     )
                     for file_id, (cluster, movie_id) in locations.items()
@@ -3042,6 +3152,7 @@ class Database:
                     await self._reconcile_registry_file_ids(staged_ids)
                     await asyncio.to_thread(_clear_cleanup_registry_ids, spool_path, staged_ids)
                     keep_spool = False
+                    await self.increment_language_counters(confirmed_deleted, -1)
                     deleted += len(confirmed_deleted)
 
                 scanned += len(batch)
@@ -3114,15 +3225,21 @@ class Database:
         deleted_ids = []
         for col in self.file_cols:
             try:
+                deleted_documents = []
                 cursor = col.find(
                     {"file_name": {"$regex": pattern, "$options": "i"}},
-                    {"file_id": 1},
+                    {"file_id": 1, "file_name": 1, "language_tags": 1},
                 )
                 async for doc in cursor:
+                    deleted_documents.append(doc)
                     if doc.get("file_id"):
                         deleted_ids.append(doc["file_id"])
                 result = await col.delete_many({"file_name": {"$regex": pattern, "$options": "i"}})
                 deleted_total += result.deleted_count
+                if result.deleted_count:
+                    await self.increment_language_counters(
+                        deleted_documents[: result.deleted_count], -1
+                    )
             except Exception as e:
                 logger.warning("Pattern purge skipped an unavailable cluster: %s", e)
         await self._release_registry_ids(deleted_ids)
@@ -3217,113 +3334,30 @@ class Database:
             self._invalidate_file_count()
         return migrated, skipped
 
-    async def _regex_search(self, regex, max_results, offset=0):
-        """Compatibility search for libraries indexed before token fields."""
-        filter_mongo = {"file_name": regex}
-        limit = max_results + 1
+    async def _indexed_token_search(self, token_groups, max_results, cursor=None):
+        """Search indexed tokens with a per-shard keyset cursor.
 
-        async def _search_cluster(index, col):
-            try:
-                async with asyncio.timeout(5.0):
-                    cursor = (
-                        col.find(filter_mongo)
-                        # The result UI performs its own movie/series ordering.
-                        # Natural reverse order lets Mongo stop as soon as the
-                        # bounded candidate page is full; an _id sort made a
-                        # real 1.1M-file query 5x slower in live measurements.
-                        .sort("$natural", -1)
-                        .skip(offset)
-                        .limit(limit)
-                        .max_time_ms(4500)
-                    )
-                    documents = [doc async for doc in cursor]
-                    self.mark_shard_reachable(index, "search_ok")
-                    return documents
-            except TimeoutError:
-                logger.warning(
-                    "Compatibility search Cluster %s skipped after 5 seconds",
-                    index + 1,
-                )
-                return []
-            except Exception as exc:
-                self.mark_shard_error(index, exc)
-                logger.warning(
-                    "Compatibility search Cluster %s failed error_type=%s",
-                    index + 1,
-                    type(exc).__name__,
-                )
-                return []
-
-        readable = self.readable_shard_indices()
-        cluster_results = await asyncio.gather(
-            *[_search_cluster(index, self.file_cols[index]) for index in readable]
-        )
-        # Legacy branding states are intentionally ignored. The removed
-        # branding worker left some original Telegram file IDs marked
-        # ``pending``; those originals are valid and must stay searchable.
-        files = deduplicate_search_results([doc for docs in cluster_results for doc in docs])
-        return files[:max_results]
-
-    async def _legacy_search_results(self, query, max_results=40, offset=0):
-        """Run the proven reference pattern without modifying legacy rows."""
-        if isinstance(query, list):
-            raw_pattern = "|".join(re.escape(str(item).strip()) for item in query if str(item).strip())
-            if not raw_pattern:
-                return []
-            return await self._regex_search(compile_regex(raw_pattern), max_results, offset)
-
-        query = str(query).strip()
-        words = [word for word in query.split() if word][:12]
-        if not words:
-            return []
-        candidate_limit = max(80, max_results * 2)
-        candidates = await self._regex_search(
-            compile_regex(_reference_search_pattern(words)),
-            candidate_limit,
-            offset,
-        )
-        ranked = rank_search_results(query, candidates, max_results)
-        if ranked or offset:
-            return ranked
-
-        title_words = [word for word in words if not _is_optional_search_token(word)]
-        if title_words and title_words != words:
-            candidates = await self._regex_search(
-                compile_regex(_reference_search_pattern(title_words)),
-                candidate_limit,
-                offset,
-            )
-            ranked = rank_search_results(query, candidates, max_results)
-            if ranked:
-                return ranked
-
-        query_identity = _fuzzy_query_identity(query)
-        for suggestion in await self.suggest_search_titles(query, limit=3):
-            if suggestion == query_identity:
-                continue
-            suggestion_words = suggestion.split()[:12]
-            if not suggestion_words:
-                continue
-            candidates = await self._regex_search(
-                compile_regex(_reference_search_pattern(suggestion_words)),
-                candidate_limit,
-                0,
-            )
-            ranked = rank_search_results(query, candidates, max_results)
-            if ranked:
-                return ranked
-        return []
-
-    async def _indexed_token_search(self, token_groups, max_results, offset=0):
-        """Search bounded candidates using the required multikey index."""
+        No user query scans ``file_name`` and no Mongo cursor calls ``skip``.
+        Each continuation supplies the last ``_id`` observed on every shard,
+        so work remains proportional to the requested page instead of the
+        number of earlier results.
+        """
         filters = [{"search_tokens": {"$all": list(dict.fromkeys(group))}} for group in token_groups if group]
         if not filters:
-            return []
-        filter_mongo = filters[0] if len(filters) == 1 else {"$or": filters}
+            return [], None
+        base_filter = filters[0] if len(filters) == 1 else {"$or": filters}
         limit = max_results + 1
+        cursor = cursor if isinstance(cursor, dict) else {}
 
         async def _search_cluster(index, col):
             try:
+                filter_mongo = dict(base_filter)
+                raw_after = cursor.get(str(index))
+                if raw_after:
+                    try:
+                        filter_mongo["_id"] = {"$lt": ObjectId(str(raw_after))}
+                    except Exception:
+                        logger.warning("Ignored malformed search cursor for Cluster %s", index + 1)
                 # A cold/unindexed Atlas shard must not make every healthy
                 # shard wait five or thirty seconds. Mongo gets its own time
                 # budget and asyncio provides a hard client-side ceiling.
@@ -3332,18 +3366,18 @@ class Database:
                 # allow enough time for the largest Atlas shard to complete
                 # an ordered multi-word scan (measured at roughly 4 seconds).
                 async with asyncio.timeout(4.0):
-                    cursor = (
-                        col.find(filter_mongo).sort("_id", -1).skip(offset).limit(limit).max_time_ms(3000)
+                    mongo_cursor = (
+                        col.find(filter_mongo).sort("_id", -1).limit(limit).max_time_ms(3000)
                     )
-                    documents = [doc async for doc in cursor]
+                    documents = [doc async for doc in mongo_cursor]
                     self.mark_shard_reachable(index, "search_ok")
-                    return documents
+                    return index, documents
             except TimeoutError:
                 logger.warning(
                     "Indexed search Cluster %s skipped after the 4s latency budget",
                     index + 1,
                 )
-                return []
+                return index, []
             except Exception as e:
                 # A secondary cluster outage should degrade result coverage,
                 # not take the entire search feature down.
@@ -3353,36 +3387,56 @@ class Database:
                     index + 1,
                     type(e).__name__,
                 )
-                return []
+                return index, []
 
+        await self.hydrate_shard_health()
         readable = self.readable_shard_indices()
         cluster_results = await asyncio.gather(
             *[_search_cluster(index, self.file_cols[index]) for index in readable]
         )
+        merged = sorted(
+            (
+                (document["_id"], index, document)
+                for index, shard_documents in cluster_results
+                for document in shard_documents
+            ),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        consumed = merged[:max_results]
+        next_cursor = dict(cursor)
+        for _, index, document in consumed:
+            next_cursor[str(index)] = str(document["_id"])
+        files = deduplicate_search_results([document for _, _, document in consumed])
+        has_more = len(merged) > len(consumed) or any(
+            len(shard_documents) > max_results
+            for _, shard_documents in cluster_results
+        )
+        return files[:max_results], next_cursor if has_more else None
 
-        files = deduplicate_search_results([doc for docs in cluster_results for doc in docs])
-        return files[:max_results]
-
-    async def _get_search_results_uncached(self, query, max_results=40, offset=0):
+    async def _get_search_page_uncached(self, query, max_results=40, cursor=None):
         """Use indexed Mongo candidates followed by fuzzy title ranking."""
-        if not getattr(self, "_search_tokens_complete", True):
-            return await self._legacy_search_results(query, max_results, offset)
         if isinstance(query, list):
             token_groups = [search_tokens_for_name(str(item))[:12] for item in query if str(item).strip()]
-            return await self._indexed_token_search(token_groups, max_results, offset)
+            results, next_cursor = await self._indexed_token_search(
+                token_groups, max_results, cursor
+            )
+            return {"results": results, "next_cursor": next_cursor}
 
         query = query.strip()
         if not query:
-            return []
+            return {"results": [], "next_cursor": None}
         words = search_tokens_for_name(query)[:12]
         if not words:
-            return []
+            return {"results": [], "next_cursor": None}
         candidate_limit = max(80, max_results * 2)
 
-        candidates = await self._indexed_token_search([words], candidate_limit, offset)
+        candidates, next_cursor = await self._indexed_token_search(
+            [words], candidate_limit, cursor
+        )
         ranked = rank_search_results(query, candidates, max_results)
-        if ranked or offset:
-            return ranked
+        if ranked or cursor:
+            return {"results": ranked, "next_cursor": next_cursor}
 
         # Real libraries are inconsistent about release metadata. The
         # reference query is always attempted first; if it misses, retry the
@@ -3390,10 +3444,12 @@ class Database:
         # quality tokens. Title, season and episode words are never relaxed.
         title_words = [word for word in words if not _is_optional_search_token(word)]
         if title_words and title_words != words:
-            candidates = await self._indexed_token_search([title_words], candidate_limit, offset)
+            candidates, next_cursor = await self._indexed_token_search(
+                [title_words], candidate_limit, cursor
+            )
             ranked = rank_search_results(query, candidates, max_results)
             if ranked:
-                return ranked
+                return {"results": ranked, "next_cursor": next_cursor}
 
         # Typo fallback: RapidFuzz compares against the compact catalog of
         # unique visible titles, then Mongo performs the normal precise lookup
@@ -3405,11 +3461,13 @@ class Database:
             suggestion_words = suggestion.split()[:12]
             if not suggestion_words:
                 continue
-            candidates = await self._indexed_token_search([suggestion_words], candidate_limit, 0)
+            candidates, next_cursor = await self._indexed_token_search(
+                [suggestion_words], candidate_limit, None
+            )
             ranked = rank_search_results(query, candidates, max_results)
             if ranked:
-                return ranked
-        return []
+                return {"results": ranked, "next_cursor": next_cursor}
+        return {"results": [], "next_cursor": None}
 
     async def suggest_search_titles(self, query, limit=3):
         """Run bounded-catalog RapidFuzz work outside the event loop."""
@@ -3419,23 +3477,34 @@ class Database:
         async with semaphore:
             return await asyncio.to_thread(suggest_search_titles, query, limit)
 
-    async def get_search_results(self, query, max_results=40, offset=0):
-        """Return a short-lived cached search result when available."""
+    async def get_search_page(self, query, max_results=40, cursor=None):
+        """Return a Redis-cached keyset page shared by all bot replicas."""
         if isinstance(query, list):
             normalized_query = tuple(str(item).strip().lower() for item in query)
         else:
             normalized_query = str(query).strip().lower()
-        cache_key = (normalized_query, int(max_results), int(offset))
-        query_cache = getattr(self, "_query_cache", None)
-        if query_cache is not None:
-            cached = query_cache.get(cache_key)
-            if cached is not None:
-                return cached
+        cache_key = stable_cache_key(normalized_query, int(max_results), cursor or {})
+        cached = await redis_state.get_json("search-query", cache_key)
+        if cached is not None:
+            return cached
+        page = await self._get_search_page_uncached(query, max_results, cursor)
+        await redis_state.set_json("search-query", cache_key, page, ttl=120)
+        return page
 
-        results = await self._get_search_results_uncached(query, max_results, offset)
-        if query_cache is not None:
-            query_cache.set(cache_key, results)
-        return results
+    async def get_search_results(self, query, max_results=40, offset=0):
+        """Compatibility API implemented with keyset pages, never ``skip``."""
+        remaining = max(0, int(offset))
+        cursor = None
+        while True:
+            page_size = max(int(max_results), min(100, remaining + int(max_results)))
+            page = await self.get_search_page(query, page_size, cursor)
+            results = page["results"]
+            if remaining < len(results):
+                return results[remaining : remaining + int(max_results)]
+            remaining -= len(results)
+            cursor = page.get("next_cursor")
+            if not cursor or not results:
+                return []
 
     async def get_prefix_suggestions(self, query, limit=3):
         return await self.suggest_search_titles(query, limit=limit)
@@ -3525,9 +3594,28 @@ class Database:
     async def delete_file_by_id(self, file_id):
         deleted = 0
         for col in self.file_cols:
+            documents = []
+            try:
+                if hasattr(col, "find"):
+                    documents = [
+                        document
+                        async for document in col.find(
+                            {"file_id": file_id},
+                            {"file_name": 1, "language_tags": 1},
+                        )
+                    ]
+            except Exception as error:
+                logger.warning(
+                    "Language-counter lookup failed before file delete: %s",
+                    type(error).__name__,
+                )
             try:
                 result = await col.delete_many({"file_id": file_id})
                 deleted += result.deleted_count
+                if result.deleted_count and documents:
+                    await self.increment_language_counters(
+                        documents[: result.deleted_count], -1
+                    )
             except Exception as e:
                 logger.warning("File-id delete skipped an unavailable cluster: %s", e)
         if deleted:
@@ -3646,6 +3734,8 @@ class Database:
             await col.drop()
         if self.registry_col is not None:
             await self.registry_col.drop()
+        if getattr(self, "analytics_col", None) is not None:
+            await self.analytics_col.delete_one({"_id": "files_by_language"})
         # Recreate uniqueness indexes immediately so a reset cannot leave a
         # running bot accepting duplicate file IDs.
         await self.ensure_indexes()
@@ -4256,13 +4346,99 @@ class Database:
 
     async def set_index_task(self, chat_id, state):
         if self.indexer_col is None:
-            return
-        try:
-            await self.indexer_col.update_one(
-                {"_id": str(chat_id)}, {"$set": {"state": state, "updated": time.time()}}, upsert=True
-            )
-        except Exception as e:
-            logger.warning(f"set_index_task failed: {e}")
+            raise RuntimeError("Indexer task collection is unavailable")
+        update = {"$set": {"state": state, "updated": time.time()}}
+        if state == "queued":
+            update["$unset"] = {"lock_token": "", "locked_until": ""}
+        result = await self.indexer_col.update_one(
+            {"_id": str(chat_id)},
+            update,
+            upsert=True,
+        )
+        if not result.acknowledged:
+            raise RuntimeError("Indexer task update was not acknowledged")
+
+    async def enqueue_index_task(
+        self,
+        chat_id: int,
+        last_msg_id: int,
+        start_id: int,
+        admin_chat_id: int,
+        status_message_id: int,
+        requested_by: int,
+    ):
+        if self.indexer_col is None:
+            raise RuntimeError("Indexer task collection is unavailable")
+        now = time.time()
+        await self.indexer_col.update_one(
+            {"_id": str(chat_id)},
+            {
+                "$set": {
+                    "chat_id": int(chat_id),
+                    "last_msg_id": int(last_msg_id),
+                    "start_id": int(start_id),
+                    "admin_chat_id": int(admin_chat_id),
+                    "status_message_id": int(status_message_id),
+                    "requested_by": int(requested_by),
+                    "state": "queued",
+                    "updated": now,
+                },
+                "$setOnInsert": {"created": now},
+                "$unset": {"lock_token": "", "locked_until": ""},
+            },
+            upsert=True,
+        )
+
+    async def claim_index_task(self, lease_seconds=90):
+        if self.indexer_col is None:
+            raise RuntimeError("Indexer task collection is unavailable")
+        now = time.time()
+        token = secrets.token_urlsafe(24)
+        return await self.indexer_col.find_one_and_update(
+            {
+                "state": {"$in": ["queued", "running"]},
+                "$or": [
+                    {"locked_until": {"$exists": False}},
+                    {"locked_until": {"$lte": now}},
+                ],
+            },
+            {
+                "$set": {
+                    "state": "running",
+                    "lock_token": token,
+                    "locked_until": now + max(30, int(lease_seconds)),
+                    "updated": now,
+                }
+            },
+            sort=[("updated", 1)],
+            return_document=ReturnDocument.AFTER,
+        )
+
+    async def renew_index_task(self, chat_id: int, lock_token: str, lease_seconds=90) -> bool:
+        if self.indexer_col is None:
+            return False
+        result = await self.indexer_col.update_one(
+            {"_id": str(chat_id), "lock_token": lock_token, "state": "running"},
+            {
+                "$set": {
+                    "locked_until": time.time() + max(30, int(lease_seconds)),
+                    "updated": time.time(),
+                }
+            },
+        )
+        return result.matched_count == 1
+
+    async def release_index_task(self, chat_id: int, lock_token: str, state: str):
+        if self.indexer_col is None:
+            return False
+        result = await self.indexer_col.update_one(
+            {"_id": str(chat_id), "lock_token": lock_token},
+            {
+                "$set": {"state": state, "updated": time.time()},
+                "$unset": {"lock_token": "", "locked_until": ""},
+            },
+        )
+        return result.matched_count == 1
 
     async def get_index_task(self, chat_id):
         if self.indexer_col is None:
@@ -4273,6 +4449,11 @@ class Database:
         except Exception as e:
             logger.warning(f"get_index_task failed: {e}")
             return None  # treat transient DB errors as "not stopped" — loop keeps trying
+
+    async def get_index_task_document(self, chat_id):
+        if self.indexer_col is None:
+            return None
+        return await self.indexer_col.find_one({"_id": str(chat_id)})
 
     async def clear_index_task(self, chat_id):
         if self.indexer_col is None:
@@ -4285,17 +4466,24 @@ class Database:
         await self.indexer_col.delete_many({})
 
     async def recover_index_tasks_on_startup(self):
-        """Pause interrupted workers while retaining checkpoints and history."""
+        """Requeue only expired worker leases while retaining checkpoints."""
         if self.indexer_col is None:
             return 0
         result = await self.indexer_col.update_many(
-            {"state": "running"},
+            {
+                "state": "running",
+                "$or": [
+                    {"locked_until": {"$exists": False}},
+                    {"locked_until": {"$lte": time.time()}},
+                ],
+            },
             {
                 "$set": {
-                    "state": "paused",
+                    "state": "queued",
                     "recovered_at": time.time(),
                     "recovery_reason": "process_restart",
-                }
+                },
+                "$unset": {"lock_token": "", "locked_until": ""},
             },
         )
         return int(result.modified_count)
@@ -4308,13 +4496,13 @@ class Database:
         return [doc async for doc in cursor]
 
     async def save_search(self, session_id, data):
-        self._search_cache.set(session_id, data)
+        await redis_state.set_json("search-session", session_id, data, ttl=600)
 
     async def get_search(self, session_id):
-        return self._search_cache.get(session_id)
+        return await redis_state.get_json("search-session", session_id)
 
     async def clear_old_searches(self, expiry_seconds=600):
-        self._search_cache.purge(expiry_seconds)
+        return 0
 
     async def enqueue_notification_job(self, kind: str, coalesce_key: str, payload: dict, delay_seconds=0):
         """Persist a coalesced, bounded notification-pipeline job."""

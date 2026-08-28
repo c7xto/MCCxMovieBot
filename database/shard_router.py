@@ -125,6 +125,36 @@ class ShardRouter:
             for index, health in enumerate(self._health)
         ]
 
+    def apply_snapshot(self, snapshot: list[dict]) -> None:
+        """Merge a Redis-published health snapshot from another process."""
+        if not isinstance(snapshot, list):
+            return
+        for item in snapshot:
+            try:
+                index = int(item["cluster"]) - 1
+                state = str(item["state"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not 0 <= index < len(self._health):
+                continue
+            if state not in {
+                "checking",
+                "healthy",
+                "near_limit",
+                "full",
+                "capacity_unknown",
+                "unavailable",
+                "quarantined",
+            }:
+                continue
+            size_mb = item.get("size_mb")
+            if size_mb is not None:
+                try:
+                    size_mb = float(size_mb)
+                except (TypeError, ValueError):
+                    size_mb = None
+            self._set(index, state, size_mb, str(item.get("reason") or "shared_state"))
+
     def unavailable(self) -> list[int]:
         """Return one-based cluster numbers that cannot provide complete reads."""
         return [

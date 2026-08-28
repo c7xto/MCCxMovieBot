@@ -25,8 +25,8 @@ _BACK_BTN = InlineKeyboardMarkup(
 
 @Client.on_callback_query(filters.regex(r"^group_manager_menu$") & filters.user(ADMIN_ID))
 async def group_manager_menu(client: Client, callback: CallbackQuery):
-    clear_state(callback.from_user.id)
     await answer_callback_safely(callback)
+    await clear_state(callback.from_user.id)
     config = await db.get_config()
     whitelist_mode = config.get("group_whitelist_mode", "blacklist")  # "whitelist" or "blacklist"
 
@@ -333,7 +333,7 @@ async def _ban_group(client, reply_to_msg, group_id: int):
 )
 async def gm_input_handler(client: Client, message: Message):
     admin_id = message.from_user.id
-    state = get_state(admin_id)
+    state = await get_state(admin_id)
 
     if not state or not state.startswith("gm_"):
         raise ContinuePropagation

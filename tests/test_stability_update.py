@@ -114,7 +114,7 @@ async def test_interactive_load_gate_defers_background_but_never_starves_it():
         observed_idle = await background_turn("test_background", max_defer=0.01)
         assert observed_idle is False
     assert await background_turn("test_background", max_defer=0.01) is True
-    assert workload_snapshot()["background_fairness_release:test_background"] >= 1
+    assert (await workload_snapshot())["background_fairness_release:test_background"] >= 1
 
 
 def test_shard_router_redirects_writes_and_recovers_after_probe():

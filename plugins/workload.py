@@ -2,12 +2,14 @@
 
 import asyncio
 import logging
+import os
 import time
 from collections import Counter
 from contextlib import asynccontextmanager
 from functools import wraps
 
 from database.db import db
+from database.redis_client import redis_state
 
 
 logger = logging.getLogger(__name__)
@@ -17,14 +19,16 @@ MAX_QUERY_TOKENS = 12
 SEARCH_QUEUE_TIMEOUT_SECONDS = 2.0
 DELIVERY_LEASE_SECONDS = 10 * 60
 
-_SEARCH_CONCURRENCY = 8
+_SEARCH_CONCURRENCY = max(8, int(os.getenv("SEARCH_CONCURRENCY_PER_PROCESS", "32")))
+_GLOBAL_SEARCH_CONCURRENCY = max(
+    _SEARCH_CONCURRENCY,
+    int(os.getenv("GLOBAL_SEARCH_CONCURRENCY", "128")),
+)
 _search_semaphore = asyncio.Semaphore(_SEARCH_CONCURRENCY)
 _metrics = Counter()
 _search_waiting = 0
 _search_active = 0
 _interactive_active = 0
-_interactive_idle = asyncio.Event()
-_interactive_idle.set()
 _interactive_lock = asyncio.Lock()
 
 
@@ -44,12 +48,14 @@ async def interactive_slot(route: str):
     started = time.monotonic()
     async with _interactive_lock:
         _interactive_active += 1
-        _interactive_idle.clear()
         _metrics[f"interactive_started:{route}"] += 1
         _metrics["interactive_high_water"] = max(
             _metrics["interactive_high_water"], _interactive_active
         )
+    shared_incremented = False
     try:
+        await redis_state.increment_counter("interactive-active", ttl=30)
+        shared_incremented = True
         yield
         _metrics[f"interactive_completed:{route}"] += 1
     finally:
@@ -58,8 +64,8 @@ async def interactive_slot(route: str):
         )
         async with _interactive_lock:
             _interactive_active = max(0, _interactive_active - 1)
-            if _interactive_active == 0:
-                _interactive_idle.set()
+        if shared_incremented:
+            await redis_state.decrement_counter("interactive-active", ttl=30)
 
 
 async def background_turn(route: str, max_defer: float = 2.0) -> bool:
@@ -68,15 +74,19 @@ async def background_turn(route: str, max_defer: float = 2.0) -> bool:
     Returns True when an idle window was observed and False when the bounded
     wait elapsed. The timeout prevents a busy bot from starving the indexer.
     """
-    if _interactive_idle.is_set():
+    if await redis_state.get_counter("interactive-active") == 0:
         return True
     _metrics[f"background_deferred:{route}"] += 1
     try:
-        await asyncio.wait_for(_interactive_idle.wait(), timeout=max(0.0, max_defer))
-        return True
-    except TimeoutError:
-        _metrics[f"background_fairness_release:{route}"] += 1
-        return False
+        deadline = time.monotonic() + max(0.0, max_defer)
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.025)
+            if await redis_state.get_counter("interactive-active") == 0:
+                return True
+    except asyncio.CancelledError:
+        raise
+    _metrics[f"background_fairness_release:{route}"] += 1
+    return False
 
 
 def interactive_callback(route: str):
@@ -142,6 +152,8 @@ async def search_slot(route: str):
     global _search_active, _search_waiting
     started = time.monotonic()
     acquired = False
+    entered = False
+    distributed_token = None
     _search_waiting += 1
     _metrics["search_queue_high_water"] = max(
         _metrics["search_queue_high_water"], _search_waiting
@@ -152,6 +164,17 @@ async def search_slot(route: str):
                 _search_semaphore.acquire(), timeout=SEARCH_QUEUE_TIMEOUT_SECONDS
             )
             acquired = True
+            deadline = started + SEARCH_QUEUE_TIMEOUT_SECONDS
+            while distributed_token is None and time.monotonic() < deadline:
+                distributed_token = await redis_state.acquire_semaphore(
+                    "search",
+                    _GLOBAL_SEARCH_CONCURRENCY,
+                    lease_seconds=15,
+                )
+                if distributed_token is None:
+                    await asyncio.sleep(0.025)
+            if distributed_token is None:
+                raise TimeoutError
         except TimeoutError as exc:
             _metrics[f"search_queue_timeouts:{route}"] += 1
             logger.warning(
@@ -167,6 +190,7 @@ async def search_slot(route: str):
             _search_waiting -= 1
 
         _search_active += 1
+        entered = True
         _metrics[f"search_started:{route}"] += 1
         async with interactive_slot(route):
             yield
@@ -174,9 +198,12 @@ async def search_slot(route: str):
     finally:
         elapsed_ms = int((time.monotonic() - started) * 1000)
         _metrics[f"search_latency_ms:{route}"] += elapsed_ms
-        if acquired:
+        if entered:
             _search_active -= 1
+        if acquired:
             _search_semaphore.release()
+        if distributed_token is not None:
+            await redis_state.release_semaphore("search", distributed_token)
         if elapsed_ms >= 5000:
             logger.warning(
                 "workload_latency route=%s elapsed_ms=%s waiting=%s active=%s",
@@ -218,14 +245,16 @@ async def delivery_guard(user_id: int, file_obj_id: str, repository=None):
             await repository.release_action_lease("file_delivery", lease_key, owner)
 
 
-def workload_snapshot() -> dict:
+async def workload_snapshot() -> dict:
     """Return process metrics for health/log integrations and tests."""
     return {
         **dict(_metrics),
         "search_queue_depth": _search_waiting,
         "search_active": _search_active,
         "search_capacity": _SEARCH_CONCURRENCY,
+        "global_search_capacity": _GLOBAL_SEARCH_CONCURRENCY,
         "interactive_active": _interactive_active,
+        "interactive_active_shared": await redis_state.get_counter("interactive-active"),
     }
 
 

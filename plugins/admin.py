@@ -10,6 +10,7 @@ from pyrogram.enums import ParseMode
 from pyrogram.errors import MessageNotModified
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from database.db import db, validate_config_restore
+from database.redis_client import redis_state
 from plugins.state import (
     clear_state as _clear_state_fn,
     get_state as _get_state_fn,
@@ -38,8 +39,6 @@ from utils import (
 load_dotenv()
 
 logger = logging.getLogger(__name__)
-_reset_confirmations = {}
-_restore_confirmations = {}
 MAX_CONFIG_BACKUP_BYTES = 64 * 1024
 CONFIG_RESTORE_CONFIRM_SECONDS = 120
 
@@ -47,16 +46,16 @@ CONFIG_RESTORE_CONFIRM_SECONDS = 120
 _BACK_BTN = InlineKeyboardMarkup([[InlineKeyboardButton("‹ Control Center", callback_data="back_to_admin")]])
 
 
-def _get_state(admin_id):
-    return _get_state_fn(admin_id)
+async def _get_state(admin_id):
+    return await _get_state_fn(admin_id)
 
 
-def _set_state(admin_id, state):
-    _set_state_fn(admin_id, state)
+async def _set_state(admin_id, state):
+    await _set_state_fn(admin_id, state)
 
 
-def _clear_state(admin_id):
-    _clear_state_fn(admin_id)
+async def _clear_state(admin_id):
+    await _clear_state_fn(admin_id)
 
 
 def _parse_config_backup(raw: bytes) -> dict:
@@ -195,8 +194,8 @@ _CATEGORY_BACK_BTN = InlineKeyboardMarkup(
     filters.regex(r"^admin_cat_(library|appearance|users|settings|health)$") & filters.user(ADMIN_ID)
 )
 async def show_category_menu(client: Client, callback: CallbackQuery):
-    _clear_state(callback.from_user.id)
     await answer_callback_safely(callback)
+    await _clear_state(callback.from_user.id)
     key = callback.data.split("_", 2)[2]
     title, description, items = _CATEGORY_MENUS[key]
 
@@ -280,8 +279,8 @@ async def admin_panel(client: Client, message: Message):
 
 @Client.on_callback_query(filters.regex(r"^back_to_admin$") & filters.user(ADMIN_ID))
 async def back_to_admin(client: Client, callback: CallbackQuery):
-    _clear_state(callback.from_user.id)
     await answer_callback_safely(callback)
+    await _clear_state(callback.from_user.id)
     text, markup = await get_admin_menu_data()
     try:
         await callback.message.edit_text(text=text, reply_markup=markup, **_no_preview())
@@ -368,7 +367,7 @@ async def show_stats(client: Client, callback: CallbackQuery):
     hits = int(cache.get("hits", 0))
     misses = int(cache.get("misses", 0))
     hit_rate = (hits * 100 / (hits + misses)) if hits + misses else 0.0
-    workload = workload_snapshot()
+    workload = await workload_snapshot()
     ops_note = (
         "🟢 Dedicated operations database"
         if db.operations_db is not None
@@ -451,12 +450,12 @@ async def show_stats_health(client: Client, callback: CallbackQuery):
     await callback.message.edit_text("🩺 **System Health**\n\nRunning live connection checks…")
     health = await db.probe_shards(force=True)
     cluster_lines = "\n".join(_cluster_status_line(item) for item in health)
-    workload = workload_snapshot()
+    workload = await workload_snapshot()
     cache = db.cache_metrics()
     operations = (
         "🟢 Dedicated and isolated"
         if db.operations_db is not None
-        else "🟠 Shared with Cluster 2 • configure OPERATIONS_DATABASE_URI"
+        else "🔴 Unavailable • readiness violation"
     )
     text = (
         "🩺 **System Health**\n"
@@ -467,7 +466,7 @@ async def show_stats_health(client: Client, callback: CallbackQuery):
         f"Search queue  `{int(workload.get('search_queue_depth', 0))}`\n"
         f"Active searches  `{int(workload.get('search_active', 0))}`\n"
         f"Event-loop lag  `{int(workload.get('event_loop_lag_latest_ms', 0))} ms`\n"
-        f"Cached queries  `{int(cache.get('queries', {}).get('size', 0))}`"
+        f"Search cache  `Redis • {int(cache.get('queries', {}).get('ttl_seconds', 0))}s TTL`"
     )
     await _show_analytics_page(callback, text, "health")
 
@@ -873,7 +872,7 @@ _OWN_STATES = {
 )
 async def catch_admin_input(client: Client, message: Message):
     admin_id = message.from_user.id
-    state = _get_state(admin_id)
+    state = await _get_state(admin_id)
 
     if not state or state not in _OWN_STATES:
         raise ContinuePropagation
@@ -1222,7 +1221,7 @@ async def catch_admin_input(client: Client, message: Message):
 async def cancel_cmd(client: Client, message: Message):
     restored = await restore_prompt(client, message.from_user.id, fallback_message=message)
     if not restored:
-        _clear_state(message.from_user.id)
+        await _clear_state(message.from_user.id)
     try:
         await message.delete()
     except Exception:
@@ -1294,7 +1293,7 @@ async def reset_index_progress_cmd(client: Client, message: Message):
 
 @Client.on_message(filters.command("reset_db") & filters.private & filters.user(ADMIN_ID))
 async def reset_db_cmd(client: Client, message: Message):
-    _reset_confirmations[message.from_user.id] = time.monotonic() + 60
+    await redis_state.set_json("admin-reset-confirm", message.from_user.id, {"ready": True}, 60)
     await message.reply_text(
         "⚠️ **WARNING: NUCLEAR OPTION** ⚠️\n\n"
         "Are you absolutely sure you want to completely wipe ALL files, users, and bans across all 5 clusters?\n\n"
@@ -1305,8 +1304,9 @@ async def reset_db_cmd(client: Client, message: Message):
 
 @Client.on_message(filters.command("confirm_reset") & filters.private & filters.user(ADMIN_ID))
 async def confirm_reset_cmd(client: Client, message: Message):
-    expires_at = _reset_confirmations.pop(message.from_user.id, 0)
-    if time.monotonic() > expires_at:
+    confirmation = await redis_state.get_json("admin-reset-confirm", message.from_user.id)
+    await redis_state.delete("admin-reset-confirm", message.from_user.id)
+    if not confirmation:
         return await message.reply_text("Reset confirmation is missing or expired. Run /reset_db first.")
     status = await message.reply_text("☢️ **Nuking the database...**")
     try:
@@ -1583,7 +1583,7 @@ async def restore_config_prompt(client: Client, callback: CallbackQuery):
 
 @Client.on_message(filters.private & filters.document & filters.user(ADMIN_ID))
 async def handle_config_restore_file(client: Client, message: Message):
-    state = _get_state(message.from_user.id)
+    state = await _get_state(message.from_user.id)
     if state != "restore_config_file":
         # Not a config restore — let the message propagate to other handlers (e.g. forward_indexer)
         raise ContinuePropagation
@@ -1599,7 +1599,7 @@ async def handle_config_restore_file(client: Client, message: Message):
             reply_markup=_BACK_BTN,
         )
 
-    _clear_state(message.from_user.id)
+    await _clear_state(message.from_user.id)
     file_bytes = None
     try:
         file_bytes = await client.download_media(message.document, in_memory=True)
@@ -1618,10 +1618,12 @@ async def handle_config_restore_file(client: Client, message: Message):
                 reply_markup=_BACK_BTN,
             )
 
-        _restore_confirmations[message.from_user.id] = {
-            "expires_at": time.monotonic() + CONFIG_RESTORE_CONFIRM_SECONDS,
-            "changes": changes,
-        }
+        await redis_state.set_json(
+            "admin-restore-confirm",
+            message.from_user.id,
+            {"changes": changes},
+            CONFIG_RESTORE_CONFIRM_SECONDS,
+        )
         await message.reply_text(
             _format_restore_diff(current, changes),
             parse_mode=ParseMode.DISABLED,
@@ -1649,8 +1651,10 @@ async def handle_config_restore_file(client: Client, message: Message):
 
 @Client.on_callback_query(filters.regex(r"^admin_restore_apply$") & filters.user(ADMIN_ID))
 async def apply_config_restore(client: Client, callback: CallbackQuery):
-    pending = _restore_confirmations.pop(callback.from_user.id, None)
-    if not pending or time.monotonic() > pending["expires_at"]:
+    await answer_callback_safely(callback)
+    pending = await redis_state.get_json("admin-restore-confirm", callback.from_user.id)
+    await redis_state.delete("admin-restore-confirm", callback.from_user.id)
+    if not pending:
         await answer_callback_safely(callback, "Restore preview expired. Upload it again.", show_alert=True)
         return
 
@@ -1672,7 +1676,7 @@ async def apply_config_restore(client: Client, callback: CallbackQuery):
 @Client.on_callback_query(filters.regex(r"^admin_restore_cancel$") & filters.user(ADMIN_ID))
 async def cancel_config_restore(client: Client, callback: CallbackQuery):
     await answer_callback_safely(callback)
-    _restore_confirmations.pop(callback.from_user.id, None)
+    await redis_state.delete("admin-restore-confirm", callback.from_user.id)
     await callback.message.edit_text("Config restore cancelled.", reply_markup=_BACK_BTN)
     await answer_callback_safely(callback)
 
