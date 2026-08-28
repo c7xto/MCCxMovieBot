@@ -739,7 +739,19 @@ from pyrogram import ContinuePropagation, StopPropagation
     filters.private
     & filters.text
     & filters.user(ADMIN_ID)
-    & ~filters.command(["start", "admin", "ban", "unban", "reset_db", "broadcast", "filesearch", "cancel"]),
+    & ~filters.command(
+        [
+            "start",
+            "admin",
+            "ban",
+            "unban",
+            "reset_db",
+            "broadcast",
+            "broadcast_status",
+            "filesearch",
+            "cancel",
+        ]
+    ),
     group=-1,  # must win the race against filter.py's auto_filter — see admin.py's
     # matching catch_admin_input handler for the full explanation.
 )

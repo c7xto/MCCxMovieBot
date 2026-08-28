@@ -43,7 +43,6 @@ async def group_manager_menu(client: Client, callback: CallbackQuery):
                 InlineKeyboardButton("⚙ Manage Groups", callback_data="gm_settings_prompt"),
                 InlineKeyboardButton("🔎 Find", callback_data="gm_find"),
             ],
-            [InlineKeyboardButton("📢 Broadcast Guide", callback_data="gm_broadcast_prompt")],
             [InlineKeyboardButton(f"🔄 {toggle_label}", callback_data="gm_toggle_mode")],
             [InlineKeyboardButton("‹ Control Center", callback_data="back_to_admin")],
         ]
@@ -313,7 +312,19 @@ async def _ban_group(client, reply_to_msg, group_id: int):
     filters.private
     & filters.text
     & filters.user(ADMIN_ID)
-    & ~filters.command(["start", "admin", "ban", "unban", "reset_db", "broadcast", "filesearch", "cancel"]),
+    & ~filters.command(
+        [
+            "start",
+            "admin",
+            "ban",
+            "unban",
+            "reset_db",
+            "broadcast",
+            "broadcast_status",
+            "filesearch",
+            "cancel",
+        ]
+    ),
     group=-1,  # must win the race against filter.py's auto_filter — see admin.py's
     # matching catch_admin_input handler for the full explanation. Without
     # this, auto_filter (default group 0, registered earlier since

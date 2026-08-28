@@ -161,6 +161,7 @@ _CATEGORY_MENUS = {
         "⚙ **Preferences & Backup**",
         "Manage channels, deletion rules, backups and deployment.",
         [
+            ("📣 Broadcasts", "broadcast_jobs_menu"),
             ("💬 Request Group", "edit_maingroup"),
             ("📰 New Releases Channel", "releases_channel_menu"),
             ("🎫 Request Inbox", "edit_requestchannel"),
@@ -753,7 +754,17 @@ _OWN_STATES = {
     & filters.text
     & filters.user(ADMIN_ID)
     & ~filters.command(
-        ["start", "admin", "ban", "unban", "reset_db", "reset_index_progress", "broadcast", "cancel"]
+        [
+            "start",
+            "admin",
+            "ban",
+            "unban",
+            "reset_db",
+            "reset_index_progress",
+            "broadcast",
+            "broadcast_status",
+            "cancel",
+        ]
     ),
     group=-1,  # must win the race against filter.py's auto_filter (default group 0),
     # which matches any plain text and never ContinuePropagates — see

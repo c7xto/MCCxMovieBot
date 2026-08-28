@@ -61,6 +61,7 @@ MAX_NOTIFICATION_OUTBOX_JOBS = 5000
 MAX_REQUEST_MATCHES_PER_JOB = 100
 MAX_CONFIG_BACKUP_KEYS = 50
 MAX_CONFIG_BACKUP_DEPTH = 4
+BROADCAST_LEASE_SECONDS = 360
 
 _RESTORABLE_CONFIG_TYPES = {
     "start_media": str,
@@ -1728,6 +1729,12 @@ class Database:
         if self.groups_col is None:
             return 0
         return await self.groups_col.count_documents({})
+
+    async def get_broadcast_group_count(self):
+        """Return only groups that are eligible to receive broadcasts."""
+        if self.groups_col is None:
+            return 0
+        return await self.groups_col.count_documents({"banned": {"$ne": True}})
 
     async def get_group(self, group_id):
         if self.groups_col is None:
@@ -4150,12 +4157,14 @@ class Database:
         target: str,
         do_pin: bool,
         do_delete: bool,
+        total_users: int = 0,
+        total_groups: int = 0,
     ):
         """Persist a scheduled broadcast without retaining Telegram objects."""
         if self.broadcast_col is None or target not in {"users", "groups", "both"}:
             return None
         active = await self.broadcast_col.count_documents(
-            {"status": {"$in": ["pending", "running"]}}, limit=101
+            {"status": {"$in": ["pending", "running", "paused"]}}, limit=101
         )
         if active >= 100:
             return None
@@ -4171,6 +4180,9 @@ class Database:
             "target": target,
             "do_pin": bool(do_pin),
             "do_delete": bool(do_delete),
+            "total_users": max(0, int(total_users)),
+            "total_groups": max(0, int(total_groups)),
+            "total_recipients": max(0, int(total_users)) + max(0, int(total_groups)),
             "status": "pending",
             "attempts": 0,
             "user_cursor": None,
@@ -4187,7 +4199,7 @@ class Database:
         result = await self.broadcast_col.insert_one(document)
         return result.inserted_id
 
-    async def claim_due_broadcast(self, lease_seconds=120):
+    async def claim_due_broadcast(self, lease_seconds=BROADCAST_LEASE_SECONDS):
         if self.broadcast_col is None:
             return None
         now = time.time()
@@ -4207,8 +4219,10 @@ class Database:
                     "status": "running",
                     "lock_token": lock_token,
                     "locked_until": now + max(30, int(lease_seconds)),
-                    "started_at": now,
-                }
+                    "last_started_at": now,
+                },
+                "$min": {"started_at": now},
+                "$unset": {"control_requested": ""},
             },
             sort=[("due_at", 1)],
             return_document=ReturnDocument.AFTER,
@@ -4244,7 +4258,7 @@ class Database:
             {
                 "$set": {
                     cursor_field: recipient_id,
-                    "locked_until": time.time() + 120,
+                    "locked_until": time.time() + BROADCAST_LEASE_SECONDS,
                 },
                 "$inc": {counters[outcome]: 1},
             },
@@ -4267,7 +4281,12 @@ class Database:
             return False
         result = await self.broadcast_col.update_one(
             {"_id": job_id, "status": "running", "lock_token": lock_token},
-            {"$set": {f"{audience}_done": True, "locked_until": time.time() + 120}},
+            {
+                "$set": {
+                    f"{audience}_done": True,
+                    "locked_until": time.time() + BROADCAST_LEASE_SECONDS,
+                }
+            },
         )
         return result.matched_count == 1
 
@@ -4278,7 +4297,115 @@ class Database:
             {"_id": job_id, "status": "running", "lock_token": lock_token},
             {
                 "$set": {"status": "completed", "finished_at": time.time()},
-                "$unset": {"lock_token": "", "locked_until": ""},
+                "$unset": {
+                    "lock_token": "",
+                    "locked_until": "",
+                    "control_requested": "",
+                },
+            },
+        )
+        return result.matched_count == 1
+
+    @staticmethod
+    def _broadcast_job_id(job_id):
+        try:
+            return ObjectId(job_id) if isinstance(job_id, str) else job_id
+        except Exception:
+            return None
+
+    async def get_broadcast(self, job_id):
+        if self.broadcast_col is None:
+            return None
+        parsed_id = self._broadcast_job_id(job_id)
+        if parsed_id is None:
+            return None
+        return await self.broadcast_col.find_one({"_id": parsed_id})
+
+    async def list_recent_broadcasts(self, limit=8):
+        if self.broadcast_col is None:
+            return []
+        cursor = (
+            self.broadcast_col.find({})
+            .sort("created_at", -1)
+            .limit(max(1, min(int(limit), 20)))
+        )
+        return [document async for document in cursor]
+
+    async def get_broadcast_control(self, job_id, lock_token: str):
+        if self.broadcast_col is None:
+            return None
+        return await self.broadcast_col.find_one(
+            {"_id": job_id, "status": "running", "lock_token": lock_token},
+            {"status": 1, "control_requested": 1},
+        )
+
+    async def request_broadcast_control(self, job_id, action: str):
+        """Request a safe pause, resume or stop and return the latest job."""
+        if self.broadcast_col is None or action not in {"pause", "resume", "stop"}:
+            return None
+        parsed_id = self._broadcast_job_id(job_id)
+        if parsed_id is None:
+            return None
+        for _ in range(3):
+            now = time.time()
+            job = await self.broadcast_col.find_one({"_id": parsed_id}, {"status": 1})
+            if not job:
+                return None
+            status = job.get("status")
+            query = {"_id": parsed_id, "status": status}
+            if action == "pause" and status == "pending":
+                update = {
+                    "$set": {"status": "paused", "paused_at": now},
+                    "$unset": {"lock_token": "", "locked_until": "", "control_requested": ""},
+                }
+            elif action == "pause" and status == "running":
+                update = {"$set": {"control_requested": "pause"}}
+            elif action == "resume" and status == "paused":
+                update = {
+                    "$set": {"status": "pending", "due_at": now},
+                    "$unset": {
+                        "paused_at": "",
+                        "lock_token": "",
+                        "locked_until": "",
+                        "control_requested": "",
+                    },
+                }
+            elif action == "stop" and status in {"pending", "paused"}:
+                update = {
+                    "$set": {"status": "stopped", "finished_at": now},
+                    "$unset": {"lock_token": "", "locked_until": "", "control_requested": ""},
+                }
+            elif action == "stop" and status == "running":
+                update = {"$set": {"control_requested": "stop"}}
+            else:
+                return await self.broadcast_col.find_one({"_id": parsed_id})
+            updated = await self.broadcast_col.find_one_and_update(
+                query,
+                update,
+                return_document=ReturnDocument.AFTER,
+            )
+            if updated:
+                return updated
+        return await self.broadcast_col.find_one({"_id": parsed_id})
+
+    async def apply_broadcast_control(self, job_id, lock_token: str, action: str) -> bool:
+        """Atomically release a running job after its current recipient."""
+        if self.broadcast_col is None or action not in {"pause", "stop"}:
+            return False
+        now = time.time()
+        terminal_status = "paused" if action == "pause" else "stopped"
+        fields = {"status": terminal_status}
+        fields["paused_at" if action == "pause" else "finished_at"] = now
+        result = await self.broadcast_col.update_one(
+            {
+                "_id": job_id,
+                "status": "running",
+                "lock_token": lock_token,
+                "control_requested": action,
+            },
+            {
+                "$set": fields,
+                "$unset": {"lock_token": "", "locked_until": "", "control_requested": ""},
             },
         )
         return result.matched_count == 1
@@ -4296,7 +4423,7 @@ class Database:
                     "last_error": str(error)[:500],
                 },
                 "$inc": {"attempts": 1},
-                "$unset": {"lock_token": "", "locked_until": ""},
+                "$unset": {"lock_token": "", "locked_until": "", "control_requested": ""},
             },
         )
         return result.matched_count == 1
@@ -4313,7 +4440,7 @@ class Database:
                     "last_error_type": type(error).__name__,
                     "last_error": str(error)[:500],
                 },
-                "$unset": {"lock_token": "", "locked_until": ""},
+                "$unset": {"lock_token": "", "locked_until": "", "control_requested": ""},
             },
         )
         return result.matched_count == 1

@@ -873,6 +873,7 @@ route_menu = show_results
             "help",
             "admin",
             "broadcast",
+            "broadcast_status",
             "ban",
             "unban",
             "reset_db",

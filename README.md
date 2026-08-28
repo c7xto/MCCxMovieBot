@@ -34,7 +34,7 @@ Premium plans and web streaming are deliberately outside this project's current 
 - The primary MongoDB cluster is required at startup; optional clusters degrade independently.
 - Search sessions are bounded and expire automatically.
 - Message deletions use a persistent MongoDB queue, so restarts do not cancel them.
-- Scheduled broadcasts and per-recipient checkpoints are persisted, so delivery resumes after restarts.
+- Broadcasts show live speed and ETA, support pause/resume/safe stop, and resume from durable recipient checkpoints after restarts.
 - Background task crashes and cluster failures are reported to the configured log channel.
 - The self-updater stages and compiles the complete target commit before applying it, with rollback on an apply failure.
 
@@ -124,6 +124,7 @@ overwrite an existing plaintext file.
 | `/admin` | Admin | Open the control center |
 | `/stats` | Admin | View operational statistics |
 | `/broadcast` | Admin | Preview and send a broadcast |
+| `/broadcast_status` | Admin | View, pause, resume or safely stop broadcasts |
 | `/filesearch <query>` | Admin | Find and manage indexed files |
 | `/update <commit-sha>` | Admin | Review and apply a pinned update |
 | `/cancel` | Admin | Cancel the current admin input flow |
