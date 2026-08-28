@@ -21,6 +21,7 @@ from plugins.verification_channels import (
 from plugins.telegram_retry import BACKGROUND_RETRY, telegram_call
 from plugins.config_backup import encrypt_config_export
 from plugins.callbacks import answer_callback_safely
+from plugins.access_gates import access_gate_health, get_access_gates
 from plugins.ui_helpers import begin_prompt, finish_prompt, restore_prompt
 from utils import (
     ADMIN_ID,
@@ -151,7 +152,6 @@ _CATEGORY_MENUS = {
     "users": (
         "👥 **Users, Groups & Access**",
         [
-            ("🔐 Required Channels", "fsub_menu"),
             ("🛡 Access Gates", "verification_gates_menu"),
             ("🏘 Group Manager", "group_manager_menu"),
         ],
@@ -248,6 +248,15 @@ async def show_stats(client: Client, callback: CallbackQuery):
         bar = "█" * fill + "░" * (10 - fill)
         status = "⚠️" if size >= 450 else "✅"
         cluster_text += f"{status} Cluster {db_num}  [{bar}]  `{size:.1f} MB`\n"
+    if db.operations_db is not None:
+        try:
+            size = await db.get_db_size(db.operations_db)
+            fill = max(0, min(10, round((size / 512) * 10)))
+            bar = "█" * fill + "░" * (10 - fill)
+            status = "⚠️" if size >= 450 else "✅"
+            cluster_text += f"{status} Operations  [{bar}]  `{size:.1f} MB`\n"
+        except Exception:
+            cluster_text += "⚠️ Operations storage unavailable\n"
 
     # Language breakdown
     try:
@@ -405,6 +414,7 @@ async def handle_edit_buttons(client: Client, callback: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^fsub_menu$") & filters.user(ADMIN_ID))
 async def show_fsub_menu(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback)
     config = await db.get_config()
     channels = config.get("fsub_channels", [])
 
@@ -434,7 +444,6 @@ async def show_fsub_menu(client: Client, callback: CallbackQuery):
         ]
     )
     await callback.message.edit_text(text, reply_markup=markup)
-    await answer_callback_safely(callback)
 
 
 # ── DATABASE CHANNELS MANAGER ─────────────────────────────────────────────────
@@ -442,39 +451,42 @@ async def show_fsub_menu(client: Client, callback: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^verification_gates_menu$") & filters.user(ADMIN_ID))
 async def show_verification_gates_menu(client: Client, callback: CallbackQuery):
-    """Request-FSub and Two-Stage Verification are two independently-built
-    gates that both run before file delivery (on top of Main FSub, managed
-    separately under "Manage FSub Channels") — grouped here under one
-    submenu instead of two separate top-level entries so their cumulative
-    effect on a new user is visible in one place. Each still has its own
-    config/admin screen below; see plugins/req_fsub.py's
-    check_verification_gates() for how they're combined into one join
-    screen on the user-facing side."""
+    await answer_callback_safely(callback)
     config = await db.get_config()
-    req_count = len(config.get("req_fsub_channels", []))
-    two_stage_active = len([c for c in config.get("two_stage_channels", []) if c]) >= 2
-
+    gates = get_access_gates(config)
+    required = sum(gate["mode"] == "required" for gate in gates)
+    timed = len(gates) - required
+    lines = []
+    for index, gate in enumerate(gates, 1):
+        healthy, reason = access_gate_health(gate)
+        icon = "✅" if healthy else "⚠️"
+        mode = "Required" if gate["mode"] == "required" else "Timed"
+        interval = "15 min" if gate["mode"] == "required" else f"{gate['interval_seconds'] // 3600 or 1}h"
+        lines.append(
+            f"{icon} `{index}.` {mode} • `{gate.get('id') or 'Missing ID'}` • {interval}"
+            + ("" if healthy else f"\n   Fix: {reason}")
+        )
     text = (
-        f"🔐🔐 **Verification Gates**\n\n"
-        f"Extra join-gates on top of Main FSub, checked before a file is delivered. "
-        f"When more than one is active, the user sees a single combined join screen, "
-        f"not separate sequential prompts.\n\n"
-        f"📢 **Request-FSub:** {req_count} channel(s) configured\n"
-        f"🔐🔐 **Two-Stage:** {'✅ Active' if two_stage_active else '⚫ Incomplete'}"
+        "🛡 **Access Gates**\n\n"
+        "One clear access system is used before every file delivery.\n"
+        f"Required: `{required}` • Timed: `{timed}`\n"
+        "Successful checks are cached, with a short grace period during Telegram outages.\n\n"
+        + ("\n".join(lines) if lines else "⚫ No access gates are active.")
     )
     markup = InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("📢 Request-FSub", callback_data="req_fsub_menu")],
-            [InlineKeyboardButton("🔐🔐 Two-Stage Verification", callback_data="two_stage_menu")],
+            [InlineKeyboardButton("🔐 Required Channels", callback_data="fsub_menu")],
+            [InlineKeyboardButton("⏱ Timed Channels", callback_data="req_fsub_menu")],
+            [InlineKeyboardButton("🧰 Legacy Two-Stage", callback_data="two_stage_menu")],
             [InlineKeyboardButton("‹ Control Center", callback_data="back_to_admin")],
         ]
     )
     await callback.message.edit_text(text, reply_markup=markup)
-    await answer_callback_safely(callback)
 
 
 @Client.on_callback_query(filters.regex(r"^req_fsub_menu$") & filters.user(ADMIN_ID))
 async def show_req_fsub_menu(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback)
     config = await db.get_config()
     channels = config.get("req_fsub_channels", [])
     interval = int(config.get("req_fsub_interval_hours", 24))
@@ -500,7 +512,6 @@ async def show_req_fsub_menu(client: Client, callback: CallbackQuery):
         ]
     )
     await callback.message.edit_text(text, reply_markup=markup)
-    await answer_callback_safely(callback)
 
 
 @Client.on_callback_query(filters.regex(r"^req_fsub_add$") & filters.user(ADMIN_ID))
@@ -524,6 +535,7 @@ async def req_fsub_remove_prompt(client: Client, callback: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^req_fsub_interval$") & filters.user(ADMIN_ID))
 async def req_fsub_interval_prompt(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback)
     config = await db.get_config()
     current = int(config.get("req_fsub_interval_hours", 24))
     await begin_prompt(
@@ -550,6 +562,7 @@ def _fmt_two_stage_slot(entry):
 
 @Client.on_callback_query(filters.regex(r"^two_stage_menu$") & filters.user(ADMIN_ID))
 async def show_two_stage_menu(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback)
     config = await db.get_config()
     channels = config.get("two_stage_channels", [])
     ch1 = channels[0] if len(channels) > 0 else None
@@ -580,11 +593,11 @@ async def show_two_stage_menu(client: Client, callback: CallbackQuery):
         ]
     )
     await callback.message.edit_text(text, reply_markup=markup)
-    await answer_callback_safely(callback)
 
 
 @Client.on_callback_query(filters.regex(r"^twostage_remove(1|2)$") & filters.user(ADMIN_ID))
 async def two_stage_remove(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback)
     slot = int(callback.data[-1])
     await db.remove_two_stage_channel(slot)
     await answer_callback_safely(callback, f"✅ Channel {slot} removed.", show_alert=False)
@@ -593,6 +606,7 @@ async def two_stage_remove(client: Client, callback: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^db_chan_menu$") & filters.user(ADMIN_ID))
 async def show_db_chan_menu(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback)
     config = await db.get_config()
     channels = config.get("db_channels", [])
 
@@ -1259,8 +1273,8 @@ async def help_cmd(client: Client, message: Message):
 
 @Client.on_callback_query(filters.regex(r"^fsub_refresh_links$") & filters.user(ADMIN_ID))
 async def fsub_refresh_links(client: Client, callback: CallbackQuery):
-    await callback.message.edit_text("♻️ **Refreshing join channel links...**")
     await answer_callback_safely(callback)
+    await callback.message.edit_text("♻️ **Refreshing join channel links...**")
 
     config = await db.get_config()
     channels = config.get("fsub_channels", [])
@@ -1320,10 +1334,10 @@ async def fsub_refresh_links(client: Client, callback: CallbackQuery):
 @Client.on_callback_query(filters.regex(r"^channel_health_check$") & filters.user(ADMIN_ID))
 async def channel_health_check(client: Client, callback: CallbackQuery):
     """Uses shared check_all_channels() from health_monitor — no duplicate logic."""
+    await answer_callback_safely(callback)
     from plugins.health_monitor import check_all_channels
 
     await callback.message.edit_text("🔍 **Running channel health check...**")
-    await answer_callback_safely(callback)
 
     config = await db.get_config()
     checks = await check_all_channels(client, config)
@@ -1361,10 +1375,10 @@ async def known_issues_check(client: Client, callback: CallbackQuery):
     """Live status tile — cluster capacity, whitelist-mode misconfiguration,
     verification-gate stacking, stuck indexer tasks, missing TMDB key.
     Uses shared check_known_issues() from health_monitor."""
+    await answer_callback_safely(callback)
     from plugins.health_monitor import check_known_issues
 
     await callback.message.edit_text("🔍 **Checking for known issues...**")
-    await answer_callback_safely(callback)
 
     config = await db.get_config()
     findings = await check_known_issues(client, config)
@@ -1387,6 +1401,7 @@ async def known_issues_check(client: Client, callback: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^admin_toggle_maintenance$") & filters.user(ADMIN_ID))
 async def toggle_maintenance(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback)
     config = await db.get_config()
     current = config.get("maintenance_mode", False)
     new_val = not current
@@ -1551,6 +1566,7 @@ async def apply_config_restore(client: Client, callback: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^admin_restore_cancel$") & filters.user(ADMIN_ID))
 async def cancel_config_restore(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback)
     _restore_confirmations.pop(callback.from_user.id, None)
     await callback.message.edit_text("Config restore cancelled.", reply_markup=_BACK_BTN)
     await answer_callback_safely(callback)
@@ -1561,5 +1577,6 @@ async def cancel_config_restore(client: Client, callback: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^close_data$") & filters.user(ADMIN_ID))
 async def close_callback(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback)
     await callback.message.delete()
     await answer_callback_safely(callback)

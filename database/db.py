@@ -28,6 +28,7 @@ from database.index_policy import (
     ensure_required_index,
     ensure_required_unique_index,
 )
+from database.shard_router import ShardRouter, is_capacity_error
 from plugins.duplicate_safety import stable_duplicate_key
 from verification import VerificationResult, VerificationStatus
 
@@ -251,6 +252,7 @@ class AllClustersFullError(Exception):
 
 _config_cache = None
 _config_cache_ts = 0.0
+_last_valid_config = None
 _CONFIG_TTL = 60
 
 # Fixed per-user re-verification window for the Two-Stage Verification gate
@@ -946,6 +948,9 @@ class Database:
         self.clients = []
         self.dbs = []
         self.file_cols = []
+        self.operations_client = None
+        self.operations_db = None
+        self.operations_uri = os.getenv("OPERATIONS_DATABASE_URI") or None
         allow_insecure_mongo = os.getenv("ALLOW_INSECURE_MONGODB_FOR_DEVELOPMENT", "false").casefold() in {
             "1",
             "true",
@@ -999,14 +1004,17 @@ class Database:
         self.deletion_dead_letter_col = None
         self.broadcast_col = None
         self.groups_col = None
+        self.verification_cache_col = None
         self.main_db = None
         self.legacy_main_db = None
+        self.legacy_operations_db = None
         self._search_cache = _SearchCache(maxsize=2000, default_ttl=600)
         # Popular movie searches are highly repetitive. Keep their already
         # merged results briefly so groups and DMs do not rescan three Atlas
         # shards for the same title every time.
         self._query_cache = _SearchCache(maxsize=512, default_ttl=120)
         self._db_size_cache = {}  # id(db_instance) -> (fetched_at, size_mb)
+        self.shard_router = ShardRouter(len(self.dbs))
         self._file_count_cache = (0.0, 0)
         self._catalog_building = False
         self._catalog_worker_semaphore = asyncio.Semaphore(1)
@@ -1023,7 +1031,28 @@ class Database:
             # blocks *all* writes on an over-quota cluster, so users, settings,
             # groups and request bookkeeping must not depend on cluster 1.
             self.legacy_main_db = self.dbs[0]
-            _ops_db = self.dbs[1] if len(self.dbs) > 1 else self.legacy_main_db
+            self.legacy_operations_db = self.dbs[1] if len(self.dbs) > 1 else self.legacy_main_db
+            _ops_db = self.legacy_operations_db
+            if self.operations_uri:
+                tls_options = mongo_tls_options(
+                    self.operations_uri,
+                    allow_insecure_development=allow_insecure_mongo,
+                    ca_file=mongo_ca_file,
+                )
+                self.operations_client = AsyncMongoClient(
+                    self.operations_uri,
+                    serverSelectionTimeoutMS=30000,
+                    connectTimeoutMS=30000,
+                    socketTimeoutMS=30000,
+                    retryWrites=True,
+                    retryReads=True,
+                    maxPoolSize=50,
+                    minPoolSize=0,
+                    **tls_options,
+                )
+                self.clients.append(self.operations_client)
+                self.operations_db = self.operations_client["MCCxBot_Operations"]
+                _ops_db = self.operations_db
             self.main_db = _ops_db
             self.users_col = self.main_db["users"]
             self.banned_col = self.main_db["banned_users"]
@@ -1047,6 +1076,7 @@ class Database:
             self.deletion_dead_letter_col = _ops_db["scheduled_deletion_dead_letters"]
             self.broadcast_col = _ops_db["broadcast_jobs"]
             self.groups_col = _ops_db["connected_groups"]
+            self.verification_cache_col = _ops_db["verification_cache"]
 
     async def migrate_legacy_control_data(self):
         """Copy the small writable control plane off legacy cluster 1 once.
@@ -1055,7 +1085,13 @@ class Database:
         win, so a restart can never overwrite newer settings or counters with
         stale values from the read-only legacy database.
         """
-        if self.main_db is None or self.legacy_main_db is None or self.main_db is self.legacy_main_db:
+        if self.main_db is None or self.legacy_main_db is None:
+            return
+
+        if self.operations_db is not None:
+            await self._migrate_to_dedicated_operations()
+            return
+        if self.main_db is self.legacy_main_db:
             return
 
         marker_col = self.main_db["_migrations"]
@@ -1102,6 +1138,192 @@ class Database:
             upsert=True,
         )
         logger.info("✅ Migrated %s legacy control-plane document(s) to operations DB.", copied)
+
+    async def _migrate_to_dedicated_operations(self):
+        """Resumably copy the legacy control plane without deleting its data."""
+        marker_col = self.main_db["_migrations"]
+        marker_id = "dedicated_operations_database_v1"
+        if await marker_col.find_one({"_id": marker_id}, {"_id": 1}):
+            return
+
+        # Establish the uniqueness boundary before copying the registry. A
+        # restart repeats only missing inserts because every write is upserted.
+        await ensure_required_unique_index(
+            self.main_db["file_registry"], "file_id", "file_registry.file_id"
+        )
+        await self.main_db["file_registry"].create_index(
+            "file_unique_id", unique=True, sparse=True, name="file_unique_id_unique"
+        )
+
+        collections = (
+            "bot_config",
+            "users",
+            "banned_users",
+            "connected_groups",
+            "missed_searches",
+            "pending_requests",
+            "settings",
+            "duplicate_scan_results",
+            "indexer_tasks",
+            "index_failures",
+            "rate_limits",
+            "action_leases",
+            "announcement_outbox",
+            "file_branding_jobs",
+            "file_registry",
+            "scheduled_deletions",
+            "scheduled_deletion_dead_letters",
+            "broadcast_jobs",
+            "verification_cache",
+        )
+        sources = []
+        for source in (self.legacy_operations_db, self.legacy_main_db):
+            if source is not None and all(source is not existing for existing in sources):
+                sources.append(source)
+
+        copied = 0
+        validated = {}
+        checkpoint_col = self.main_db["_migration_checkpoints"]
+        for source in sources:
+            for name in collections:
+                source_col = source[name]
+                target_col = self.main_db[name]
+                checkpoint_id = (
+                    f"{marker_id}:"
+                    f"{hashlib.sha256(f'{source.name}:{name}'.encode()).hexdigest()[:20]}"
+                )
+                checkpoint = await checkpoint_col.find_one(
+                    {"_id": checkpoint_id}, {"last_id": 1, "complete": 1}
+                )
+                if checkpoint and checkpoint.get("complete"):
+                    validated[f"{source.name}:{name}"] = await source_col.count_documents({})
+                    continue
+                query = {}
+                if checkpoint and "last_id" in checkpoint:
+                    query = {"_id": {"$gt": checkpoint["last_id"]}}
+                ops = []
+                batch_last_id = None
+                collection_copied = 0
+                async for original in source_col.find(query).sort("_id", 1):
+                    document = dict(original)
+                    document_id = document.pop("_id")
+                    batch_last_id = document_id
+                    update = (
+                        {"$set": document or {"_legacy_migrated": True}}
+                        if name == "bot_config" and source is self.legacy_operations_db
+                        else {"$setOnInsert": document or {"_legacy_migrated": True}}
+                    )
+                    ops.append(
+                        UpdateOne(
+                            {"_id": document_id},
+                            update,
+                            upsert=True,
+                        )
+                    )
+                    if len(ops) >= 2000:
+                        result = await target_col.bulk_write(ops, ordered=False)
+                        copied += result.upserted_count
+                        collection_copied += result.upserted_count
+                        await checkpoint_col.update_one(
+                            {"_id": checkpoint_id},
+                            {
+                                "$set": {
+                                    "source": source.name,
+                                    "collection": name,
+                                    "last_id": batch_last_id,
+                                    "updated_at": datetime.now(timezone.utc),
+                                }
+                            },
+                            upsert=True,
+                        )
+                        if collection_copied and collection_copied % 20_000 < 2000:
+                            logger.info(
+                                "Operations migration %s/%s: %s new documents",
+                                source.name,
+                                name,
+                                f"{collection_copied:,}",
+                            )
+                        ops = []
+                if ops:
+                    result = await target_col.bulk_write(ops, ordered=False)
+                    copied += result.upserted_count
+                    collection_copied += result.upserted_count
+                    await checkpoint_col.update_one(
+                        {"_id": checkpoint_id},
+                        {
+                            "$set": {
+                                "source": source.name,
+                                "collection": name,
+                                "last_id": batch_last_id,
+                                "updated_at": datetime.now(timezone.utc),
+                            }
+                        },
+                        upsert=True,
+                    )
+
+                source_count = await source_col.count_documents({})
+                target_count = await target_col.count_documents({})
+                if target_count < source_count:
+                    raise RuntimeError(
+                        f"Operations migration validation failed for {name}: "
+                        f"source={source_count}, target={target_count}"
+                    )
+                validated[f"{source.name}:{name}"] = source_count
+                await checkpoint_col.update_one(
+                    {"_id": checkpoint_id},
+                    {
+                        "$set": {
+                            "complete": True,
+                            "source_count": source_count,
+                            "target_count": target_count,
+                            "completed_at": datetime.now(timezone.utc),
+                        }
+                    },
+                    upsert=True,
+                )
+
+        await marker_col.update_one(
+            {"_id": marker_id},
+            {
+                "$set": {
+                    "completed_at": time.time(),
+                    "copied_documents": copied,
+                    "validated_source_counts": validated,
+                    "legacy_data_retained": True,
+                }
+            },
+            upsert=True,
+        )
+        logger.info(
+            "✅ Dedicated operations migration complete: %s new document(s); legacy retained.",
+            copied,
+        )
+
+    async def migrate_access_gates(self):
+        """Idempotently add the canonical schema while retaining old fields."""
+        if self.config_col is None:
+            return 0
+        config = await self.config_col.find_one({"_id": "bot_config"}) or {}
+        if int(config.get("access_gates_schema_version", 0) or 0) >= 1:
+            return 0
+        from plugins.access_gates import ACCESS_GATES_SCHEMA_VERSION, legacy_access_gates
+
+        gates = legacy_access_gates(config)
+        await self.config_col.update_one(
+            {"_id": "bot_config"},
+            {
+                "$set": {
+                    "access_gates": gates,
+                    "access_gates_schema_version": ACCESS_GATES_SCHEMA_VERSION,
+                    "access_gates_migrated_at": datetime.now(timezone.utc),
+                }
+            },
+            upsert=True,
+        )
+        global _config_cache, _config_cache_ts
+        _config_cache = None
+        _config_cache_ts = 0.0
+        return len(gates)
 
     async def consume_rate_limit(
         self, scope: str, key: str, limit: int, window_seconds: int
@@ -1332,6 +1554,22 @@ class Database:
                 await self.groups_col.create_index("search_count")
             except Exception as e:
                 logger.warning("Could not ensure connected-groups index: %s", e)
+        if hasattr(self, "verification_cache_col"):
+            if self.verification_cache_col is None:
+                raise RequiredIndexError("Required verification cache is unavailable; refusing readiness.")
+            try:
+                await self.verification_cache_col.create_index(
+                    [("user_id", 1), ("gate_key", 1)],
+                    unique=True,
+                    name="verification_user_gate_unique",
+                )
+                await self.verification_cache_col.create_index(
+                    "grace_until", expireAfterSeconds=0, name="verification_grace_ttl"
+                )
+            except Exception as exc:
+                raise RequiredIndexError(
+                    f"Could not create required verification-cache indexes: {exc}"
+                ) from exc
 
         for collection, label in (
             (self.rate_limits_col, "rate-limit"),
@@ -1595,7 +1833,30 @@ class Database:
                 )
                 size = float("inf")
         self._db_size_cache[key] = (now, size)
+        try:
+            self.shard_router.record_size(self.dbs.index(db_instance), size)
+        except (AttributeError, ValueError):
+            pass
         return size
+
+    def shard_health_snapshot(self):
+        router = getattr(self, "shard_router", None)
+        return router.snapshot() if router is not None else []
+
+    async def probe_shards(self):
+        """Refresh write-routing state; full shards remain available to reads."""
+        router = getattr(self, "shard_router", None)
+        if router is None:
+            return []
+        for index, db_instance in enumerate(self.dbs):
+            try:
+                await db_instance.command("ping")
+                self._db_size_cache.pop(id(db_instance), None)
+                size = await self.get_db_size(db_instance)
+                router.record_size(index, size)
+            except Exception as exc:
+                router.mark_error(index, exc)
+        return router.snapshot()
 
     async def get_total_files(self):
         cached_at, cached_count = self._file_count_cache
@@ -1780,7 +2041,10 @@ class Database:
         if branding_status:
             file_doc["branding_status"] = str(branding_status)
         try:
-            for i, col in enumerate(self.file_cols):
+            router = getattr(self, "shard_router", None)
+            candidates = router.candidates() if router is not None else range(len(self.file_cols))
+            for i in candidates:
+                col = self.file_cols[i]
                 try:
                     size = await self.get_db_size(self.dbs[i])
                 except Exception as exc:
@@ -1792,6 +2056,8 @@ class Database:
                     )
                     continue
                 if size >= 450:
+                    if router is not None:
+                        router.record_size(i, size)
                     continue
 
                 try:
@@ -1820,6 +2086,8 @@ class Database:
                             )
                     return False, "Duplicate"
                 except Exception as exc:
+                    if router is not None:
+                        router.mark_error(i, exc)
                     logger.warning(
                         "Cluster %s insert failed for %s: %s",
                         i + 1,
@@ -2028,11 +2296,16 @@ class Database:
 
         saved_total = 0
         remaining = new_files[:]
-        for i, col in enumerate(self.file_cols):
+        router = getattr(self, "shard_router", None)
+        candidates = router.candidates() if router is not None else range(len(self.file_cols))
+        for i in candidates:
+            col = self.file_cols[i]
             if not remaining:
                 break
             size = await self.get_db_size(self.dbs[i])
             if size >= 450:
+                if router is not None:
+                    router.record_size(i, size)
                 continue
             try:
                 result = await col.insert_many(remaining, ordered=False)
@@ -2045,6 +2318,8 @@ class Database:
                 saved_total += len(inserted)
                 remaining = []
             except BulkWriteError as bwe:
+                if router is not None and is_capacity_error(bwe):
+                    router.mark_error(i, bwe)
                 errors = bwe.details.get("writeErrors", [])
                 failed_indexes = {err.get("index") for err in errors}
                 successful = [doc for idx, doc in enumerate(remaining) if idx not in failed_indexes]
@@ -2087,6 +2362,8 @@ class Database:
                     f"{len(retry)} retryable, {len(errors) - len(retry)} duplicate(s)"
                 )
             except Exception as e:
+                if router is not None:
+                    router.mark_error(i, e)
                 if "space quota" in str(e).lower() or "over your space" in str(e).lower():
                     logger.error(f"Cluster {i + 1} FULL — add DATABASE_URI_{i + 2} to .env")
                 else:
@@ -3106,13 +3383,22 @@ class Database:
         return True
 
     async def get_config(self):
-        global _config_cache, _config_cache_ts
+        global _config_cache, _config_cache_ts, _last_valid_config
         now = time.time()
         if _config_cache is not None and (now - _config_cache_ts) < _CONFIG_TTL:
             return _config_cache
         if self.config_col is None:
-            return {}
-        config = await self.config_col.find_one({"_id": "bot_config"})
+            return _last_valid_config or {}
+        try:
+            config = await self.config_col.find_one({"_id": "bot_config"})
+        except Exception as exc:
+            if _last_valid_config is not None:
+                logger.warning(
+                    "Config refresh failed; using last valid snapshot error_type=%s",
+                    type(exc).__name__,
+                )
+                return _last_valid_config
+            raise
         if not config:
             config = {
                 "_id": "bot_config",
@@ -3129,14 +3415,100 @@ class Database:
             }
             await self.config_col.insert_one(config)
         _config_cache = config
+        _last_valid_config = config
         _config_cache_ts = now
         return config
 
     async def update_config(self, key, value):
-        global _config_cache, _config_cache_ts
+        global _config_cache, _config_cache_ts, _last_valid_config
         if self.config_col is None:
             return False
         await self.config_col.update_one({"_id": "bot_config"}, {"$set": {key: value}}, upsert=True)
+        updated = dict(_last_valid_config or _config_cache or {"_id": "bot_config"})
+        updated[key] = value
+        _last_valid_config = updated
+        _config_cache = updated
+        _config_cache_ts = time.time()
+        if key in {
+            "fsub_channels",
+            "req_fsub_channels",
+            "req_fsub_interval_hours",
+            "two_stage_channels",
+        }:
+            await self._sync_access_gates_from_legacy()
+        return True
+
+    async def _sync_access_gates_from_legacy(self):
+        """Keep legacy admin actions reflected in the canonical gate list."""
+        if self.config_col is None:
+            return
+        from plugins.access_gates import ACCESS_GATES_SCHEMA_VERSION, legacy_access_gates
+
+        config = await self.config_col.find_one({"_id": "bot_config"}) or {}
+        await self.config_col.update_one(
+            {"_id": "bot_config"},
+            {
+                "$set": {
+                    "access_gates": legacy_access_gates(config),
+                    "access_gates_schema_version": ACCESS_GATES_SCHEMA_VERSION,
+                    "access_gates_updated_at": datetime.now(timezone.utc),
+                }
+            },
+            upsert=True,
+        )
+        global _config_cache, _config_cache_ts
+        _config_cache = None
+        _config_cache_ts = 0.0
+
+    async def get_verification_cache(self, user_id: int, gate_keys: list[str]) -> dict:
+        if self.verification_cache_col is None or not gate_keys:
+            return {}
+        documents = await self.verification_cache_col.find(
+            {"user_id": int(user_id), "gate_key": {"$in": list(gate_keys)}}
+        ).to_list(length=len(gate_keys))
+        return {str(document.get("gate_key")): document for document in documents}
+
+    async def mark_gate_verified(
+        self,
+        user_id: int,
+        gate_key: str,
+        interval_seconds: int,
+        grace_seconds: int = 900,
+    ):
+        if self.verification_cache_col is None:
+            return False
+        now = datetime.now(timezone.utc)
+        valid_until = datetime.fromtimestamp(now.timestamp() + max(60, int(interval_seconds)), timezone.utc)
+        grace_until = datetime.fromtimestamp(valid_until.timestamp() + max(0, int(grace_seconds)), timezone.utc)
+        await self.verification_cache_col.update_one(
+            {"user_id": int(user_id), "gate_key": str(gate_key)},
+            {
+                "$set": {
+                    "verified_at": now,
+                    "valid_until": valid_until,
+                    "grace_until": grace_until,
+                }
+            },
+            upsert=True,
+        )
+        return {"valid_until": valid_until, "grace_until": grace_until}
+
+    async def invalidate_gate_verification(self, user_id: int, gate_key: str):
+        if self.verification_cache_col is None:
+            return False
+        await self.verification_cache_col.delete_one(
+            {"user_id": int(user_id), "gate_key": str(gate_key)}
+        )
+        return True
+
+    async def update_access_gate_link(self, gate_key: str, link: str):
+        if self.config_col is None:
+            return False
+        await self.config_col.update_one(
+            {"_id": "bot_config", "access_gates.key": str(gate_key)},
+            {"$set": {"access_gates.$.link": str(link)}},
+        )
+        global _config_cache, _config_cache_ts
         _config_cache = None
         _config_cache_ts = 0.0
         return True
@@ -3182,6 +3554,7 @@ class Database:
         global _config_cache, _config_cache_ts
         _config_cache = None
         _config_cache_ts = 0.0
+        await self._sync_access_gates_from_legacy()
         return True
 
     async def update_fsub_channel_link(self, channel_id, link):
@@ -3200,6 +3573,7 @@ class Database:
         global _config_cache, _config_cache_ts
         _config_cache = None
         _config_cache_ts = 0.0
+        await self._sync_access_gates_from_legacy()
 
     async def remove_fsub_channel(self, channel_id):
         if self.config_col is None:
@@ -3211,6 +3585,7 @@ class Database:
         global _config_cache, _config_cache_ts
         _config_cache = None
         _config_cache_ts = 0.0
+        await self._sync_access_gates_from_legacy()
         return True
 
     async def add_db_channel(self, channel_id):
@@ -3259,6 +3634,7 @@ class Database:
         global _config_cache, _config_cache_ts
         _config_cache = None
         _config_cache_ts = 0.0
+        await self._sync_access_gates_from_legacy()
         return True, "Added"
 
     async def remove_req_fsub_channel(self, channel_id):
@@ -3271,6 +3647,7 @@ class Database:
         global _config_cache, _config_cache_ts
         _config_cache = None
         _config_cache_ts = 0.0
+        await self._sync_access_gates_from_legacy()
         return True
 
     async def update_req_fsub_link(self, channel_id, link):
@@ -3289,6 +3666,7 @@ class Database:
         global _config_cache, _config_cache_ts
         _config_cache = None
         _config_cache_ts = 0.0
+        await self._sync_access_gates_from_legacy()
 
     async def set_two_stage_channel(self, slot: int, channel_id) -> bool:
         """slot is 1 or 2 — a fixed 2-slot list (unlike fsub_channels/
@@ -3308,6 +3686,7 @@ class Database:
         global _config_cache, _config_cache_ts
         _config_cache = None
         _config_cache_ts = 0.0
+        await self._sync_access_gates_from_legacy()
         return True
 
     async def remove_two_stage_channel(self, slot: int) -> bool:
@@ -3324,6 +3703,7 @@ class Database:
         global _config_cache, _config_cache_ts
         _config_cache = None
         _config_cache_ts = 0.0
+        await self._sync_access_gates_from_legacy()
         return True
 
     async def update_two_stage_channel_link(self, channel_id, link):
@@ -3342,6 +3722,7 @@ class Database:
         global _config_cache, _config_cache_ts
         _config_cache = None
         _config_cache_ts = 0.0
+        await self._sync_access_gates_from_legacy()
 
     async def get_two_stage_gate_status(self, user_id: int) -> VerificationResult:
         """Return PASS when cached verification is valid, DENY when due."""
@@ -3601,6 +3982,22 @@ class Database:
         if self.indexer_col is None:
             return
         await self.indexer_col.delete_many({})
+
+    async def recover_index_tasks_on_startup(self):
+        """Pause interrupted workers while retaining checkpoints and history."""
+        if self.indexer_col is None:
+            return 0
+        result = await self.indexer_col.update_many(
+            {"state": "running"},
+            {
+                "$set": {
+                    "state": "paused",
+                    "recovered_at": time.time(),
+                    "recovery_reason": "process_restart",
+                }
+            },
+        )
+        return int(result.modified_count)
 
     async def get_stale_index_tasks(self, older_than_seconds=7200):
         if self.indexer_col is None:

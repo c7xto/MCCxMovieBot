@@ -472,6 +472,7 @@ async def start_handler(client: Client, message: Message):
 
 @Client.on_callback_query(filters.regex(r"^help_menu$"))
 async def help_menu_callback(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback)
     lang = await db.get_user_language(callback.from_user.id)
     strings = LANG_STRINGS.get(lang, LANG_STRINGS["en"])
     steps = "\n".join(f"{i}. {s}" for i, s in enumerate(strings["help_steps"], 1))
@@ -497,11 +498,11 @@ async def help_menu_callback(client: Client, callback: CallbackQuery):
             await callback.message.edit_text(text=help_text, reply_markup=markup, parse_mode=ParseMode.HTML)
     except Exception:
         pass
-    await answer_callback_safely(callback)
 
 
 @Client.on_callback_query(filters.regex(r"^start_home$"))
 async def start_home_callback(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback)
     config = await db.get_config()
     UPDATE_CHANNEL_LINK = config.get("update_channel", "")
     MAIN_GROUP_LINK = config.get("main_group", "")

@@ -122,6 +122,7 @@ async def _do_file_search(client, message_obj, query):
 
 @Client.on_callback_query(filters.regex(r"^fm_del#") & filters.user(ADMIN_ID))
 async def fm_delete_file(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback)
     obj_id = callback.data.split("#")[1]
     deleted = await db.delete_file_by_obj_id(obj_id)
     if deleted:
@@ -544,6 +545,7 @@ async def fm_bulkdelete_prompt(client: Client, callback: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^fm_bulkconfirm#") & filters.user(ADMIN_ID))
 async def fm_bulk_confirm(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback)
     pattern = callback.data.split("#")[1]
     status = await callback.message.edit_text(f"🗑 Deleting files matching `{pattern}`...")
     await answer_callback_safely(callback)
@@ -573,6 +575,7 @@ async def fm_migrate_prompt(client: Client, callback: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^fm_migrate_confirm#") & filters.user(ADMIN_ID))
 async def fm_migrate_confirm(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback)
     parts = callback.data.split("#")
     from_idx = int(parts[1]) - 1
     to_idx = int(parts[2]) - 1
@@ -620,6 +623,7 @@ async def _run_migration(client, status_msg, from_idx, to_idx):
 
 @Client.on_callback_query(filters.regex(r"^fm_bylang$") & filters.user(ADMIN_ID))
 async def fm_by_language(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback)
     await callback.message.edit_text("📊 **Counting files by language...**")
     await answer_callback_safely(callback)
 
@@ -664,6 +668,7 @@ async def fm_by_language(client: Client, callback: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^fm_missing$") & filters.user(ADMIN_ID))
 async def fm_missing_files(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback)
     await callback.message.edit_text("📋 **Fetching top missing searches...**")
     await answer_callback_safely(callback)
 
@@ -706,6 +711,7 @@ async def fm_missing_files(client: Client, callback: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^fm_clear_missed#") & filters.user(ADMIN_ID))
 async def fm_clear_missed(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback)
     query_id = callback.data.split("#")[1]
     await db.clear_missed_search(query_id)
     await answer_callback_safely(callback, "✅ Removed from missing list.", show_alert=False)

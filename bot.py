@@ -188,14 +188,32 @@ class AutoFilterBot(Client):
                         raise RuntimeError(f"Primary MongoDB cluster is unavailable: {e}") from e
                     logger.warning(f"  ⚠️ Optional cluster {i + 1} unavailable: {e}")
 
+        if db.operations_db is not None:
+            try:
+                await db.operations_db.command("ping")
+                logger.info("  ✅ Dedicated operations database — OK")
+            except Exception as e:
+                await super().stop()
+                raise RuntimeError(f"Dedicated operations database is unavailable: {e}") from e
+
         logger.info("🔄 Migrating legacy control data → operations database...")
         await db.migrate_legacy_control_data()
 
+        migrated_gates = await db.migrate_access_gates()
+        if migrated_gates:
+            logger.info("✅ Unified %s access gate(s); legacy fields retained.", migrated_gates)
+
         logger.info("🔄 Syncing .env config → MongoDB...")
         await db.sync_config()
+        await db.get_config()  # Pin a last-known-good snapshot before accepting users.
 
-        logger.info("🧹 Clearing stale indexer tasks...")
-        await db.clear_all_index_tasks()
+        logger.info("🧭 Recovering interrupted indexer tasks...")
+        recovered_indexes = await db.recover_index_tasks_on_startup()
+        if recovered_indexes:
+            logger.warning(
+                "Paused %s interrupted indexer task(s); checkpoints were retained.",
+                recovered_indexes,
+            )
 
         logger.info("🧹 Clearing old search sessions...")
         await db.clear_old_searches(expiry_seconds=0)

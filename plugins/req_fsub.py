@@ -27,6 +27,8 @@ plus the unified Verification Gates entry point that enforces both of them
 
 import logging
 import asyncio
+import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pyrogram import Client, filters
 from pyrogram.errors import (
@@ -42,7 +44,13 @@ from pyrogram.enums import ParseMode
 from database.db import db
 from plugins.access_policy import authorize_user_action, enforce_user_action
 from plugins.callbacks import answer_callback_safely
-from plugins.workload import WorkloadRejected, delivery_guard
+from plugins.workload import (
+    WorkloadRejected,
+    delivery_guard,
+    interactive_slot,
+    record_workload_metric,
+)
+from plugins.access_gates import GRACE_SECONDS, get_access_gates
 from plugins.telegram_retry import DELIVERY_RETRY, telegram_call
 from utils import get_subscription_status_by_id, _parse_fsub_entry
 from verification import (
@@ -53,6 +61,8 @@ from verification import (
 )
 
 logger = logging.getLogger(__name__)
+_memory_gate_cache = OrderedDict()
+_MEMORY_GATE_CACHE_MAX = 10_000
 
 
 @dataclass(frozen=True)
@@ -109,7 +119,16 @@ async def _get_link(client, entry) -> str | None:
     if ch_str.lstrip("-").isdigit():
         try:
             link = await client.create_chat_invite_link(int(ch_str), creates_join_request=True)
-            await db.update_req_fsub_link(channel_id, link.invite_link)
+            gate_key = entry.get("key") if isinstance(entry, dict) else None
+            if gate_key:
+                await db.update_access_gate_link(gate_key, link.invite_link)
+            source = entry.get("source") if isinstance(entry, dict) else None
+            if source == "main_fsub":
+                await db.update_fsub_channel_link(channel_id, link.invite_link)
+            elif source == "two_stage":
+                await db.update_two_stage_channel_link(channel_id, link.invite_link)
+            else:
+                await db.update_req_fsub_link(channel_id, link.invite_link)
             return link.invite_link
         except Exception as e:
             logger.debug(f"req_fsub: no invite link for {channel_id}: {e}")
@@ -118,8 +137,18 @@ async def _get_link(client, entry) -> str | None:
     return f"https://t.me/{ch_str}"
 
 
-async def _requested_or_joined_status(client, channel_id, user_id: int) -> VerificationResult:
-    return await check_channel_membership(client, channel_id, user_id, allow_pending_request=True)
+async def _requested_or_joined_status(
+    client,
+    channel_id,
+    user_id: int,
+    allow_pending_request: bool = True,
+) -> VerificationResult:
+    return await check_channel_membership(
+        client,
+        channel_id,
+        user_id,
+        allow_pending_request=allow_pending_request,
+    )
 
 
 async def _deliver_file(client, chat_id, user_id: int, file_obj_id: str):
@@ -203,9 +232,9 @@ async def _channel_display_name(client, channel_id) -> str:
 
 
 async def _collect_outstanding_gates(client, user_id: int):
-    """Return aggregate state plus due gates conclusively passed this check."""
+    """Evaluate canonical gates with bounded cache reads and a grace window."""
     try:
-        config = await db.get_config()
+        config = await asyncio.wait_for(db.get_config(), timeout=2.0)
     except Exception as exc:
         logger.warning(
             "verification_indeterminate gate=config error_type=%s",
@@ -213,104 +242,127 @@ async def _collect_outstanding_gates(client, user_id: int):
         )
         return _gate_evaluation(VerificationResult.indeterminate("config_unavailable"))
 
-    missing, passed_due_gates = [], set()
+    gates = get_access_gates(config)
+    if not gates:
+        return _gate_evaluation(VerificationResult.allow("no_access_gates"))
+    if any(not gate.get("id") for gate in gates):
+        return _gate_evaluation(VerificationResult.indeterminate("missing_access_gate_channel_id"))
 
-    fsub_channels = config.get("fsub_channels", [])
-    main_status = await get_subscription_status_by_id(client, user_id, config)
-    if main_status.status is VerificationStatus.INDETERMINATE:
-        return _gate_evaluation(main_status)
-    if main_status.status is VerificationStatus.DENY:
-        for i, entry in enumerate(fsub_channels, 1):
-            channel_id, _ = _parse_fsub_entry(entry)
-            if not channel_id:
-                return _gate_evaluation(VerificationResult.indeterminate("missing_main_fsub_channel_id"))
-            link = await _get_link(
+    now = time.time()
+    keys = [gate["key"] for gate in gates]
+    persistent_cache = {}
+    if hasattr(db, "get_verification_cache"):
+        try:
+            persistent_cache = await asyncio.wait_for(
+                db.get_verification_cache(user_id, keys), timeout=2.0
+            )
+        except Exception as exc:
+            record_workload_metric("verification_cache_read_failure")
+            logger.warning(
+                "verification_cache_unavailable error_type=%s",
+                type(exc).__name__,
+            )
+
+    cache = {}
+    for gate in gates:
+        cache_key = (id(db), int(user_id), gate["key"])
+        record = persistent_cache.get(gate["key"]) or _memory_gate_cache.get(cache_key)
+        if record:
+            cache[gate["key"]] = record
+            _memory_gate_cache[cache_key] = record
+            _memory_gate_cache.move_to_end(cache_key)
+    while len(_memory_gate_cache) > _MEMORY_GATE_CACHE_MAX:
+        _memory_gate_cache.popitem(last=False)
+
+    def _timestamp(value):
+        if hasattr(value, "timestamp"):
+            return value.timestamp()
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    legacy_status = {}
+    sources = {gate.get("source") for gate in gates}
+    if "request_fsub" in sources and hasattr(db, "get_req_fsub_gate_status"):
+        legacy_status["request_fsub"] = await db.get_req_fsub_gate_status(user_id)
+    if "two_stage" in sources and hasattr(db, "get_two_stage_gate_status"):
+        legacy_status["two_stage"] = await db.get_two_stage_gate_status(user_id)
+
+    due = []
+    for gate in gates:
+        record = cache.get(gate["key"], {})
+        if _timestamp(record.get("valid_until")) > now:
+            continue
+        old_status = legacy_status.get(gate.get("source"))
+        if old_status and old_status.status is VerificationStatus.PASS:
+            continue
+        if old_status and old_status.status is VerificationStatus.INDETERMINATE:
+            return _gate_evaluation(old_status)
+        due.append(gate)
+    if not due:
+        return _gate_evaluation(VerificationResult.allow("verification_cache_valid"))
+
+    membership_results = await asyncio.gather(
+        *[
+            _requested_or_joined_status(
                 client,
-                entry if isinstance(entry, dict) else {"id": channel_id},
+                gate["id"],
+                user_id,
+                allow_pending_request=gate.get("mode") == "timed",
             )
+            for gate in due
+        ],
+        return_exceptions=True,
+    )
+    missing, passed_due_gates = [], set()
+    for gate, result in zip(due, membership_results):
+        if isinstance(result, BaseException):
+            result = VerificationResult.indeterminate("access_gate_task_error")
+        record = cache.get(gate["key"], {})
+        if result.status is VerificationStatus.INDETERMINATE:
+            if _timestamp(record.get("grace_until")) > now:
+                record_workload_metric("verification_grace_pass")
+                logger.warning(
+                    "verification_grace_pass gate_key=%s reason=%s",
+                    gate["key"],
+                    result.reason,
+                )
+                continue
+            return _gate_evaluation(result)
+        if result.status is VerificationStatus.DENY:
+            _memory_gate_cache.pop((id(db), int(user_id), gate["key"]), None)
+            try:
+                await asyncio.wait_for(
+                    db.invalidate_gate_verification(user_id, gate["key"]), timeout=2.0
+                )
+            except Exception:
+                record_workload_metric("verification_cache_invalidation_failure")
+            link = await _get_link(client, gate)
             if not link:
-                return _gate_evaluation(VerificationResult.indeterminate("main_fsub_link_unavailable"))
-            missing.append({"label": f"Main Channel {i}", "link": link})
+                return _gate_evaluation(
+                    VerificationResult.indeterminate("access_gate_link_unavailable")
+                )
+            name = await _channel_display_name(client, gate["id"])
+            missing.append({"label": name, "link": link})
+            continue
 
-    req_channels = config.get("req_fsub_channels", [])
-    if not isinstance(req_channels, list):
-        return _gate_evaluation(VerificationResult.indeterminate("invalid_request_fsub_configuration"))
-    if req_channels:
-        req_due = await db.get_req_fsub_gate_status(user_id)
-        if req_due.status is VerificationStatus.INDETERMINATE:
-            return _gate_evaluation(req_due)
-        if req_due.status is VerificationStatus.DENY:
-            candidates = [
-                (entry, entry.get("id") if isinstance(entry, dict) else entry) for entry in req_channels
-            ]
-            if any(not channel_id for _, channel_id in candidates):
-                return _gate_evaluation(VerificationResult.indeterminate("missing_request_fsub_channel_id"))
-            membership_results = await asyncio.gather(
-                *[_requested_or_joined_status(client, channel_id, user_id) for _, channel_id in candidates],
-                return_exceptions=True,
+        interval = int(gate.get("interval_seconds", 900))
+        valid_until = now + interval
+        grace_until = valid_until + GRACE_SECONDS
+        memory_record = {"valid_until": valid_until, "grace_until": grace_until}
+        cache_key = (id(db), int(user_id), gate["key"])
+        _memory_gate_cache[cache_key] = memory_record
+        try:
+            persisted = await asyncio.wait_for(
+                db.mark_gate_verified(user_id, gate["key"], interval, GRACE_SECONDS),
+                timeout=2.0,
             )
-            for result in membership_results:
-                if isinstance(result, BaseException):
-                    return _gate_evaluation(VerificationResult.indeterminate("request_fsub_task_error"))
-                if result.status is VerificationStatus.INDETERMINATE:
-                    return _gate_evaluation(result)
-
-            unjoined = [
-                pair
-                for pair, result in zip(candidates, membership_results)
-                if result.status is VerificationStatus.DENY
-            ]
-            if unjoined:
-                for entry, channel_id in unjoined:
-                    link = await _get_link(client, entry)
-                    if not link:
-                        return _gate_evaluation(
-                            VerificationResult.indeterminate("request_fsub_link_unavailable")
-                        )
-                    name = await _channel_display_name(client, channel_id)
-                    missing.append({"label": name, "link": link})
-            else:
-                passed_due_gates.add("request_fsub")
-
-    two_stage_channels = config.get("two_stage_channels", [])
-    if not isinstance(two_stage_channels, list):
-        return _gate_evaluation(VerificationResult.indeterminate("invalid_two_stage_configuration"))
-    active_two_stage = [channel for channel in two_stage_channels if channel]
-    if len(active_two_stage) >= 2:
-        two_stage_due = await db.get_two_stage_gate_status(user_id)
-        if two_stage_due.status is VerificationStatus.INDETERMINATE:
-            return _gate_evaluation(two_stage_due)
-        if two_stage_due.status is VerificationStatus.DENY:
-            stage_ids = [entry.get("id") if isinstance(entry, dict) else entry for entry in active_two_stage]
-            if any(not channel_id for channel_id in stage_ids):
-                return _gate_evaluation(VerificationResult.indeterminate("missing_two_stage_channel_id"))
-            membership_results = await asyncio.gather(
-                *[_requested_or_joined_status(client, channel_id, user_id) for channel_id in stage_ids],
-                return_exceptions=True,
-            )
-            for result in membership_results:
-                if isinstance(result, BaseException):
-                    return _gate_evaluation(VerificationResult.indeterminate("two_stage_task_error"))
-                if result.status is VerificationStatus.INDETERMINATE:
-                    return _gate_evaluation(result)
-
-            unjoined_stage = [
-                entry
-                for entry, result in zip(active_two_stage, membership_results)
-                if result.status is VerificationStatus.DENY
-            ]
-            if unjoined_stage:
-                for entry in unjoined_stage:
-                    channel_id = entry.get("id") if isinstance(entry, dict) else entry
-                    link = await _get_link(client, entry)
-                    if not link:
-                        return _gate_evaluation(
-                            VerificationResult.indeterminate("two_stage_link_unavailable")
-                        )
-                    name = await _channel_display_name(client, channel_id)
-                    missing.append({"label": name, "link": link})
-            else:
-                passed_due_gates.add("two_stage")
+            if persisted:
+                _memory_gate_cache[cache_key] = persisted
+        except Exception:
+            record_workload_metric("verification_cache_write_failure")
+        passed_due_gates.add(str(gate.get("source") or "access_gates"))
 
     if missing:
         return _gate_evaluation(
@@ -333,7 +385,17 @@ def _gates_markup(missing: list, file_obj_id: str) -> InlineKeyboardMarkup:
             )
         ]
     )
+    buttons.append([InlineKeyboardButton("‹ Back to Results", callback_data="vgate_back")])
     return InlineKeyboardMarkup(buttons)
+
+
+def _retry_markup(file_obj_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔄 Retry Verification", callback_data=f"vgate_check#{file_obj_id}")],
+            [InlineKeyboardButton("‹ Back to Results", callback_data="vgate_back")],
+        ]
+    )
 
 
 async def check_verification_gates(client, event, file_obj_id: str) -> bool:
@@ -350,12 +412,13 @@ async def check_verification_gates(client, event, file_obj_id: str) -> bool:
     if not user:
         return True
 
-    evaluation = await _collect_outstanding_gates(client, user.id)
+    async with interactive_slot("verification"):
+        evaluation = await _collect_outstanding_gates(client, user.id)
     gate_result, missing = evaluation.result, evaluation.missing
     if gate_result.status is VerificationStatus.INDETERMINATE:
         message = verification_unavailable_message(gate_result)
         if isinstance(event, CallbackQuery):
-            await event.answer(message, show_alert=True)
+            await event.message.reply_text(message, reply_markup=_retry_markup(file_obj_id))
         else:
             await event.reply_text(message, reply_parameters=None)
         return False
@@ -371,10 +434,8 @@ async def check_verification_gates(client, event, file_obj_id: str) -> bool:
     markup = _gates_markup(missing, file_obj_id)
 
     if isinstance(event, CallbackQuery):
-        try:
-            await event.message.edit_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
-        except Exception:
-            await event.message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+        # Keep the results visible behind this actionable verification card.
+        await event.message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
     else:
         await event.reply_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
 
@@ -383,18 +444,25 @@ async def check_verification_gates(client, event, file_obj_id: str) -> bool:
 
 @Client.on_callback_query(filters.regex(r"^vgate_check#"))
 async def vgate_check_callback(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback)
     if not (await enforce_user_action(callback, "verification")).allowed:
         return
     file_obj_id = callback.data.split("#", 1)[1]
     user_id = callback.from_user.id
 
-    evaluation = await _collect_outstanding_gates(client, user_id)
+    async with interactive_slot("verification_callback"):
+        evaluation = await _collect_outstanding_gates(client, user_id)
     gate_result, missing = evaluation.result, evaluation.missing
     if gate_result.status is VerificationStatus.INDETERMINATE:
-        await answer_callback_safely(callback, verification_unavailable_message(gate_result), show_alert=True)
+        try:
+            await callback.message.edit_text(
+                verification_unavailable_message(gate_result),
+                reply_markup=_retry_markup(file_obj_id),
+            )
+        except Exception:
+            pass
         return
     if gate_result.status is VerificationStatus.DENY:
-        await answer_callback_safely(callback, "❌ Still missing some channels.", show_alert=True)
         try:
             await callback.message.edit_text(
                 f"🔐 <b>Still missing {len(missing)} channel(s)</b>\n\n"
@@ -409,9 +477,17 @@ async def vgate_check_callback(client: Client, callback: CallbackQuery):
 
     await _persist_passed_gate_state(user_id, evaluation.passed_due_gates)
 
-    await answer_callback_safely(callback, "✅ Verified! Sending your file...", show_alert=False)
     try:
         await callback.message.delete()
     except Exception:
         pass
     await _deliver_file(client, callback.message.chat.id, user_id, file_obj_id)
+
+
+@Client.on_callback_query(filters.regex(r"^vgate_back$"))
+async def vgate_back_callback(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback)
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass

@@ -26,6 +26,7 @@ _BACK_BTN = InlineKeyboardMarkup(
 @Client.on_callback_query(filters.regex(r"^group_manager_menu$") & filters.user(ADMIN_ID))
 async def group_manager_menu(client: Client, callback: CallbackQuery):
     clear_state(callback.from_user.id)
+    await answer_callback_safely(callback)
     config = await db.get_config()
     whitelist_mode = config.get("group_whitelist_mode", "blacklist")  # "whitelist" or "blacklist"
 
@@ -60,7 +61,6 @@ async def group_manager_menu(client: Client, callback: CallbackQuery):
         await callback.message.edit_text(text, reply_markup=markup)
     except Exception:
         await callback.message.reply_text(text, reply_markup=markup)
-    await answer_callback_safely(callback)
 
 
 # ── LIST & TOP GROUPS ─────────────────────────────────────────────────────────
@@ -68,8 +68,8 @@ async def group_manager_menu(client: Client, callback: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^gm_list$") & filters.user(ADMIN_ID))
 async def gm_list_groups(client: Client, callback: CallbackQuery):
-    await callback.message.edit_text("📋 **Fetching group list...**")
     await answer_callback_safely(callback)
+    await callback.message.edit_text("📋 **Fetching group list...**")
 
     groups = await db.get_all_groups()
     if not groups:
@@ -252,6 +252,7 @@ async def gm_set_autodel_prompt(client: Client, callback: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^gm_toggle_mode$") & filters.user(ADMIN_ID))
 async def gm_toggle_mode(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback)
     config = await db.get_config()
     current = config.get("group_whitelist_mode", "blacklist")
     new_mode = "whitelist" if current == "blacklist" else "blacklist"

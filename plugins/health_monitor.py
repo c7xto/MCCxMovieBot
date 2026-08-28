@@ -16,7 +16,8 @@ from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMa
 from database.db import db
 from plugins.callbacks import answer_callback_safely
 from plugins.filter import send_smart_log
-from plugins.workload import workload_snapshot
+from plugins.workload import record_workload_metric, set_workload_gauge, workload_snapshot
+from plugins.access_gates import access_gate_health, get_access_gates
 from plugins.telegram_retry import (
     BACKGROUND_RETRY,
     INTERACTIVE_RETRY,
@@ -144,9 +145,15 @@ async def check_all_channels(client, config):
     for i, ch in enumerate(config.get("db_channels", []), 1):
         results.append(await _check(f"📚 DB Channel {i}", ch, fix="db_chan_menu"))
 
-    for i, entry in enumerate(config.get("fsub_channels", []), 1):
-        ch_id = entry.get("id") if isinstance(entry, dict) else entry
-        results.append(await _check(f"🔐 FSub {i}", ch_id, fix="fsub_menu"))
+    for i, gate in enumerate(get_access_gates(config), 1):
+        ch_id = gate.get("id")
+        mode = "Required" if gate.get("mode") == "required" else "Timed"
+        result = await _check(f"🛡 {mode} Gate {i}", ch_id, fix="verification_gates_menu")
+        healthy, reason = access_gate_health(gate)
+        if not healthy:
+            result["ok"] = False
+            result["text"] += f"\n  ⚠️ {reason}"
+        results.append(result)
 
     return results
 
@@ -186,6 +193,34 @@ async def check_known_issues(client, config):
                 }
             )
 
+    if db.operations_db is not None:
+        try:
+            operations_size = await db.get_db_size(db.operations_db)
+            if operations_size >= 450:
+                findings.append(
+                    {
+                        "label": "Operations Database",
+                        "ok": False,
+                        "text": f"🛑 Operations storage is full (`{operations_size:.0f} MB`). "
+                        "File registration and control writes are blocked.",
+                    }
+                )
+            elif operations_size >= 400:
+                findings.append(
+                    {
+                        "label": "Operations Database",
+                        "ok": False,
+                        "text": f"⚠️ Operations storage is nearing capacity (`{operations_size:.0f} MB`).",
+                    }
+                )
+        except Exception:
+            findings.append(
+                {
+                    "label": "Operations Database",
+                    "ok": False,
+                    "text": "⚠️ Dedicated operations storage could not be measured.",
+                }
+            )
     # ── Whitelist mode with nothing whitelisted ───────────────────────────────
     if config.get("group_whitelist_mode", "blacklist") == "whitelist":
         try:
@@ -203,21 +238,32 @@ async def check_known_issues(client, config):
             pass
 
     # ── Verification gate stacking ────────────────────────────────────────────
-    gates_active = []
-    if config.get("fsub_channels"):
-        gates_active.append("Main FSub")
-    if config.get("req_fsub_channels"):
-        gates_active.append("Request-FSub")
-    if len([c for c in config.get("two_stage_channels", []) if c]) >= 2:
-        gates_active.append("Two-Stage Verification")
-    if len(gates_active) >= 2:
+    gates = get_access_gates(config)
+    invalid_gates = [
+        (gate, access_gate_health(gate)[1])
+        for gate in gates
+        if not access_gate_health(gate)[0]
+    ]
+    if invalid_gates:
         findings.append(
             {
-                "label": "Verification Gates",
+                "label": "Access Gates",
+                "ok": False,
+                "text": "⚠️ Invalid access gate configuration: "
+                + "; ".join(
+                    f"{gate.get('id') or 'missing ID'} ({reason})"
+                    for gate, reason in invalid_gates
+                ),
+            }
+        )
+
+    if db.operations_db is None:
+        findings.append(
+            {
+                "label": "Operations Database",
                 "ok": None,
-                "text": f"ℹ️ {len(gates_active)} verification gates are active at once "
-                f"({', '.join(gates_active)}) — a new user may face multiple "
-                f"join-and-confirm steps for one file.",
+                "text": "ℹ️ OPERATIONS_DATABASE_URI is not set. Control data and the file registry "
+                "still use a movie cluster; a dedicated operations database is recommended.",
             }
         )
 
@@ -261,7 +307,13 @@ async def run_health_monitor(client):
     Sends green heartbeat every 6 hours when all is well.
     """
     while True:
+        sleep_started = time.monotonic()
         await asyncio.sleep(600)  # 10 minutes
+        loop_lag_ms = max(0, int((time.monotonic() - sleep_started - 600) * 1000))
+        set_workload_gauge("event_loop_lag_latest_ms", loop_lag_ms)
+        if loop_lag_ms >= 1000:
+            record_workload_metric("event_loop_lag_slow_intervals")
+            logger.warning("event_loop_lag_ms %s", loop_lag_ms)
 
         ready_file = Path(os.getenv("SESSION_WORKDIR", "runtime")) / "ready"
         try:
@@ -272,6 +324,7 @@ async def run_health_monitor(client):
         issues = []
         logger.info("workload_metrics %s", workload_snapshot())
         logger.info("telegram_retry_metrics %s", telegram_retry_snapshot())
+        logger.info("shard_router %s", db.shard_health_snapshot())
         try:
             logger.info(
                 "notification_outbox_depth %s",
@@ -284,6 +337,10 @@ async def run_health_monitor(client):
             )
 
         # ── 1. Ping all clusters ──────────────────────────────────────────────
+        try:
+            await db.probe_shards()
+        except Exception as exc:
+            logger.warning("Shard health probe failed: %s", type(exc).__name__)
         for i, db_instance in enumerate(db.dbs):
             key = f"cluster_{i + 1}_down"
             try:
@@ -303,6 +360,23 @@ async def run_health_monitor(client):
                         f"🚨 **#HealthAlert — Cluster {i + 1} Down**\n\n"
                         f"MongoDB Cluster {i + 1} is not responding.\n"
                         f"Reference: `{reference}`",
+                    )
+
+        if db.operations_db is not None:
+            key = "operations_database_down"
+            try:
+                await db.operations_db.command("ping")
+                if key in _last_alert:
+                    await _clear_alert(key)
+                    await send_smart_log(client, "✅ **#OperationsRecovered**\n\nOperations database is back online.")
+            except Exception as error:
+                reference = report_internal_error(logger, "operations_health", error)
+                issues.append(f"Operations database unreachable ({reference})")
+                if await _should_alert(key):
+                    await send_smart_log(
+                        client,
+                        "🚨 **#HealthAlert — Operations Database Down**\n\n"
+                        f"File registration and control writes are unavailable.\nReference: `{reference}`",
                     )
 
         # ── 2. Check for stale indexer tasks ──────────────────────────────────
@@ -440,6 +514,7 @@ async def process_deletion_job(client, job):
 
 @Client.on_callback_query(filters.regex(r"^retry_deletion#") & filters.user(ADMIN_ID))
 async def retry_dead_letter_callback(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback)
     job_id = callback.data.split("#", 1)[1]
     retried = await db.retry_dead_letter_deletion(job_id)
     if not retried:

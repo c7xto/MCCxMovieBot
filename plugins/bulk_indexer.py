@@ -23,6 +23,7 @@ from plugins.index_progress import IndexProgress
 from plugins.retry import retry_with_backoff
 from plugins.telegram_retry import BACKGROUND_RETRY, INTERACTIVE_RETRY, telegram_call
 from plugins.task_supervisor import TaskConflict, supervisor
+from plugins.workload import background_turn
 
 logger = logging.getLogger(__name__)
 _active_indexes = {}
@@ -155,6 +156,7 @@ async def run_indexer(client: Client, status_message: Message, chat_id: int, las
             message_ids = list(range(current_id, end_id + 1))
             batch_files = []
             try:
+                await background_turn("bulk_index_telegram_read")
                 messages = await telegram_call(
                     lambda: client.get_messages(chat_id, message_ids),
                     route="bulk_index_messages",
@@ -201,6 +203,7 @@ async def run_indexer(client: Client, status_message: Message, chat_id: int, las
             new_saves = dups = 0
             try:
                 if batch_files:
+                    await background_turn("bulk_index_database_write")
                     new_saves, dups = await retry_with_backoff(
                         lambda: db.save_files_bulk(batch_files),
                         attempts=4,
@@ -241,6 +244,7 @@ async def run_indexer(client: Client, status_message: Message, chat_id: int, las
                 return
 
             try:
+                await background_turn("bulk_index_checkpoint")
                 await retry_with_backoff(
                     lambda: db.set_index_progress(chat_id, end_id),
                     attempts=3,

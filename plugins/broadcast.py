@@ -192,6 +192,7 @@ async def bc_confirm(client: Client, callback: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^bc_cancel$") & filters.user(ADMIN_ID))
 async def bc_cancel(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback)
     _pending_broadcasts.pop(callback.message.chat.id, None)
     await callback.message.edit_text("❌ **Broadcast cancelled.**")
     await answer_callback_safely(callback)

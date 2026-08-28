@@ -66,13 +66,24 @@ async def authorize_user_action(
 
 async def enforce_user_action(event, action: str, config: dict | None = None) -> AccessDecision:
     """Authorize an event and render its denial through the matching UI API."""
+    is_callback = hasattr(event, "answer") and getattr(event, "message", None) is not None
+    if is_callback:
+        # This is deliberately the first awaitable operation. Telegram gives
+        # callback queries a short lifetime; database policy checks must never
+        # hold the button spinner open.
+        from plugins.callbacks import answer_callback_safely
+
+        await answer_callback_safely(event)
+
     user = getattr(event, "from_user", None)
     decision = await authorize_user_action(getattr(user, "id", None), action, config)
     if decision.allowed:
         return decision
 
-    if hasattr(event, "answer") and getattr(event, "message", None) is not None:
-        await event.answer((decision.message or "Action denied.")[:180], show_alert=True)
+    if is_callback:
+        # The callback was already acknowledged above. Render the outcome as a
+        # normal message instead of attempting a second callback answer.
+        await event.message.reply_text(decision.message or "Action denied.", reply_parameters=None)
     elif hasattr(event, "reply_text"):
         await event.reply_text(decision.message or "Action denied.", reply_parameters=None)
     return decision

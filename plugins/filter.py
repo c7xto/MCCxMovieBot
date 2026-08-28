@@ -27,25 +27,18 @@ from plugins.workload import (
     WorkloadRejected,
     delivery_guard,
     enforce_search_rate_limits,
+    interactive_slot,
+    interactive_callback,
     search_slot,
     validate_search_query,
 )
 from plugins.telegram_retry import DELIVERY_RETRY, INTERACTIVE_RETRY, telegram_call
 from plugins.task_supervisor import TaskConflict, supervisor
 from utils import (
-    get_subscription_status_by_id,
-    send_fsub_message,
-    _parse_fsub_entry,
     _no_preview,
     _html,
     callback_data,
     html_user_mention,
-)
-from verification import (
-    VerificationResult,
-    VerificationStatus,
-    check_channel_membership,
-    verification_unavailable_message,
 )
 
 load_dotenv()
@@ -807,13 +800,6 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
         return
     config = access.config
 
-    subscription = await get_subscription_status_by_id(client, user_id, config)
-    if subscription.status is VerificationStatus.INDETERMINATE:
-        return await message.reply_text(verification_unavailable_message(subscription), reply_parameters=None)
-    if subscription.status is VerificationStatus.DENY:
-        await send_fsub_message(client, message)
-        return
-
     if manual_query:
         query = manual_query
     else:
@@ -935,6 +921,7 @@ async def auto_filter(client: Client, message: Message, manual_query=None):
 
 
 @Client.on_callback_query(filters.regex(r"^page#"))
+@interactive_callback("search_pagination")
 async def handle_pagination(client: Client, callback: CallbackQuery):
     if not (await enforce_user_action(callback, "search_navigation")).allowed:
         return
@@ -957,6 +944,7 @@ async def handle_pagination(client: Client, callback: CallbackQuery):
 
 
 @Client.on_callback_query(filters.regex(r"^expandseries#"))
+@interactive_callback("series_expansion")
 async def handle_expand_series(client: Client, callback: CallbackQuery):
     if not (await enforce_user_action(callback, "search_navigation")).allowed:
         return
@@ -976,6 +964,7 @@ async def handle_expand_series(client: Client, callback: CallbackQuery):
 
 
 @Client.on_callback_query(filters.regex(r"^filtermenu#"))
+@interactive_callback("search_filter_menu")
 async def show_filter_menu(client: Client, callback: CallbackQuery):
     if not (await enforce_user_action(callback, "search_navigation")).allowed:
         return
@@ -1023,6 +1012,7 @@ async def show_filter_menu(client: Client, callback: CallbackQuery):
 
 
 @Client.on_callback_query(filters.regex(r"^applyfilter#"))
+@interactive_callback("search_filter_apply")
 async def apply_result_filter(client: Client, callback: CallbackQuery):
     if not (await enforce_user_action(callback, "search_navigation")).allowed:
         return
@@ -1043,6 +1033,7 @@ async def apply_result_filter(client: Client, callback: CallbackQuery):
 
 
 @Client.on_callback_query(filters.regex(r"^clearfilters#"))
+@interactive_callback("search_filter_clear")
 async def clear_result_filters(client: Client, callback: CallbackQuery):
     if not (await enforce_user_action(callback, "search_navigation")).allowed:
         return
@@ -1067,218 +1058,49 @@ async def handle_ignore(client: Client, callback: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^sendfile#"))
 async def send_movie_file(client: Client, callback: CallbackQuery):
+    # Absolute first awaitable: release Telegram's callback spinner before
+    # policy, MongoDB, verification, or delivery work begins.
+    await answer_callback_safely(callback)
     if not (await enforce_user_action(callback, "file_delivery")).allowed:
         return
     _, file_obj_id = callback.data.split("#")
-    file_data = await db.get_file(file_obj_id)
+    async with interactive_slot("file_delivery_callback"):
+        file_data = await db.get_file(file_obj_id)
 
-    if not file_data:
-        return await answer_callback_safely(callback, "⚠️ File no longer available.", show_alert=True)
-
-    if not await check_verification_gates(client, callback, file_obj_id):
-        return
-
-    access = await enforce_user_action(callback, "file_delivery")
-    if not access.allowed:
-        return
-
-    guard = delivery_guard(callback.from_user.id, file_obj_id)
-    try:
-        await guard.__aenter__()
-    except WorkloadRejected as exc:
-        return await answer_callback_safely(callback, exc.public_message, show_alert=True)
-
-    await answer_callback_safely(callback, "📤 Sending file...", show_alert=False)
-
-    config = access.config
-    delete_seconds = int(config.get("auto_delete_time", 300))
-    delete_minutes = delete_seconds // 60
-
-    try:
-        sent = await telegram_call(
-            lambda: client.send_cached_media(
-                chat_id=callback.message.chat.id,
-                file_id=file_data["file_id"],
-                caption=_build_caption(config, file_data, delete_minutes, client.me.username),
-                parse_mode=ParseMode.HTML,
-            ),
-            route="file_delivery_callback",
-            policy=DELIVERY_RETRY,
-            retry_safe=True,
-            idempotency_key=f"{callback.from_user.id}:{file_obj_id}",
-        )
-        await _auto_delete_file(sent, file_data["file_name"], client.me.username, delete_seconds)
-    except (
-        FileIdInvalid,
-        FileReferenceEmpty,
-        FileReferenceExpired,
-        FileReferenceInvalid,
-        MediaEmpty,
-        MediaInvalid,
-    ) as e:
-        await db.delete_file_by_id(file_data["file_id"])
-        unavailable_title, unavailable_year = _display_title(file_data["file_name"])
-        unavailable_name = (
-            f"{unavailable_title} ({unavailable_year})" if unavailable_year else unavailable_title
-        )
-        await callback.message.reply_text(
-            f"❌ <b>File unavailable</b>\n\n"
-            f"{_html(unavailable_name)} is no longer valid. "
-            f"It was removed from the index; please search again.",
-            parse_mode=ParseMode.HTML,
-        )
-        logger.warning("Removed invalid cached file %s: %s", file_data["file_id"], e)
-    except Exception as e:
-        await callback.message.reply_text("❌ Could not send this file right now. Please try again.")
-        logger.error(f"send_cached_media failed: {e}")
-    finally:
-        await guard.__aexit__(None, None, None)
-
-
-async def _fsub_membership(client, channel_id, user_id) -> VerificationResult:
-    """Return the shared tri-state membership result for legacy FSub UI."""
-    return await check_channel_membership(client, channel_id, user_id)
-
-
-@Client.on_callback_query(filters.regex(r"^check_fsub#"))
-async def check_fsub_callback(client: Client, callback: CallbackQuery):
-    if not (await enforce_user_action(callback, "verification")).allowed:
-        return
-    file_part = callback.data.split("#")[1]
-    pending_file_id = file_part if file_part != "none" else None
-
-    config = await db.get_config()
-    channels = config.get("fsub_channels", [])
-    user_id = callback.from_user.id
-
-    # Parse first, preserving each channel's original 1-based position (i)
-    # in `channels` for the "Channel {i}" fallback name below, exactly as
-    # the old sequential loop did.
-    valid = []
-    for i, entry in enumerate(channels, 1):
-        channel_id, _ = _parse_fsub_entry(entry)
-        if channel_id:
-            valid.append((i, entry, channel_id))
-
-    # Membership checks are independent Telegram API calls — run them
-    # concurrently instead of one at a time.
-    membership_results = (
-        await asyncio.gather(
-            *[_fsub_membership(client, channel_id, user_id) for _, _, channel_id in valid],
-            return_exceptions=True,
-        )
-        if valid
-        else []
-    )
-
-    indeterminate = next(
-        (
-            result
-            for result in membership_results
-            if isinstance(result, BaseException) or result.status is VerificationStatus.INDETERMINATE
-        ),
-        None,
-    )
-    if indeterminate is not None:
-        result = (
-            VerificationResult.indeterminate("membership_task_error")
-            if isinstance(indeterminate, BaseException)
-            else indeterminate
-        )
-        logger.warning("verification_indeterminate gate=legacy_fsub reason=%s", result.reason)
-        return await answer_callback_safely(
-            callback, verification_unavailable_message(result), show_alert=True
-        )
-
-    remaining = []
-    link_error = False
-    for (i, entry, channel_id), membership in zip(valid, membership_results):
-        if membership.status is VerificationStatus.PASS:
-            continue  # already joined
-
-        # Same join-link resolution as utils.send_fsub_message.
-        try:
-            ch_str = str(channel_id).strip()
-            stored_link = entry.get("link") if isinstance(entry, dict) else None
-            if ch_str.startswith("@"):
-                link = f"https://t.me/{ch_str[1:]}"
-            elif stored_link and not stored_link.startswith("tg://"):
-                link = stored_link
-            elif ch_str.startswith("-100"):
-                link = await client.export_chat_invite_link(int(ch_str))
-                await db.update_fsub_channel_link(channel_id, link)
-            elif ch_str.startswith("http"):
-                link = ch_str
-            else:
-                link = f"https://t.me/{ch_str}"
-        except Exception as e:
-            logger.warning(f"Could not build FSub join link for {channel_id}: {e}")
-            link_error = True
-            continue
-
-        try:
-            chat = await client.get_chat(int(ch_str) if ch_str.lstrip("-").isdigit() else ch_str)
-            ch_name = (getattr(chat, "title", None) or f"Channel {i}")[:30]
-        except Exception:
-            ch_name = f"Channel {i}"
-        remaining.append([InlineKeyboardButton(f"📢 Join {ch_name}", url=link)])
-
-    if link_error:
-        logger.warning("verification_indeterminate gate=legacy_fsub reason=join_link")
-        return await answer_callback_safely(callback, verification_unavailable_message(), show_alert=True)
-
-    if remaining:
-        remaining.append(
-            [InlineKeyboardButton("✅ I've Joined — Check Now", callback_data=f"check_fsub#{file_part}")]
-        )
-        await answer_callback_safely(
-            callback, f"❌ Still need to join {len(remaining) - 1} channel(s).", show_alert=True
-        )
-        try:
-            await callback.message.edit_reply_markup(InlineKeyboardMarkup(remaining))
-        except Exception:
-            pass
-        return
-
-    access = await enforce_user_action(callback, "file_delivery")
-    if not access.allowed:
-        return
-    await answer_callback_safely(callback, "✅ Verified! Sending your file...", show_alert=False)
-    chat_id = callback.message.chat.id
-    try:
-        await callback.message.delete()
-    except Exception:
-        pass
-
-    if pending_file_id:
-        file_data = await db.get_file(pending_file_id)
         if not file_data:
-            await client.send_message(chat_id, "✅ Verified! But the file is no longer available.")
+            await callback.message.reply_text("⚠️ File no longer available. Please search again.")
             return
 
-        guard = delivery_guard(user_id, pending_file_id)
+        if not await check_verification_gates(client, callback, file_obj_id):
+            return
+
+        access = await enforce_user_action(callback, "file_delivery")
+        if not access.allowed:
+            return
+
+        guard = delivery_guard(callback.from_user.id, file_obj_id)
         try:
             await guard.__aenter__()
         except WorkloadRejected as exc:
-            await client.send_message(chat_id, exc.public_message)
+            await callback.message.reply_text(exc.public_message)
             return
 
-        cfg = access.config
-        delete_seconds = int(cfg.get("auto_delete_time", 300))
+        config = access.config
+        delete_seconds = int(config.get("auto_delete_time", 300))
         delete_minutes = delete_seconds // 60
 
         try:
             sent = await telegram_call(
                 lambda: client.send_cached_media(
-                    chat_id=chat_id,
+                    chat_id=callback.message.chat.id,
                     file_id=file_data["file_id"],
-                    caption=_build_caption(cfg, file_data, delete_minutes, client.me.username),
+                    caption=_build_caption(config, file_data, delete_minutes, client.me.username),
                     parse_mode=ParseMode.HTML,
                 ),
-                route="file_delivery_legacy_fsub",
+                route="file_delivery_callback",
                 policy=DELIVERY_RETRY,
                 retry_safe=True,
-                idempotency_key=f"{user_id}:{pending_file_id}",
+                idempotency_key=f"{callback.from_user.id}:{file_obj_id}",
             )
             await _auto_delete_file(sent, file_data["file_name"], client.me.username, delete_seconds)
         except (
@@ -1290,17 +1112,53 @@ async def check_fsub_callback(client: Client, callback: CallbackQuery):
             MediaInvalid,
         ) as e:
             await db.delete_file_by_id(file_data["file_id"])
-            await client.send_message(chat_id, "❌ File unavailable. Please search again.")
+            unavailable_title, unavailable_year = _display_title(file_data["file_name"])
+            unavailable_name = (
+                f"{unavailable_title} ({unavailable_year})" if unavailable_year else unavailable_title
+            )
+            await callback.message.reply_text(
+                f"❌ <b>File unavailable</b>\n\n"
+                f"{_html(unavailable_name)} is no longer valid. "
+                f"It was removed from the index; please search again.",
+                parse_mode=ParseMode.HTML,
+            )
             logger.warning("Removed invalid cached file %s: %s", file_data["file_id"], e)
         except Exception as e:
-            await client.send_message(chat_id, "❌ Could not send file right now. Try again.")
-            logger.error("FSub delivery failed: %s", e)
+            await callback.message.reply_text("❌ Could not send this file right now. Please try again.")
+            logger.error(f"send_cached_media failed: {e}")
         finally:
             await guard.__aexit__(None, None, None)
-    else:
+
+
+@Client.on_callback_query(filters.regex(r"^check_fsub#"))
+async def check_fsub_callback(client: Client, callback: CallbackQuery):
+    """One-release bridge for old buttons; always use the unified gate path."""
+    await answer_callback_safely(callback)
+    if not (await enforce_user_action(callback, "verification")).allowed:
+        return
+    file_part = callback.data.split("#", 1)[1]
+    pending_file_id = file_part if file_part != "none" else None
+    chat_id = callback.message.chat.id
+    if not pending_file_id:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
         await client.send_message(
             chat_id,
-            "✅ **Verification Successful!**\n\n"
-            "<blockquote>You're all set! Type any movie name to search.</blockquote>",
+            "🔎 <b>Search is ready</b>\n\nType a movie or series name. Access is checked when you choose a file.",
             parse_mode=ParseMode.HTML,
         )
+        return
+
+    passed = await check_verification_gates(client, callback, pending_file_id)
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    if not passed:
+        return
+
+    from plugins.req_fsub import _deliver_file
+
+    await _deliver_file(client, chat_id, callback.from_user.id, pending_file_id)

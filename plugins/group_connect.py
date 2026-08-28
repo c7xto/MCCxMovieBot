@@ -23,6 +23,7 @@ from plugins.task_supervisor import TaskConflict, supervisor
 from plugins.workload import (
     WorkloadRejected,
     enforce_search_rate_limits,
+    interactive_callback,
     search_slot,
     validate_search_query,
 )
@@ -407,6 +408,7 @@ async def group_search(client: Client, message: Message):
 
 
 @Client.on_callback_query(filters.regex(r"^grppage#"))
+@interactive_callback("group_search_pagination")
 async def handle_group_pagination(client: Client, callback: CallbackQuery):
     if not (await enforce_user_action(callback, "search_navigation")).allowed:
         return

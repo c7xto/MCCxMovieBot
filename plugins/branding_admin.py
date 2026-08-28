@@ -74,6 +74,7 @@ async def file_branding_menu(client, callback, *, answer=True):
 
 @Client.on_callback_query(filters.regex(r"^file_branding_toggle$") & filters.user(ADMIN_ID))
 async def file_branding_toggle(client, callback):
+    await answer_callback_safely(callback)
     config = await db.get_config()
     enabled = bool(config.get("file_branding_enabled"))
     if not enabled and not int(config.get("file_branding_channel_id", 0) or 0):

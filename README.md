@@ -27,6 +27,10 @@ Premium plans and web streaming are deliberately outside this project's current 
 
 - `file_registry` prevents duplicate Telegram file IDs across clusters. New files also use Telegram's stable content identity when available.
 - Bulk writes distinguish complete success, partial success, duplicates and genuine retryable failures.
+- Live searches and file delivery take priority over each bounded indexer batch without starving background work.
+- Every Telegram button is acknowledged before database or membership checks, preventing stale callback errors.
+- Access gates use a TTL-backed verification cache and a short grace window for temporary Telegram failures.
+- An optional dedicated operations database keeps configuration, checkpoints and the cross-cluster registry away from movie-shard capacity limits.
 - The primary MongoDB cluster is required at startup; optional clusters degrade independently.
 - Search sessions are bounded and expire automatically.
 - Message deletions use a persistent MongoDB queue, so restarts do not cancel them.
@@ -84,11 +88,16 @@ docker compose logs -f bot
 | `BOT_TOKEN` | BotFather token |
 | `ADMIN_ID` | One or more comma-separated numeric admin IDs |
 | `DATABASE_URI` | Required primary MongoDB cluster |
+| `OPERATIONS_DATABASE_URI` | Optional dedicated database for settings, users, registry, caches and job checkpoints |
 
 `DATABASE_URI_2` through `DATABASE_URI_5` are optional. Channel IDs,
 community links and the TMDB API Read Access Token (`TMDB_BEARER_TOKEN`) are
 documented in `.env.example`; most presentation and access settings can then
 be managed live through `/admin`.
+
+When `OPERATIONS_DATABASE_URI` is added, startup copies operational data in
+resumable batches, validates the copy, and leaves the old data untouched. Do
+not point it at a movie shard if you want true storage isolation.
 
 ## File branding
 
@@ -143,7 +152,7 @@ overwrite an existing plaintext file.
 ## First deployment checklist
 
 1. Add the bot as an administrator in the log and database channels.
-2. Open `/admin` → **System** → **Channel Check**.
+2. Open `/admin` → **Health & System** → **Channel Check**.
 3. Configure source and required-subscription channels.
 4. Forward a storage-channel message to the bot to begin bulk indexing.
 5. Run `python tools/migrate_registry.py` once if upgrading an older database.
@@ -162,7 +171,7 @@ dependencies. The GitHub Actions workflow runs the same gate in a clean Python
 ## Important operational notes
 
 - New rows use indexed title tokens; older libraries automatically keep the compatible reference-bot search, with bounded RapidFuzz typo correction. No large database rewrite is required for an update.
-- Duplicate cleanup is report-only in this release. Exact copies and probable matches are shown separately, and language, quality, codec, size, season and episode variants are preserved.
+- Duplicate scans start in report-only mode. Verified exact copies can be removed only after a separate admin confirmation; probable matches are never auto-deleted, and language, quality, codec, size, season and episode variants are preserved.
 - Broadcast source messages must remain available in the administrator chat until a scheduled job completes.
 - Use only media you are legally authorized to distribute and follow Telegram and hosting-provider rules.
 
