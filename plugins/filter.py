@@ -129,6 +129,11 @@ _QUAL_RES = [(quality, _attribute_regex(quality)) for quality in QUALITIES]
 def extract_attributes(filename):
     normalized = re.sub(r"[._\-–—]+", " ", filename)
     lang = next((l for l, pat in _LANG_RES if pat.search(normalized)), "Other")
+    if lang == "Other":
+        if re.search(r"\bmulti(?:\s*audio)?\b", normalized, re.IGNORECASE):
+            lang = "Multi Audio"
+        elif re.search(r"\bdual(?:\s*audio)?\b", normalized, re.IGNORECASE):
+            lang = "Dual Audio"
     qual = next((q for q, pat in _QUAL_RES if pat.search(normalized)), "Other")
     if qual.lower() == "hdrip":
         qual = "HD Rip"
@@ -256,19 +261,12 @@ def _display_title(filename: str) -> tuple:
     presentation only (button labels / delivered-file captions) — never
     touches the stored file_name.
 
-    Walks the filename's tokens backward from the end, classifying each
-    trailing token (or 2-token phrase, for "Dual Audio"/"HD Rip"-style
-    entries) as quality/language/year/codec metadata, and stops at the
-    first token (from the end) that isn't recognized — everything up to
-    and including that token is the real title. This checks the whole
-    trailing run rather than "does a marker appear anywhere in the
-    filename", so a title that merely *contains* a language/quality word
-    ("The Malayalam Movie") is never truncated mid-title — a cut only
-    happens once the marker is genuinely part of an unbroken metadata tail
-    at the end of the string. Season/episode markers (S01E01 etc.) are
-    deliberately never classified as metadata, so they stay part of the
-    title for series files — otherwise every episode of a show would
-    render an identical caption/label with no way to tell them apart.
+    An unwrapped release year is treated as the strongest movie-title
+    boundary. This is important for real release names whose suffix ends in
+    an unknown uploader tag: one unfamiliar word must not make the whole
+    ``1080p WEB-DL ...`` tail leak back into the visible title. Filenames
+    without that boundary still use the conservative backward metadata
+    walk. Season/episode markers (S01E01 etc.) remain part of series titles.
     """
     # Promotional handles and URLs are never useful to a user choosing a
     # file. Remove them before the extension so ``movie.mkv @channel`` also
@@ -293,10 +291,26 @@ def _display_title(filename: str) -> tuple:
     norm = _TITLE_SEP_RE.sub(" ", name)
     tokens = [t for t in _TITLE_WS_RE.split(norm) if t]
 
-    i = len(tokens)
-    year_consumed = False
-    metadata_consumed = False
-    while i > 0:
+    year_positions = [index for index, token in enumerate(tokens) if _is_year_token(token)]
+    release_year_index = None
+    numeric_title_only = False
+    if year_positions:
+        if len(year_positions) > 1:
+            release_year_index = year_positions[-1]
+        elif year_positions[0] > 0:
+            release_year_index = year_positions[0]
+        else:
+            # ``1917 1080p`` is a numeric title with no separate release
+            # year. Keep 1917 as the title while still discarding its tail.
+            numeric_title_only = True
+
+    i = release_year_index if release_year_index is not None else len(tokens)
+    year_consumed = release_year_index is not None
+    metadata_consumed = release_year_index is not None or numeric_title_only
+    if numeric_title_only:
+        i = 1
+
+    while release_year_index is None and not numeric_title_only and i > 0:
         if i >= 2:
             phrase = _metadata_key(f"{tokens[i - 2]} {tokens[i - 1]}")
             if phrase in _QUALITY_LOWER or phrase in _LANGUAGE_LOWER:
@@ -361,6 +375,8 @@ def _display_title(filename: str) -> tuple:
         year = paren_year
     else:
         year = next((t for t in tail_tokens if _is_year_token(t)), "")
+        if numeric_title_only:
+            year = ""
 
     clean_fallback = _TITLE_WS_RE.sub(" ", _TITLE_SEP_RE.sub(" ", name)).strip(" |")
     return (title or clean_fallback or filename.strip(), year)
@@ -522,7 +538,6 @@ def _build_results_caption(query: str, total: int, page: int, total_pages: int, 
         [
             "",
             f"📁 <b>Files:</b> {total}  •  📚 <b>Page:</b> {page + 1} / {total_pages}",
-            "<i>Choose below by size, language and quality.</i>",
         ]
     )
     return "\n".join(lines)

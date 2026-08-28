@@ -130,6 +130,24 @@ def test_release_platform_is_not_mistaken_for_movie_title():
     assert len(label) <= 52
 
 
+def test_real_release_group_suffix_cannot_leak_into_movie_title():
+    file_doc = {
+        "file_name": (
+            "Balan The Boy 2026 1080p ZEE5 WEB DL MULTi "
+            "DDP5 1 H 264 PMi XDMovies mkv"
+        ),
+        "file_size": 2_842_513_107,
+    }
+    label = _flat_file_label(file_doc)
+    assert label == "[2.65 GB] Balan The Boy (2026) • Multi Audio • 1080p"
+    assert "ZEE5" not in label
+    assert "XDMovies" not in label
+
+
+def test_numeric_movie_title_is_not_mistaken_for_release_year():
+    assert _display_title("1917 1080p WEB DL x264 mkv") == ("1917", "")
+
+
 def test_listing_name_removes_brackets_extension_and_promotional_url():
     name, episode = _listing_name(
         "[Reacher].S2E8.English+WEB-DL.#x265| https://t.me/spam mkv"
@@ -161,7 +179,7 @@ def test_results_caption_contains_shared_count_and_page_header():
     assert "Files:</b> 152" in caption
     assert "Page:</b> 1 / 16" in caption
     assert "👤 <b>7</b>" in caption
-    assert "Choose below by size, language and quality" in caption
+    assert "Choose below" not in caption
 
 
 def test_movie_results_sort_from_largest_to_smallest():

@@ -17,17 +17,21 @@ async def answer_callback_safely(callback, text=None, *, show_alert=False) -> bo
     # A callback query can be answered only once.  Mark it locally so nested
     # policy/verification helpers do not make a second Telegram request and
     # create QUERY_ID_INVALID noise after the UI lock has already been freed.
-    callback_key = str(getattr(callback, "id", "") or id(callback))
-    if getattr(callback, "_mccx_answered", False) or callback_key in _answered_callback_ids:
+    telegram_callback_id = getattr(callback, "id", "")
+    callback_key = f"telegram:{telegram_callback_id}" if telegram_callback_id else None
+    if getattr(callback, "_mccx_answered", False) or (
+        callback_key is not None and callback_key in _answered_callback_ids
+    ):
         if text and show_alert and getattr(callback, "message", None) is not None:
             # Telegram cannot show a second popup after the early ACK. Preserve
             # important error feedback as a normal chat message instead.
             await callback.message.reply_text(str(text), reply_parameters=None)
         return True
-    _answered_callback_ids[callback_key] = None
-    _answered_callback_ids.move_to_end(callback_key)
-    while len(_answered_callback_ids) > _MAX_ANSWERED_CALLBACKS:
-        _answered_callback_ids.popitem(last=False)
+    if callback_key is not None:
+        _answered_callback_ids[callback_key] = None
+        _answered_callback_ids.move_to_end(callback_key)
+        while len(_answered_callback_ids) > _MAX_ANSWERED_CALLBACKS:
+            _answered_callback_ids.popitem(last=False)
     started = time.monotonic()
     try:
         await callback.answer(text, show_alert=show_alert)
@@ -56,5 +60,6 @@ async def answer_callback_safely(callback, text=None, *, show_alert=False) -> bo
     except Exception:
         # A transport error may occur before Telegram receives the answer;
         # permit an explicit retry instead of treating it as acknowledged.
-        _answered_callback_ids.pop(callback_key, None)
+        if callback_key is not None:
+            _answered_callback_ids.pop(callback_key, None)
         raise
