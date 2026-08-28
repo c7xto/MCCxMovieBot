@@ -88,10 +88,10 @@ async def send_request_ticket(client, user, movie_name, message_obj, is_callback
     USER_REQUEST_COOLDOWN.move_to_end(user.id)
 
     config = access.config
-    log_channel = config.get("log_channel", 0)
+    request_channel = config.get("request_channel_id") or config.get("log_channel", 0)
 
-    if not log_channel:
-        return await message_obj.reply_text("Request system is currently offline — log channel not set.")
+    if not request_channel:
+        return await message_obj.reply_text("Request system is currently offline — request inbox not set.")
 
     ticket_text = (
         "🎫 <b>New Movie Request</b>\n\n"
@@ -115,12 +115,16 @@ async def send_request_ticket(client, user, movie_name, message_obj, is_callback
         access = await authorize_user_action(user.id, "request")
         if not access.allowed:
             return await message_obj.reply_text(access.message or "Action denied.")
-        log_channel = access.config.get("log_channel", 0)
-        if not log_channel:
-            return await message_obj.reply_text("Request system is currently offline — log channel not set.")
+        request_channel = access.config.get("request_channel_id") or access.config.get(
+            "log_channel", 0
+        )
+        if not request_channel:
+            return await message_obj.reply_text(
+                "Request system is currently offline — request inbox not set."
+            )
         await telegram_call(
             lambda: client.send_message(
-                chat_id=log_channel,
+                chat_id=request_channel,
                 text=ticket_text,
                 reply_markup=markup,
                 parse_mode=ParseMode.HTML,

@@ -196,7 +196,7 @@ async def _do_post(client: Client, filename: str):
 
     buttons = [[InlineKeyboardButton(btn_text, url=bot_url)]]
     if main_group:
-        buttons[0].append(InlineKeyboardButton("👥 Join Group", url=main_group))
+        buttons[0].append(InlineKeyboardButton("💬 Request Group", url=main_group))
 
     markup = InlineKeyboardMarkup(buttons)
 
@@ -242,24 +242,12 @@ async def _do_post(client: Client, filename: str):
 async def index_new_files(client: Client, message: Message):
     # Always read db_channels from MongoDB so admin panel additions work instantly
     config = await db.get_config()
-    branding_channel = int(config.get("file_branding_channel_id", 0) or 0)
     db_channels = list(config.get("db_channels", []))
 
     # Also honour the .env DATABASE_CHANNEL_ID as a permanent fallback
     env_db = int(os.getenv("DATABASE_CHANNEL_ID", 0) or 0)
     if env_db and env_db not in db_channels:
         db_channels.append(env_db)
-
-    # Uploads created by the branding worker are already represented by the
-    # source row it switches. A conflicting configuration must still index the
-    # source safely, so only ignore a dedicated cache channel.
-    branding_channel_is_source = branding_channel in db_channels
-    if (
-        branding_channel
-        and message.chat.id == branding_channel
-        and not branding_channel_is_source
-    ):
-        return
 
     if message.chat.id not in db_channels:
         return
@@ -268,15 +256,7 @@ async def index_new_files(client: Client, message: Message):
     if not media or not hasattr(media, "file_name") or not media.file_name:
         return
 
-    branding_requested = bool(
-        config.get("file_branding_enabled")
-        and branding_channel
-        and not branding_channel_is_source
-    )
-    success, return_msg = await db.save_file(
-        media,
-        branding_status="pending" if branding_requested else None,
-    )
+    success, return_msg = await db.save_file(media)
 
     # Log to the channel stored in MongoDB — stays in sync with admin panel changes
     log_channel = config.get("log_channel", 0)
@@ -319,43 +299,9 @@ async def index_new_files(client: Client, message: Message):
             logger.info("Realtime capacity log skipped during shutdown")
 
     if success:
-        branding_queued = False
-        if branding_requested:
-            try:
-                await db.enqueue_file_branding(
-                    {
-                        "source_chat_id": message.chat.id,
-                        "source_message_id": message.id,
-                        "source_file_id": media.file_id,
-                        "source_unique_id": getattr(media, "file_unique_id", "") or "",
-                        "original_file_name": media.file_name,
-                        "file_size": getattr(media, "file_size", 0) or 0,
-                        "mime_type": getattr(media, "mime_type", "") or "",
-                    }
-                )
-                branding_queued = True
-            except Exception as error:
-                await db.set_file_branding_status(media.file_id, "fallback")
-                reference = report_internal_error(
-                    logger,
-                    "branding_enqueue",
-                    error,
-                    source_message_id=message.id,
-                )
-                await send_smart_log(
-                    client,
-                    "⚠️ **#FileBrandingQueue**\n\n"
-                    "The original file remains searchable and usable.\n"
-                    f"Reference: `{reference}`",
-                )
-
-        # Branded files are announced only after their replacement upload is
-        # verified. If branding is off or could not be queued, preserve the
-        # existing immediate-notification behavior.
-        if not branding_queued:
-            await _ensure_queue_worker(client)
-            await db.enqueue_announcement(media.file_name, delay_seconds=random.uniform(1.0, 3.0))
-            await db.enqueue_request_fulfillment(media.file_name, delay_seconds=random.uniform(1.0, 3.0))
+        await _ensure_queue_worker(client)
+        await db.enqueue_announcement(media.file_name, delay_seconds=random.uniform(1.0, 3.0))
+        await db.enqueue_request_fulfillment(media.file_name, delay_seconds=random.uniform(1.0, 3.0))
 
 
 async def _fulfill_matching_requests(client, file_name: str):

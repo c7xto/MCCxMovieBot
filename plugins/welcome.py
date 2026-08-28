@@ -39,8 +39,9 @@ async def welcome_new_member(client: Client, update: ChatMemberUpdated):
 
     config = await db.get_config()
     update_channel = config.get("update_channel") or config.get("update_channel_link", "")
-    # Read configured auto-delete time — respects admin panel setting
-    auto_delete_secs = int(config.get("auto_delete_time", 300))
+    group = await db.get_group(update.chat.id)
+    custom_delete = (group.get("settings", {}) if group else {}).get("auto_delete_time")
+    auto_delete_secs = int(custom_delete or config.get("auto_delete_time", 300))
     auto_delete_mins = max(1, auto_delete_secs // 60)
 
     buttons = []

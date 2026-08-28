@@ -112,7 +112,7 @@ async def _do_file_search(client, message_obj, query):
             [
                 [
                     InlineKeyboardButton("🗑 Delete", callback_data=f"fm_del#{obj_id}"),
-                    InlineKeyboardButton("✏ Rename", callback_data=f"fm_rename#{obj_id}"),
+                    InlineKeyboardButton("✏ Edit Search Name", callback_data=f"fm_rename#{obj_id}"),
                 ]
             ]
         )
@@ -147,7 +147,9 @@ async def fm_rename_prompt(client: Client, callback: CallbackQuery):
     await begin_prompt(
         callback,
         f"fm_rename#{obj_id}",
-        f"✏️ **Rename File**\n\nFile ID: `{obj_id}`\n\nSend the new searchable file name.",
+        f"✏️ **Edit Search Name**\n\nFile ID: `{obj_id}`\n\n"
+        "Send the new name used by search and result labels. This does not rename "
+        "the Telegram file users download.",
     )
 
 
@@ -156,7 +158,7 @@ async def fm_editname_prompt(client: Client, callback: CallbackQuery):
     await begin_prompt(
         callback,
         "fm_editname_id",
-        "✏️ **Edit File Name**\n\nSend the **File Object ID** from a file search result.",
+        "✏️ **Edit Search Name**\n\nSend the **File Object ID** from a file search result.",
     )
 
 
@@ -871,7 +873,8 @@ async def fm_input_handler(client: Client, message: Message):
             await client.edit_message_text(
                 context["prompt_chat_id"],
                 context["prompt_message_id"],
-                f"✏️ **Rename File**\n\nFile ID: `{obj_id}`\n\nSend the new searchable file name.",
+                f"✏️ **Edit Search Name**\n\nFile ID: `{obj_id}`\n\n"
+                "Send the new name used by search and result labels. The Telegram filename is unchanged.",
                 reply_markup=cancel_button(),
             )
 
@@ -884,7 +887,7 @@ async def fm_input_handler(client: Client, message: Message):
             await finish_prompt(
                 client,
                 admin_id,
-                f"✅ **File Renamed!**\n\nNew name: `{new_name}`",
+                f"✅ **Search Name Updated**\n\nNew searchable name: `{new_name}`",
                 back_callback="file_manager_menu",
                 back_label="‹ File Manager",
                 fallback_message=message,

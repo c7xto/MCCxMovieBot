@@ -82,9 +82,9 @@ async def get_admin_menu_data():
     config = await db.get_config()
     total_users, _, total_files, _, total_groups = await db.get_bot_stats()
 
-    fsub_count = len(config.get("fsub_channels", []))
+    gate_count = len(get_access_gates(config))
     fsub_status = (
-        f"✅ {fsub_count} channel{'s' if fsub_count != 1 else ''}" if fsub_count > 0 else "⚫ Disabled"
+        f"✅ {gate_count} gate{'s' if gate_count != 1 else ''}" if gate_count > 0 else "⚫ Disabled"
     )
 
     # config.get('log_channel') returns 0 when unset, and 0 is falsy — a naive
@@ -143,12 +143,10 @@ _CATEGORY_MENUS = {
     ),
     "appearance": (
         "🎨 **Appearance**",
-        "Customize welcome screens, captions and file branding.",
+        "Control the home screen and delivered-file text.",
         [
-            ("✏ File Captions", "edit_captiontemplate"),
-            ("🏷 File Branding", "file_branding_menu"),
-            ("🖼 Welcome Media", "edit_media"),
-            ("💬 Welcome Message", "edit_welcometext"),
+            ("🏠 Home Screen", "home_screen_menu"),
+            ("📝 Delivery Caption", "edit_captiontemplate"),
         ],
     ),
     "users": (
@@ -164,10 +162,10 @@ _CATEGORY_MENUS = {
         "Manage channels, deletion rules, backups and deployment.",
         [
             ("💬 Request Group", "edit_maingroup"),
-            ("📢 Public Updates", "edit_update"),
-            ("📡 Log Channel", "edit_logchannel"),
-            ("📣 Announcement Channel", "edit_updatechid"),
-            ("⏱ Auto-Delete", "edit_autodeletetime"),
+            ("📰 New Releases Channel", "releases_channel_menu"),
+            ("🎫 Request Inbox", "edit_requestchannel"),
+            ("🛠 System Log Channel", "edit_logchannel"),
+            ("⏱ Default Auto-Delete", "edit_autodeletetime"),
             ("⬇ Export Backup", "admin_export_config"),
             ("🔒 Secret Backup", "admin_export_secrets"),
             ("⬆ Restore Backup", "admin_restore_config"),
@@ -176,11 +174,10 @@ _CATEGORY_MENUS = {
     ),
     "health": (
         "🩺 **Health & System**",
-        "Review analytics, channel access and system health.",
+        "Check Telegram connections and internal system health.",
         [
-            ("📊 Analytics", "admin_stats"),
-            ("🔎 Channel Check", "channel_health_check"),
-            ("🧪 Diagnostics", "known_issues_check"),
+            ("📡 Telegram Channels", "channel_health_check"),
+            ("🧪 System Diagnostics", "known_issues_check"),
             ("🛠 Maintenance", "admin_toggle_maintenance"),
         ],
     ),
@@ -212,6 +209,61 @@ async def show_category_menu(client: Client, callback: CallbackQuery):
         await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
     except Exception:
         await callback.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+@Client.on_callback_query(filters.regex(r"^home_screen_menu$") & filters.user(ADMIN_ID))
+async def show_home_screen_menu(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback)
+    config = await db.get_config()
+    text = (
+        "🏠 **Home Screen**\n\n"
+        f"Home text: `{'Custom' if config.get('welcome_text') else 'Default'}`\n"
+        f"Home media: `{'Configured' if config.get('start_media') else 'Not set'}`\n\n"
+        "These settings control the `/start` screen in private chat. "
+        "Group welcome messages are separate system messages."
+    )
+    markup = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("💬 Edit Home Text", callback_data="edit_welcometext"),
+                InlineKeyboardButton("🖼 Edit Home Media", callback_data="edit_media"),
+            ],
+            [InlineKeyboardButton("‹ Appearance", callback_data="admin_cat_appearance")],
+        ]
+    )
+    await callback.message.edit_text(text, reply_markup=markup)
+
+
+@Client.on_callback_query(filters.regex(r"^releases_channel_menu$") & filters.user(ADMIN_ID))
+async def show_releases_channel_menu(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback)
+    config = await db.get_config()
+    channel_id = int(config.get("update_channel_id", 0) or 0)
+    link_set = bool(config.get("update_channel"))
+    complete = bool(channel_id and link_set)
+    text = (
+        "📰 **New Releases Channel**\n\n"
+        f"Status: `{'Ready' if complete else 'Incomplete'}`\n"
+        f"Channel ID: `{'Set' if channel_id else 'Missing'}`\n"
+        f"Public/join link: `{'Set' if link_set else 'Missing'}`\n\n"
+        "One channel is used for both automatic new-upload announcements "
+        "and the New Releases button shown to users."
+    )
+    markup = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✏ Set Channel", callback_data="edit_releaseschannel")],
+            [InlineKeyboardButton("✕ Clear Channel", callback_data="releases_channel_clear")],
+            [InlineKeyboardButton("‹ Preferences", callback_data="admin_cat_settings")],
+        ]
+    )
+    await callback.message.edit_text(text, reply_markup=markup)
+
+
+@Client.on_callback_query(filters.regex(r"^releases_channel_clear$") & filters.user(ADMIN_ID))
+async def clear_releases_channel(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback, "New Releases channel cleared")
+    await db.update_config_fields({"update_channel_id": 0, "update_channel": ""})
+    await show_releases_channel_menu(client, callback)
 
 
 # ── DASHBOARD ────────────────────────────────────────────────────────────────
@@ -329,13 +381,23 @@ async def handle_edit_buttons(client: Client, callback: CallbackQuery):
     prompts = {
         "maingroup": (
             "💬 **Request Group**\n\n"
-            "Send the public or private Telegram group link.\n\n"
+            "Send the public or private Telegram group link shown as the "
+            "Request Group button. In-bot request tickets use Request Inbox instead.\n\n"
             "Example: `https://t.me/MCCxRequests`"
         ),
-        "update": ("📢 **Public Updates**\n\nSend the public or private Telegram channel link."),
+        "update": (
+            "📰 **New Releases Channel**\n\n"
+            "Send one channel link, @username or numeric ID. The bot must be an administrator."
+        ),
+        "releaseschannel": (
+            "📰 **New Releases Channel**\n\n"
+            "Send one channel link, @username or numeric ID. The bot will use the same "
+            "channel for automatic announcements and the user-facing New Releases button.\n\n"
+            "For a private channel you may send: `-1001234567890 https://t.me/+xxxx`"
+        ),
         "adddb": ("➕ **Add Source Channel**\n\nSend the channel ID.\n\nExample: `-100123456789`"),
         "remdb": ("➖ **Remove Source Channel**\n\nSend the channel ID."),
-        "media": ("🖼 **Welcome Media**\n\nSend the Catbox link for an image, GIF or MP4."),
+        "media": ("🖼 **Home Media**\n\nSend the Catbox link for an image, GIF or MP4."),
         "addfsub": (
             "➕ **Add Required Channel**\n\n"
             "Accepted formats:\n"
@@ -365,30 +427,36 @@ async def handle_edit_buttons(client: Client, callback: CallbackQuery):
             "Bot must be **Admin** in that channel."
         ),
         "welcometext": (
-            "📝 **Send me the new Welcome Message.**\n\n"
+            "📝 **Send me the new Home Message.**\n\n"
             "**Tip:** You can use standard Telegram HTML tags (`<b>`, `<i>`, `<blockquote>`).\n"
             "Type `{mention}` for an @-tag, `{first_name}` for their plain first name, "
             "or `{total_files:,}` for the live file count."
         ),
         "logchannel": (
-            "📡 **Send me the new Log Channel ID.**\n\n"
+            "🛠 **System Log Channel**\n\n"
             "This is a numeric ID like `-100123456789`.\n"
             "Make sure the bot is an **Admin** in that channel first."
         ),
+        "requestchannel": (
+            "🎫 **Request Inbox**\n\n"
+            "Send the numeric channel ID where in-bot movie request tickets should arrive.\n\n"
+            "The bot must be an administrator. If this is not set, the System Log Channel "
+            "remains the compatibility fallback."
+        ),
         "updatechid": (
-            "📢 **Send me the new Update Channel ID.**\n\n"
-            "This is a numeric ID like `-100123456789` — the channel new-upload "
-            "announcements are posted to.\n"
-            "Make sure the bot is an **Admin** in that channel first."
+            "📰 **New Releases Channel**\n\n"
+            "Send one channel link, @username or numeric ID. The bot must be an administrator."
         ),
         "autodeletetime": (
-            "⏱ **Send me the new Auto-Delete Time in minutes.**\n\n"
-            "This is how long files stay before being deleted after sending.\n"
+            "⏱ **Default Auto-Delete Time**\n\n"
+            "This is how long delivered files stay before deletion. Individual groups "
+            "can override this default in Group Manager.\n"
             "Must be a number between `1` and `60`.\n"
             "Current default: `5` minutes."
         ),
         "captiontemplate": (
-            "✏️ **Send me the new File Caption Template.**\n\n"
+            "📝 **Delivery Caption**\n\n"
+            "This changes the text below every delivered file; it does not rename the Telegram file.\n\n"
             "Available variables:\n"
             "`{filename}` — Clean display name\n"
             "`{raw_filename}` — Original indexed name\n"
@@ -483,7 +551,6 @@ async def show_verification_gates_menu(client: Client, callback: CallbackQuery):
         [
             [InlineKeyboardButton("🔐 Required Channels", callback_data="fsub_menu")],
             [InlineKeyboardButton("⏱ Timed Channels", callback_data="req_fsub_menu")],
-            [InlineKeyboardButton("🧰 Legacy Two-Stage", callback_data="two_stage_menu")],
             [InlineKeyboardButton("‹ Control Center", callback_data="back_to_admin")],
         ]
     )
@@ -617,19 +684,27 @@ async def show_db_chan_menu(client: Client, callback: CallbackQuery):
     await answer_callback_safely(callback)
     config = await db.get_config()
     channels = config.get("db_channels", [])
+    env_channel = int(os.getenv("DATABASE_CHANNEL_ID", "0") or 0)
 
-    text = "📚 **Auto-Indexer Channels**\n\nThe bot will automatically absorb files uploaded to these channels:\n\n"
-    if not channels:
-        text += "🔸 **Status:** No extra channels set (Only checking .env).\n"
-    else:
+    text = "📚 **Source Channels**\n\nNew media posted in these channels is indexed automatically:\n\n"
+    if env_channel:
+        text += f"Environment fallback: `{env_channel}`\n"
+    if channels:
+        text += "Control Center channels:\n"
         for i, ch in enumerate(channels, 1):
             text += f" {i}. `{ch}`\n"
+    if not env_channel and not channels:
+        text += "⚠️ No source channel is configured.\n"
+    text += (
+        "\nThe environment fallback cannot be removed here; change "
+        "`DATABASE_CHANNEL_ID` in your hosting panel."
+    )
 
     markup = InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("➕ Add DB Channel", callback_data="edit_adddb"),
-                InlineKeyboardButton("➖ Remove DB", callback_data="edit_remdb"),
+                InlineKeyboardButton("➕ Add Channel", callback_data="edit_adddb"),
+                InlineKeyboardButton("➖ Remove Channel", callback_data="edit_remdb"),
             ],
             [InlineKeyboardButton("‹ Control Center", callback_data="back_to_admin")],
         ]
@@ -652,6 +727,8 @@ async def show_db_chan_menu(client: Client, callback: CallbackQuery):
 _OWN_STATES = {
     "maingroup",
     "update",
+    "releaseschannel",
+    "requestchannel",
     "adddb",
     "remdb",
     "media",
@@ -714,28 +791,42 @@ async def catch_admin_input(client: Client, message: Message):
         await db.update_config("main_group", message.text.strip())
         await respond("✅ **Main Group Link Successfully Updated!**", reply_markup=_BACK_BTN)
 
-    elif state == "update":
-        await db.update_config("update_channel", message.text.strip())
-        await respond("✅ **Updates Channel Link Successfully Updated!**", reply_markup=_BACK_BTN)
+    elif state in {"update", "updatechid", "releaseschannel"}:
+        raw = message.text.strip()
+        try:
+            verified = await resolve_request_fsub_channel(client, raw)
+            await db.update_config_fields(
+                {
+                    "update_channel_id": verified.chat_id,
+                    "update_channel": verified.link,
+                }
+            )
+            await respond(
+                "✅ <b>New Releases Channel Updated</b>\n\n"
+                f"📰 <b>{_html(verified.title)}</b>\n"
+                f"🆔 <code>{verified.chat_id}</code>\n\n"
+                "Automatic announcements and user buttons now use this one channel.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=_BACK_BTN,
+            )
+        except ChannelConfigurationError as error:
+            await respond(
+                "❌ <b>New Releases Channel Not Updated</b>\n\n"
+                f"{_html(str(error))}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=_BACK_BTN,
+            )
 
     elif state == "adddb":
         try:
             ch_val = int(message.text.strip())
             await client.get_chat(ch_val)
-            config = await db.get_config()
-            if ch_val == int(config.get("file_branding_channel_id", 0) or 0):
-                await respond(
-                    "❌ **Channel Not Added**\n\n"
-                    "That channel stores branded copies. Choose a different source channel.",
-                    reply_markup=_BACK_BTN,
-                )
-            else:
-                await db.add_db_channel(ch_val)
-                await respond(
-                    f"✅ **Database Channel `{ch_val}` Added!**\n"
-                    f"Any movie uploaded there will now be auto-indexed.",
-                    reply_markup=_BACK_BTN,
-                )
+            await db.add_db_channel(ch_val)
+            await respond(
+                f"✅ **Database Channel `{ch_val}` Added!**\n"
+                f"Any movie uploaded there will now be auto-indexed.",
+                reply_markup=_BACK_BTN,
+            )
         except ValueError:
             await respond(
                 "❌ **Invalid Channel ID**\n\nSend a number like `-100123456789`.",
@@ -751,6 +842,15 @@ async def catch_admin_input(client: Client, message: Message):
     elif state == "remdb":
         try:
             ch_val = int(message.text.strip())
+            env_channel = int(os.getenv("DATABASE_CHANNEL_ID", "0") or 0)
+            if ch_val == env_channel:
+                await respond(
+                    "⚠️ **Environment Source Not Removed**\n\n"
+                    "This channel comes from `DATABASE_CHANNEL_ID`. Remove or change it "
+                    "in your hosting panel, then restart the bot.",
+                    reply_markup=_BACK_BTN,
+                )
+                return
             await db.remove_db_channel(ch_val)
             await respond(f"✅ **Channel `{ch_val}` Removed.**", reply_markup=_BACK_BTN)
         except ValueError:
@@ -760,12 +860,12 @@ async def catch_admin_input(client: Client, message: Message):
 
     elif state == "media":
         await db.update_config("start_media", message.text.strip())
-        await respond("✅ **Welcome Media Successfully Updated!**", reply_markup=_BACK_BTN)
+        await respond("✅ **Home Media Updated!**", reply_markup=_BACK_BTN)
 
     elif state == "welcometext":
         await db.update_config("welcome_text", message.text)
         await respond(
-            "✅ **Welcome Text Successfully Updated!**\n\nType /start to see it live.", reply_markup=_BACK_BTN
+            "✅ **Home Text Updated!**\n\nType /start to see it live.", reply_markup=_BACK_BTN
         )
 
     elif state == "addfsub":
@@ -857,8 +957,9 @@ async def catch_admin_input(client: Client, message: Message):
             else:
                 await db.update_config("auto_delete_time", minutes * 60)
                 await respond(
-                    f"✅ **Auto-Delete Time Updated!**\n\n"
-                    f"Files will now be deleted **{minutes} minute(s)** after sending.",
+                    f"✅ **Default Auto-Delete Updated!**\n\n"
+                    f"Files will now be deleted **{minutes} minute(s)** after sending "
+                    "unless a group override is configured.",
                     reply_markup=_BACK_BTN,
                 )
         except ValueError:
@@ -869,14 +970,14 @@ async def catch_admin_input(client: Client, message: Message):
         if raw.lower() == "clear":
             await db.update_config("file_caption_template", "")
             await respond(
-                "✅ **Caption Template Cleared!**\n\nFiles will use the default caption.",
+                "✅ **Delivery Caption Reset**\n\nAll delivered files will use the default caption.",
                 reply_markup=_BACK_BTN,
             )
         else:
             await db.update_config("file_caption_template", raw)
             await respond(
-                f"✅ **Caption Template Updated!**\n\nTemplate saved. "
-                f"New files will use your custom caption.",
+                "✅ **Delivery Caption Updated**\n\n"
+                "The template now applies whenever any existing or new file is delivered.",
                 reply_markup=_BACK_BTN,
             )
 
@@ -913,25 +1014,28 @@ async def catch_admin_input(client: Client, message: Message):
                 reply_markup=_BACK_BTN,
             )
 
-    elif state == "updatechid":
+    elif state == "requestchannel":
         raw = message.text.strip()
         try:
             ch_val = int(raw)
             await client.get_chat(ch_val)
-            await db.update_config("update_channel_id", ch_val)
+            member = await client.get_chat_member(ch_val, client.me.id)
+            if member.status.name not in {"ADMINISTRATOR", "OWNER", "CREATOR"}:
+                raise ValueError("Make the bot an administrator in that channel first")
+            await db.update_config("request_channel_id", ch_val)
             await respond(
-                f"✅ **Update Channel Updated!**\n\n"
-                f"New Update Channel ID: `{ch_val}`\n"
-                f"New upload announcements will now post there.",
+                f"✅ **Request Inbox Updated!**\n\n"
+                f"Movie request tickets will now arrive in `{ch_val}`.",
                 reply_markup=_BACK_BTN,
             )
         except ValueError:
             await respond(
-                "❌ **Invalid format!** Update Channel ID must be a number like `-100123456789`.",
+                "❌ **Request Inbox Not Updated**\n\n"
+                "Send a numeric channel ID and make the bot an administrator there.",
                 reply_markup=_BACK_BTN,
             )
         except Exception as error:
-            reference = report_internal_error(logger, "admin_set_update_channel", error)
+            reference = report_internal_error(logger, "admin_set_request_channel", error)
             await respond(
                 "❌ **Cannot access that channel!**\n"
                 "Make sure the bot is an **Admin** there first.\n"

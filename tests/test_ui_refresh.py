@@ -30,7 +30,6 @@ def test_admin_prompts_do_not_show_raw_markdown_or_cancel_instructions():
             "admin.py",
             "file_manager.py",
             "group_manager.py",
-            "branding_admin.py",
         )
     )
 
@@ -39,6 +38,37 @@ def test_admin_prompts_do_not_show_raw_markdown_or_cancel_instructions():
     assert "_Select an action._" not in sources
     assert "Select an action." not in sources
     assert "🔙" not in sources
+
+
+def test_removed_filename_branding_is_not_exposed_or_started():
+    assert not (ROOT / "plugins" / "branding_admin.py").exists()
+    assert not (ROOT / "plugins" / "file_branding.py").exists()
+    admin_source = (ROOT / "plugins" / "admin.py").read_text(encoding="utf-8")
+    bot_source = (ROOT / "bot.py").read_text(encoding="utf-8")
+    indexer_source = (ROOT / "plugins" / "realtime_indexer.py").read_text(encoding="utf-8")
+    assert "File Branding" not in admin_source
+    assert "file_branding_worker" not in bot_source
+    assert "enqueue_file_branding" not in indexer_source
+
+
+def test_overlapping_admin_features_have_one_clear_name_and_entry_point():
+    source = (ROOT / "plugins" / "admin.py").read_text(encoding="utf-8")
+    assert source.count('(\"📊 Analytics\", callback_data=\"admin_stats\")') == 1
+    assert "Public Updates" not in source
+    assert "Announcement Channel" not in source
+    assert "File Captions" not in source
+    assert '(\"📰 New Releases Channel\", \"releases_channel_menu\")' in source
+    assert '(\"🎫 Request Inbox\", \"edit_requestchannel\")' in source
+    assert '(\"💬 Request Group\", \"edit_maingroup\")' in source
+
+
+def test_cached_media_delivery_has_one_shared_implementation():
+    combined = "\n".join(
+        (ROOT / "plugins" / name).read_text(encoding="utf-8")
+        for name in ("filter.py", "start.py", "req_fsub.py")
+    )
+    assert combined.count("client.send_cached_media(") == 1
+    assert "async def deliver_cached_file" in combined
 
 
 @pytest.mark.asyncio

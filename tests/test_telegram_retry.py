@@ -102,17 +102,20 @@ class TelegramRetryTests(unittest.TestCase):
         self.assertIn("expires_at", update["$set"])
 
     def test_core_routes_use_shared_retry_and_no_memory_post_queue(self):
-        expected = (
+        direct_retry_routes = (
             "plugins/filter.py",
             "plugins/group_connect.py",
-            "plugins/start.py",
-            "plugins/req_fsub.py",
             "plugins/request.py",
             "plugins/realtime_indexer.py",
         )
-        for relative_path in expected:
+        for relative_path in direct_retry_routes:
             source = (ROOT / relative_path).read_text(encoding="utf-8")
             self.assertIn("telegram_call(", source, relative_path)
+        for relative_path in ("plugins/start.py", "plugins/req_fsub.py"):
+            source = (ROOT / relative_path).read_text(encoding="utf-8")
+            self.assertIn("deliver_cached_file", source, relative_path)
+        shared_delivery = (ROOT / "plugins/filter.py").read_text(encoding="utf-8")
+        self.assertIn("policy=DELIVERY_RETRY", shared_delivery)
         realtime = (ROOT / "plugins/realtime_indexer.py").read_text(encoding="utf-8")
         self.assertNotIn("asyncio.Queue", realtime)
         self.assertIn("enqueue_announcement", realtime)

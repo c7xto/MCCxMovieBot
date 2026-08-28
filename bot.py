@@ -283,16 +283,6 @@ class AutoFilterBot(Client):
         )
         logger.info("✅ Durable notification worker started.")
 
-        from plugins.file_branding import run_file_branding_worker
-
-        supervisor.spawn(
-            run_file_branding_worker(self),
-            key="worker:file_branding",
-            owner="bot",
-            resources=("branding-cache",),
-        )
-        logger.info("✅ Durable file-branding worker started.")
-
     async def stop(self, *args, **kwargs):
         await asyncio.to_thread(_remove_ready_marker)
         await supervisor.shutdown(drain_timeout=10, cancel_timeout=10)

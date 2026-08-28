@@ -139,11 +139,30 @@ async def check_all_channels(client, config):
                 "text": f"{label}: ❌ No access — `{ch_id}`\n  Reference: `{reference}`",
             }
 
-    results.append(await _check("📡 Log Channel", config.get("log_channel"), fix="edit_logchannel"))
-    results.append(await _check("📢 Update Channel", config.get("update_channel_id"), fix="edit_updatechid"))
+    results.append(
+        await _check("🛠 System Log Channel", config.get("log_channel"), fix="edit_logchannel")
+    )
+    results.append(
+        await _check(
+            "🎫 Request Inbox",
+            config.get("request_channel_id") or config.get("log_channel"),
+            fix="edit_requestchannel",
+        )
+    )
+    results.append(
+        await _check(
+            "📰 New Releases Channel",
+            config.get("update_channel_id"),
+            fix="releases_channel_menu",
+        )
+    )
 
-    for i, ch in enumerate(config.get("db_channels", []), 1):
-        results.append(await _check(f"📚 DB Channel {i}", ch, fix="db_chan_menu"))
+    source_channels = list(config.get("db_channels", []))
+    fallback_source = config.get("db_channel")
+    if fallback_source and fallback_source not in source_channels:
+        source_channels.append(fallback_source)
+    for i, ch in enumerate(source_channels, 1):
+        results.append(await _check(f"📚 Source Channel {i}", ch, fix="db_chan_menu"))
 
     for i, gate in enumerate(get_access_gates(config), 1):
         ch_id = gate.get("id")

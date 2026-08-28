@@ -651,8 +651,14 @@ def _available_filter_values(results: list, kind: str) -> list:
 
 def _build_caption(config, file_data, delete_minutes, bot_username):
     raw_filename = file_data.get("file_name", "")
-    title, year = _display_title(raw_filename)
-    clean_filename = f"{title} ({year})" if year else title
+    if _is_series(raw_filename):
+        identity, episode = _series_identity(raw_filename)
+        clean_filename = f"{identity} • {episode}"
+        title_line = f"🎬 <b>{_html(clean_filename)}</b>"
+    else:
+        title, year = _display_title(raw_filename)
+        clean_filename = f"{title} ({year})" if year else title
+        title_line = f"🎬 <b>{_html(clean_filename)}</b>"
     template = config.get("file_caption_template", "")
     if template:
         f_lang, f_qual = extract_attributes(raw_filename)
@@ -698,13 +704,71 @@ def _build_caption(config, file_data, delete_minutes, bot_username):
     meta_parts.append(f"📦 {size_str}")
     meta_line = "  •  ".join(meta_parts)
 
-    title_line = f"🎬 <b>{_html(title)}{f' ({year})' if year else ''}</b>"
-
     return (
         f"{title_line}\n"
         f"<blockquote>{meta_line}</blockquote>\n"
         f"<i>⏳ Available for {delete_minutes} min  •  Forward it to keep it</i>"
     )
+
+
+async def deliver_cached_file(
+    client,
+    *,
+    chat_id,
+    user_id: int,
+    file_obj_id: str,
+    file_data: dict,
+    config: dict,
+    route: str,
+):
+    """Use one delivery path for result buttons, deep links and gate retries."""
+    guard = delivery_guard(user_id, file_obj_id)
+    try:
+        await guard.__aenter__()
+    except WorkloadRejected as exc:
+        await client.send_message(chat_id, exc.public_message)
+        return False
+
+    delete_seconds = int(config.get("auto_delete_time", 300))
+    delete_minutes = max(1, delete_seconds // 60)
+    try:
+        sent = await telegram_call(
+            lambda: client.send_cached_media(
+                chat_id=chat_id,
+                file_id=file_data["file_id"],
+                caption=_build_caption(config, file_data, delete_minutes, client.me.username),
+                parse_mode=ParseMode.HTML,
+            ),
+            route=route,
+            policy=DELIVERY_RETRY,
+            retry_safe=True,
+            idempotency_key=f"{user_id}:{file_obj_id}",
+        )
+        await _auto_delete_file(sent, file_data["file_name"], client.me.username, delete_seconds)
+        return True
+    except (
+        FileIdInvalid,
+        FileReferenceEmpty,
+        FileReferenceExpired,
+        FileReferenceInvalid,
+        MediaEmpty,
+        MediaInvalid,
+    ) as exc:
+        await db.delete_file_by_id(file_data["file_id"])
+        await client.send_message(
+            chat_id,
+            "❌ <b>File unavailable</b>\n\n"
+            "This cached file expired and was removed from search. Please search again.",
+            parse_mode=ParseMode.HTML,
+        )
+        logger.warning("Removed invalid cached file %s: %s", file_data["file_id"], exc)
+        return False
+    except Exception as exc:
+        await client.send_message(chat_id, "❌ Could not send this file right now. Please try again.")
+        logger.error("Cached file delivery failed route=%s file=%s: %s", route, file_obj_id, exc)
+        return False
+    finally:
+        await guard.__aexit__(None, None, None)
 
 
 def _build_result_buttons(results: list, session_id: str, page: int, per_page: int = 10):
@@ -1108,56 +1172,16 @@ async def send_movie_file(client: Client, callback: CallbackQuery):
         if not access.allowed:
             return
 
-        guard = delivery_guard(callback.from_user.id, file_obj_id)
-        try:
-            await guard.__aenter__()
-        except WorkloadRejected as exc:
-            await callback.message.reply_text(exc.public_message)
-            return
-
         config = access.config
-        delete_seconds = int(config.get("auto_delete_time", 300))
-        delete_minutes = delete_seconds // 60
-
-        try:
-            sent = await telegram_call(
-                lambda: client.send_cached_media(
-                    chat_id=callback.message.chat.id,
-                    file_id=file_data["file_id"],
-                    caption=_build_caption(config, file_data, delete_minutes, client.me.username),
-                    parse_mode=ParseMode.HTML,
-                ),
-                route="file_delivery_callback",
-                policy=DELIVERY_RETRY,
-                retry_safe=True,
-                idempotency_key=f"{callback.from_user.id}:{file_obj_id}",
-            )
-            await _auto_delete_file(sent, file_data["file_name"], client.me.username, delete_seconds)
-        except (
-            FileIdInvalid,
-            FileReferenceEmpty,
-            FileReferenceExpired,
-            FileReferenceInvalid,
-            MediaEmpty,
-            MediaInvalid,
-        ) as e:
-            await db.delete_file_by_id(file_data["file_id"])
-            unavailable_title, unavailable_year = _display_title(file_data["file_name"])
-            unavailable_name = (
-                f"{unavailable_title} ({unavailable_year})" if unavailable_year else unavailable_title
-            )
-            await callback.message.reply_text(
-                f"❌ <b>File unavailable</b>\n\n"
-                f"{_html(unavailable_name)} is no longer valid. "
-                f"It was removed from the index; please search again.",
-                parse_mode=ParseMode.HTML,
-            )
-            logger.warning("Removed invalid cached file %s: %s", file_data["file_id"], e)
-        except Exception as e:
-            await callback.message.reply_text("❌ Could not send this file right now. Please try again.")
-            logger.error(f"send_cached_media failed: {e}")
-        finally:
-            await guard.__aexit__(None, None, None)
+        await deliver_cached_file(
+            client,
+            chat_id=callback.message.chat.id,
+            user_id=callback.from_user.id,
+            file_obj_id=file_obj_id,
+            file_data=file_data,
+            config=config,
+            route="file_delivery_callback",
+        )
 
 
 @Client.on_callback_query(filters.regex(r"^check_fsub#"))

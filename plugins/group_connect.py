@@ -47,11 +47,20 @@ def _spawn_group_task(coroutine, key):
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 
-def _build_group_buttons(page_files, client_username, session_id, page, total, total_pages):
+def _build_group_buttons(
+    page_files,
+    client_username,
+    session_id,
+    page,
+    total,
+    total_pages,
+    delete_seconds=None,
+):
     """Build the same flat rows as DM, using deep links for delivery."""
     buttons = []
     for f in page_files:
-        bot_url = f"https://t.me/{client_username}?start=file_{f['_id']}"
+        delete_suffix = f"_d{int(delete_seconds)}" if delete_seconds else ""
+        bot_url = f"https://t.me/{client_username}?start=file_{f['_id']}{delete_suffix}"
         buttons.append([InlineKeyboardButton(_flat_file_label(f), url=bot_url)])
 
     # Navigation row — pagination goes back to DM full search for group
@@ -326,7 +335,15 @@ async def group_search(client: Client, message: Message):
     page_files = sorted_files[:per_page]
 
     caption = _build_caption(query, total, 0, total_pages, message.from_user.first_name or "")
-    buttons = _build_group_buttons(page_files, client.me.username, session_id, 0, total, total_pages)
+    buttons = _build_group_buttons(
+        page_files,
+        client.me.username,
+        session_id,
+        0,
+        total,
+        total_pages,
+        delete_seconds=_del_secs,
+    )
     markup = InlineKeyboardMarkup(buttons)
 
     await remove_search_indicator(indicator)
@@ -361,7 +378,10 @@ async def group_search(client: Client, message: Message):
                 [
                     InlineKeyboardButton(
                         compact_label,
-                        url=f"https://t.me/{client.me.username}?start=file_{file_doc['_id']}",
+                        url=(
+                            f"https://t.me/{client.me.username}?start="
+                            f"file_{file_doc['_id']}_d{_del_secs}"
+                        ),
                     )
                 ]
             )
@@ -436,7 +456,15 @@ async def handle_group_pagination(client: Client, callback: CallbackQuery):
     page_files = results[start_idx : start_idx + per_page]
 
     caption = _build_caption(query, total, page, total_pages, data.get("first_name", ""))
-    buttons = _build_group_buttons(page_files, client.me.username, session_id, page, total, total_pages)
+    buttons = _build_group_buttons(
+        page_files,
+        client.me.username,
+        session_id,
+        page,
+        total,
+        total_pages,
+        delete_seconds=data.get("auto_delete_time"),
+    )
     markup = InlineKeyboardMarkup(buttons)
 
     try:

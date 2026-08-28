@@ -7,6 +7,7 @@ asyncio.set_event_loop(asyncio.new_event_loop())
 
 from plugins.filter import (  # noqa: E402
     _apply_result_filters,
+    _build_caption,
     _build_movie_result_buttons,
     _build_results_caption,
     _display_title,
@@ -19,6 +20,7 @@ from plugins.filter import (  # noqa: E402
 )
 from plugins.search_indicator import _select_search_sticker  # noqa: E402
 from plugins.start import _build_start_ui  # noqa: E402
+from plugins.group_connect import _build_group_buttons  # noqa: E402
 
 
 def test_search_indicator_selects_native_animated_magnifying_sticker():
@@ -39,7 +41,7 @@ def test_home_screen_uses_live_count_and_clean_button_order():
     assert "Aavesham" not in text
     assert [[button.text for button in row] for row in markup.inline_keyboard] == [
         ["🔎 Search Guide", "🌐 മലയാളം"],
-        ["📝 Request Movie", "📢 New Releases"],
+        ["💬 Request Group", "📢 New Releases"],
         ["➕ Add Bot to Group"],
     ]
 
@@ -53,6 +55,16 @@ def test_display_title_removes_release_name_noise():
 def test_display_title_cleans_series_and_promotional_handle():
     filename = "Reacher_S02E03_1080p_WEB-DL_English_x265_@channel.mkv"
     assert _display_title(filename) == ("Reacher S02E03", "")
+
+
+def test_delivered_series_caption_keeps_the_selected_episode():
+    file_doc = {
+        "file_name": "Estonia.2023.S01E05.720p.WEBRip.H264.mkv",
+        "file_size": 307 * 1024 * 1024,
+    }
+    caption = _build_caption({}, file_doc, 10, "lucasmoviebot")
+    assert "Estonia (2023) • S01E05" in caption
+    assert "720p" in caption
 
 
 def test_spaced_acronym_and_duplicate_release_title_are_collapsed():
@@ -171,6 +183,19 @@ def test_flat_results_show_ten_files_without_grouping():
     assert len(rows) == 11  # ten files plus NEXT
     assert all("KGF Chapter 2" in row[0].text for row in rows[:10])
     assert rows[-1][0].text == "NEXT ➡"
+
+
+def test_group_file_links_carry_the_group_auto_delete_override():
+    rows = _build_group_buttons(
+        [{"_id": "0123456789abcdef01234567", "file_name": "Movie 2026.mkv", "file_size": 1}],
+        "lucasmoviebot",
+        "session",
+        0,
+        1,
+        1,
+        delete_seconds=900,
+    )
+    assert rows[0][0].url.endswith("?start=file_0123456789abcdef01234567_d900")
 
 
 def test_results_caption_contains_shared_count_and_page_header():

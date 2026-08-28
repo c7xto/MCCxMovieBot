@@ -31,27 +31,13 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from pyrogram import Client, filters
-from pyrogram.errors import (
-    FileIdInvalid,
-    FileReferenceEmpty,
-    FileReferenceExpired,
-    FileReferenceInvalid,
-    MediaEmpty,
-    MediaInvalid,
-)
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message
 from pyrogram.enums import ParseMode
 from database.db import db
 from plugins.access_policy import authorize_user_action, enforce_user_action
 from plugins.callbacks import answer_callback_safely
-from plugins.workload import (
-    WorkloadRejected,
-    delivery_guard,
-    interactive_slot,
-    record_workload_metric,
-)
+from plugins.workload import interactive_slot, record_workload_metric
 from plugins.access_gates import GRACE_SECONDS, get_access_gates
-from plugins.telegram_retry import DELIVERY_RETRY, telegram_call
 from utils import _parse_fsub_entry, get_subscription_status_by_id  # legacy import compatibility
 from verification import (
     VerificationResult,
@@ -180,10 +166,6 @@ async def _deliver_file(client, chat_id, user_id: int, file_obj_id: str):
     """Fetches and sends a cached file by its Mongo ObjectId string, with
     the standard expired-file fallback and auto-delete scheduling. Called
     from vgate_check_callback once every outstanding gate has passed."""
-    access = await authorize_user_action(user_id, "file_delivery")
-    if not access.allowed:
-        await client.send_message(chat_id, access.message or "Action denied.")
-        return
     file_data = await db.get_file(file_obj_id)
     if not file_data:
         await client.send_message(
@@ -196,48 +178,17 @@ async def _deliver_file(client, chat_id, user_id: int, file_obj_id: str):
         await client.send_message(chat_id, access.message or "Action denied.")
         return
     cfg = access.config
-    delete_seconds = int(cfg.get("auto_delete_time", 300))
-    delete_minutes = delete_seconds // 60
+    from plugins.filter import deliver_cached_file
 
-    from plugins.filter import _build_caption, _auto_delete_file
-
-    guard = delivery_guard(user_id, file_obj_id)
-    try:
-        await guard.__aenter__()
-    except WorkloadRejected as exc:
-        await client.send_message(chat_id, exc.public_message)
-        return
-
-    try:
-        sent = await telegram_call(
-            lambda: client.send_cached_media(
-                chat_id=chat_id,
-                file_id=file_data["file_id"],
-                caption=_build_caption(cfg, file_data, delete_minutes, client.me.username),
-                parse_mode=ParseMode.HTML,
-            ),
-            route="file_delivery_verification",
-            policy=DELIVERY_RETRY,
-            retry_safe=True,
-            idempotency_key=f"{user_id}:{file_obj_id}",
-        )
-        await _auto_delete_file(sent, file_data["file_name"], client.me.username, delete_seconds)
-    except (
-        FileIdInvalid,
-        FileReferenceEmpty,
-        FileReferenceExpired,
-        FileReferenceInvalid,
-        MediaEmpty,
-        MediaInvalid,
-    ) as e:
-        await db.delete_file_by_id(file_data["file_id"])
-        await client.send_message(chat_id, "❌ File has expired. Search again.")
-        logger.warning("Removed invalid cached file %s: %s", file_data["file_id"], e)
-    except Exception as e:
-        await client.send_message(chat_id, "❌ Could not send file right now. Try again.")
-        logger.error(f"req_fsub/_deliver_file send failed: {e}")
-    finally:
-        await guard.__aexit__(None, None, None)
+    await deliver_cached_file(
+        client,
+        chat_id=chat_id,
+        user_id=user_id,
+        file_obj_id=file_obj_id,
+        file_data=file_data,
+        config=cfg,
+        route="file_delivery_verification",
+    )
 
 
 # ── VERIFICATION GATES ───────────────────────────────────────────────────────

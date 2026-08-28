@@ -99,27 +99,6 @@ When `OPERATIONS_DATABASE_URI` is added, startup copies operational data in
 resumable batches, validates the copy, and leaves the old data untouched. Do
 not point it at a movie shard if you want true storage isolation.
 
-## File branding
-
-Open `/admin` → **Appearance** → **File Branding** to set this up.
-
-1. Create a private Telegram channel for the renamed copies.
-2. Add the bot there as an administrator.
-3. Enter that channel's numeric ID under **Set Cache Channel**.
-4. Set the short brand text you want at the end of each filename.
-5. Check **Filename Preview**, then enable branding.
-
-For every new source-channel upload, the bot downloads the file once, removes
-promotional links and messy separators from its name, uploads the renamed copy
-to the private channel, and verifies it before switching delivery. Users then
-receive the renamed Telegram copy instantly from cache. The source message is
-never deleted. If all rename retries fail, the original is restored for search
-instead of losing the file.
-
-This setting applies only to new real-time uploads. It does not re-upload the
-existing library. The host needs enough temporary disk space for the largest
-file being processed, and only one file is processed at a time.
-
 All non-loopback MongoDB connections must use certificate-validated TLS. Prefer
 `mongodb+srv://...`; a standard `mongodb://...` remote URI must include
 `tls=true`. The bundled public CA store is used by default, or set
@@ -152,7 +131,7 @@ overwrite an existing plaintext file.
 ## First deployment checklist
 
 1. Add the bot as an administrator in the log and database channels.
-2. Open `/admin` → **Health & System** → **Channel Check**.
+2. Open `/admin` → **System** → **Telegram Channels**.
 3. Configure source and required-subscription channels.
 4. Forward a storage-channel message to the bot to begin bulk indexing.
 5. Run `python tools/migrate_registry.py` once if upgrading an older database.

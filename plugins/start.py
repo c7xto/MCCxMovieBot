@@ -8,14 +8,7 @@ from plugins.access_policy import authorize_user_action, enforce_user_action
 from plugins.callbacks import answer_callback_safely
 from plugins.filter import route_menu
 from plugins.search_indicator import show_search_indicator, remove_search_indicator
-from plugins.workload import (
-    WorkloadRejected,
-    delivery_guard,
-    enforce_search_rate_limits,
-    search_slot,
-    validate_search_query,
-)
-from plugins.telegram_retry import DELIVERY_RETRY, telegram_call
+from plugins.workload import WorkloadRejected, enforce_search_rate_limits, search_slot, validate_search_query
 from utils import (
     _no_preview,
     _html,
@@ -25,14 +18,6 @@ from utils import (
     html_user_mention,
 )
 from pyrogram import Client, filters
-from pyrogram.errors import (
-    FileIdInvalid,
-    FileReferenceEmpty,
-    FileReferenceExpired,
-    FileReferenceInvalid,
-    MediaEmpty,
-    MediaInvalid,
-)
 from pyrogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, Message
 from pyrogram.enums import ParseMode, ChatAction
 from database.db import db
@@ -40,11 +25,8 @@ from database.db import db
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-# ── Brand kit ─────────────────────────────────────────────────────────────
-# Shared icon set for this file — keep in sync with plugins/filter.py's
-# LANG_EMOJI and the rest of the bot's emoji usage. Centralizing this into a
-# dedicated branding module is a reasonable follow-up once more files need
-# it; scoped to start.py for now since this phase only touches this file.
+# ── Shared UI icons ───────────────────────────────────────────────────────
+# Shared icon set for this file, scoped here because it only belongs to these menus.
 ICON_SEARCH = "🔍"
 ICON_MOVIE = "🎬"
 ICON_UPDATES = "📢"
@@ -177,7 +159,7 @@ def _build_start_ui(
     )
     discovery_row = []
     if group_link:
-        discovery_row.append(InlineKeyboardButton("📝 Request Movie", url=group_link))
+        discovery_row.append(InlineKeyboardButton("💬 Request Group", url=group_link))
     if update_link:
         discovery_row.append(InlineKeyboardButton("📢 New Releases", url=update_link))
     if discovery_row:
@@ -265,7 +247,7 @@ async def _execute_search(client, status_msg, query: str, config: dict, user_id=
     return await route_menu(client, status_msg, session_id, 0)
 
 
-async def _handle_file_link(client, message, file_obj_id: str):
+async def _handle_file_link(client, message, file_obj_id: str, delete_seconds_override=None):
     """Deep-link payload: file_<obj_id> — direct file delivery (mainly the
     group-search "Open in PM" buttons), gated by the same unified
     Verification Gates check as the in-DM sendfile# button."""
@@ -285,49 +267,21 @@ async def _handle_file_link(client, message, file_obj_id: str):
     access = await enforce_user_action(message, "file_delivery")
     if not access.allowed:
         return
-    guard = delivery_guard(message.from_user.id, file_obj_id)
-    try:
-        await guard.__aenter__()
-    except WorkloadRejected as exc:
-        return await message.reply_text(exc.public_message)
     config = access.config
-    delete_seconds = int(config.get("auto_delete_time", 300))
-    delete_minutes = delete_seconds // 60
+    if delete_seconds_override is not None:
+        config = dict(config)
+        config["auto_delete_time"] = max(60, min(3600, int(delete_seconds_override)))
+    from plugins.filter import deliver_cached_file
 
-    from plugins.filter import _auto_delete_file, _build_caption
-
-    try:
-        sent = await telegram_call(
-            lambda: client.send_cached_media(
-                chat_id=message.chat.id,
-                file_id=file_data["file_id"],
-                caption=_build_caption(config, file_data, delete_minutes, client.me.username),
-                parse_mode=ParseMode.HTML,
-            ),
-            route="file_delivery_deep_link",
-            policy=DELIVERY_RETRY,
-            retry_safe=True,
-            idempotency_key=f"{message.from_user.id}:{file_obj_id}",
-        )
-        await _auto_delete_file(sent, file_data["file_name"], client.me.username, delete_seconds)
-    except (
-        FileIdInvalid,
-        FileReferenceEmpty,
-        FileReferenceExpired,
-        FileReferenceInvalid,
-        MediaEmpty,
-        MediaInvalid,
-    ) as exc:
-        await db.delete_file_by_id(file_data["file_id"])
-        logger.warning("Removed invalid deep-linked file %s: %s", file_data["file_id"], exc)
-        await message.reply_text(
-            f"{ICON_FAIL} This cached file expired and has been removed. Please search again."
-        )
-    except Exception as exc:
-        logger.error("Deep-linked file delivery failed for %s: %s", file_data["file_id"], exc)
-        await message.reply_text(f"{ICON_FAIL} Could not send this file right now. Please try again.")
-    finally:
-        await guard.__aexit__(None, None, None)
+    await deliver_cached_file(
+        client,
+        chat_id=message.chat.id,
+        user_id=message.from_user.id,
+        file_obj_id=file_obj_id,
+        file_data=file_data,
+        config=config,
+        route="file_delivery_deep_link",
+    )
 
 
 async def _handle_request_link(message, raw_query: str):
@@ -414,7 +368,19 @@ async def start_handler(client: Client, message: Message):
     if len(message.command) > 1:
         payload = message.command[1]
         if payload.startswith("file_"):
-            return await _handle_file_link(client, message, payload.split("file_", 1)[1])
+            file_payload = payload.split("file_", 1)[1]
+            delete_override = None
+            if "_d" in file_payload:
+                candidate, marker, raw_seconds = file_payload.rpartition("_d")
+                if marker and raw_seconds.isdigit():
+                    file_payload = candidate
+                    delete_override = int(raw_seconds)
+            return await _handle_file_link(
+                client,
+                message,
+                file_payload,
+                delete_seconds_override=delete_override,
+            )
         elif payload.startswith("req_"):
             return await _handle_request_link(message, payload.split("req_", 1)[1])
         else:

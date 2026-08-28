@@ -58,7 +58,6 @@ MAX_DUPLICATE_IDS_PER_GROUP = 1000
 _DUPLICATE_HASH_BYTES = 12
 _VERIFIED_CLEANUP_BATCH_SIZE = 2000
 MAX_NOTIFICATION_OUTBOX_JOBS = 5000
-MAX_FILE_BRANDING_JOBS = 20_000
 MAX_REQUEST_MATCHES_PER_JOB = 100
 MAX_CONFIG_BACKUP_KEYS = 50
 MAX_CONFIG_BACKUP_DEPTH = 4
@@ -70,9 +69,6 @@ _RESTORABLE_CONFIG_TYPES = {
     "maintenance_mode": bool,
     "maintenance_message": str,
     "file_caption_template": str,
-    "file_branding_enabled": bool,
-    "file_branding_channel_id": int,
-    "file_branding_text": str,
     "update_channel": str,
     "main_group": str,
     "group_whitelist_mode": str,
@@ -147,7 +143,6 @@ def validate_config_restore(data: object) -> dict:
         "welcome_text": 4096,
         "maintenance_message": 4096,
         "file_caption_template": 4096,
-        "file_branding_text": 64,
         "update_channel": 512,
         "main_group": 512,
         "group_whitelist_mode": 16,
@@ -998,7 +993,6 @@ class Database:
         self.rate_limits_col = None
         self.action_leases_col = None
         self.announcement_col = None
-        self.file_branding_col = None
         self.registry_col = None
         self.deletion_col = None
         self.deletion_dead_letter_col = None
@@ -1062,7 +1056,6 @@ class Database:
             self.rate_limits_col = _ops_db["rate_limits"]
             self.action_leases_col = _ops_db["action_leases"]
             self.announcement_col = _ops_db["announcement_outbox"]
-            self.file_branding_col = _ops_db["file_branding_jobs"]
             # Centralized cross-cluster identity registry — single source of
             # truth for file_id uniqueness across all sharded clusters, since
             # the per-cluster unique index on `movies.file_id` only protects
@@ -1169,7 +1162,6 @@ class Database:
             "rate_limits",
             "action_leases",
             "announcement_outbox",
-            "file_branding_jobs",
             "file_registry",
             "scheduled_deletions",
             "scheduled_deletion_dead_letters",
@@ -1590,18 +1582,6 @@ class Database:
             await self.announcement_col.create_index("expires_at", expireAfterSeconds=0)
         except Exception as exc:
             raise RequiredIndexError(f"Could not create announcement outbox indexes: {exc}") from exc
-        # ``hasattr`` keeps lightweight test doubles and upgrade-time bare
-        # database objects compatible. A fully initialized production object
-        # always owns the attribute and still fails closed if its queue is lost.
-        if hasattr(self, "file_branding_col"):
-            if self.file_branding_col is None:
-                raise RequiredIndexError("Required file-branding queue is unavailable; refusing readiness.")
-            try:
-                await self.file_branding_col.create_index([("status", 1), ("due_at", 1)])
-                await self.file_branding_col.create_index("expires_at", expireAfterSeconds=0)
-            except Exception as exc:
-                raise RequiredIndexError(f"Could not create file-branding queue indexes: {exc}") from exc
-
     async def sync_config(self):
         if self.config_col is None:
             return
@@ -1612,10 +1592,7 @@ class Database:
             "update_channel_id": int(os.getenv("UPDATE_CHANNEL", 0) or 0),
             "update_channel": os.getenv("UPDATE_CHANNEL_LINK", ""),
             "main_group": os.getenv("MAIN_GROUP_LINK", ""),
-            "file_branding_channel_id": int(os.getenv("FILE_BRANDING_CHANNEL_ID", 0) or 0),
-            "file_branding_text": os.getenv("FILE_BRANDING_TEXT", ""),
-            "file_branding_enabled": os.getenv("FILE_BRANDING_ENABLED", "").casefold()
-            in {"1", "true", "yes", "on"},
+            "request_channel_id": int(os.getenv("REQUEST_CHANNEL_ID", 0) or 0),
         }
         fields_to_set = {}
         for key, env_val in migrations.items():
@@ -2004,7 +1981,7 @@ class Database:
 
         return any(await asyncio.gather(*[_has_file(col) for col in self.file_cols]))
 
-    async def save_file(self, media, *, branding_status=None):
+    async def save_file(self, media):
         file_id = getattr(media, "file_id", "")
         file_unique_id = getattr(media, "file_unique_id", "") or ""
         file_name = normalize_file_name(getattr(media, "file_name", ""))
@@ -2038,8 +2015,6 @@ class Database:
         }
         if file_unique_id:
             file_doc["file_unique_id"] = file_unique_id
-        if branding_status:
-            file_doc["branding_status"] = str(branding_status)
         try:
             router = getattr(self, "shard_router", None)
             candidates = router.candidates() if router is not None else range(len(self.file_cols))
@@ -3055,9 +3030,10 @@ class Database:
                 return []
 
         cluster_results = await asyncio.gather(*[_search_cluster(col) for col in self.file_cols])
-        files = deduplicate_search_results(
-            [doc for docs in cluster_results for doc in docs if doc.get("branding_status") != "pending"]
-        )
+        # Legacy branding states are intentionally ignored. The removed
+        # branding worker left some original Telegram file IDs marked
+        # ``pending``; those originals are valid and must stay searchable.
+        files = deduplicate_search_results([doc for docs in cluster_results for doc in docs])
         return files[:max_results]
 
     async def _legacy_search_results(self, query, max_results=40, offset=0):
@@ -3143,9 +3119,7 @@ class Database:
 
         cluster_results = await asyncio.gather(*[_search_cluster(col) for col in self.file_cols])
 
-        files = deduplicate_search_results(
-            [doc for docs in cluster_results for doc in docs if doc.get("branding_status") != "pending"]
-        )
+        files = deduplicate_search_results([doc for docs in cluster_results for doc in docs])
         return files[:max_results]
 
     async def _get_search_results_uncached(self, query, max_results=40, offset=0):
@@ -3251,7 +3225,7 @@ class Database:
             cluster_number = registry_doc.get("cluster")
             if isinstance(cluster_number, int) and 1 <= cluster_number <= len(self.file_cols):
                 doc = await _bounded_find(self.file_cols[cluster_number - 1], {"_id": obj_id}, 2.5)
-                if doc and doc.get("branding_status") != "pending":
+                if doc:
                     return doc
 
         async def _fallback(cluster_index, collection):
@@ -3265,7 +3239,7 @@ class Database:
             (
                 (cluster, document)
                 for cluster, document in lookups
-                if document and document.get("branding_status") != "pending"
+                if document
             ),
             None,
         )
@@ -3409,9 +3383,7 @@ class Database:
                 "maintenance_mode": False,
                 "maintenance_message": "🔧 Bot is under maintenance. Back soon!",
                 "file_caption_template": "",
-                "file_branding_enabled": False,
-                "file_branding_channel_id": 0,
-                "file_branding_text": "",
+                "request_channel_id": 0,
             }
             await self.config_col.insert_one(config)
         _config_cache = config
@@ -3436,6 +3408,22 @@ class Database:
             "two_stage_channels",
         }:
             await self._sync_access_gates_from_legacy()
+        return True
+
+    async def update_config_fields(self, values: dict):
+        """Atomically update related settings and refresh the shared cache."""
+        global _config_cache, _config_cache_ts, _last_valid_config
+        if self.config_col is None or not values:
+            return False
+        clean_values = {str(key): value for key, value in values.items()}
+        await self.config_col.update_one(
+            {"_id": "bot_config"}, {"$set": clean_values}, upsert=True
+        )
+        updated = dict(_last_valid_config or _config_cache or {"_id": "bot_config"})
+        updated.update(clean_values)
+        _last_valid_config = updated
+        _config_cache = updated
+        _config_cache_ts = time.time()
         return True
 
     async def _sync_access_gates_from_legacy(self):
@@ -3515,7 +3503,15 @@ class Database:
 
     async def export_config(self, *, include_private_invites=False):
         config = await self.get_config()
-        exclude = {"_id", "log_channel", "admin_id", "db_channels", "update_channel_id", "db_channel"}
+        exclude = {
+            "_id",
+            "log_channel",
+            "request_channel_id",
+            "admin_id",
+            "db_channels",
+            "update_channel_id",
+            "db_channel",
+        }
         safe = {k: v for k, v in config.items() if k not in exclude}
         if include_private_invites:
             return safe
@@ -4023,344 +4019,6 @@ class Database:
 
     async def clear_old_searches(self, expiry_seconds=600):
         self._search_cache.purge(expiry_seconds)
-
-    async def set_file_branding_status(self, source_file_id: str, status: str):
-        """Change delivery visibility for one source row without moving media."""
-        source_file_id = str(source_file_id or "")
-        if not source_file_id:
-            return False
-
-        registry = None
-        if self.registry_col is not None:
-            try:
-                registry = await self.registry_col.find_one(
-                    {"file_id": source_file_id}, {"cluster": 1, "movie_id": 1}
-                )
-            except Exception:
-                registry = None
-        if registry:
-            cluster = registry.get("cluster")
-            movie_id = registry.get("movie_id")
-            if isinstance(cluster, int) and movie_id and 1 <= cluster <= len(self.file_cols):
-                try:
-                    result = await self.file_cols[cluster - 1].update_one(
-                        {"_id": ObjectId(movie_id)},
-                        {"$set": {"branding_status": str(status)}},
-                    )
-                    if result.matched_count:
-                        self._search_cache.clear()
-                        self._query_cache.clear()
-                        return True
-                except Exception:
-                    pass
-
-        for collection in self.file_cols:
-            try:
-                result = await collection.update_one(
-                    {
-                        "$or": [
-                            {"file_id": source_file_id},
-                            {"source_file_id": source_file_id},
-                        ]
-                    },
-                    {"$set": {"branding_status": str(status)}},
-                )
-                if result.matched_count:
-                    self._search_cache.clear()
-                    self._query_cache.clear()
-                    return True
-            except Exception:
-                continue
-        return False
-
-    async def enqueue_file_branding(self, payload: dict, delay_seconds=0):
-        """Queue one newly indexed file for a single, resumable re-upload."""
-        if self.file_branding_col is None:
-            raise RuntimeError("File-branding queue is unavailable")
-        source_file_id = str(payload.get("source_file_id", "") or "")
-        source_unique_id = str(payload.get("source_unique_id", "") or "")
-        identity = source_unique_id or source_file_id
-        if not identity:
-            raise ValueError("A Telegram file identity is required")
-        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
-        job_id = f"brand:{digest}"
-        existing = await self.file_branding_col.find_one({"_id": job_id}, {"_id": 1, "status": 1})
-        if existing and existing.get("status") == "complete":
-            return job_id
-        if existing is None:
-            depth = await self.file_branding_col.count_documents(
-                {"status": {"$in": ["pending", "running"]}},
-                limit=MAX_FILE_BRANDING_JOBS,
-            )
-            if depth >= MAX_FILE_BRANDING_JOBS:
-                raise RuntimeError("File-branding queue is full")
-        now = time.time()
-        await self.file_branding_col.update_one(
-            {"_id": job_id},
-            {
-                "$set": {
-                    "status": "pending",
-                    "payload": dict(payload),
-                    "due_at": now + max(0.0, float(delay_seconds)),
-                    "updated_at": now,
-                },
-                "$setOnInsert": {"created_at": now, "attempts": 0},
-                "$unset": {"locked_until": "", "lock_token": "", "last_error": ""},
-            },
-            upsert=True,
-        )
-        return job_id
-
-    async def claim_due_file_branding(self, lease_seconds=7200):
-        if self.file_branding_col is None:
-            return None
-        now = time.time()
-        lock_token = secrets.token_hex(16)
-        return await self.file_branding_col.find_one_and_update(
-            {
-                "status": {"$in": ["pending", "running"]},
-                "due_at": {"$lte": now},
-                "$or": [
-                    {"status": "pending"},
-                    {"locked_until": {"$lte": now}},
-                    {"locked_until": {"$exists": False}},
-                ],
-            },
-            {
-                "$set": {
-                    "status": "running",
-                    "lock_token": lock_token,
-                    "locked_until": now + max(300, int(lease_seconds)),
-                    "updated_at": now,
-                },
-                "$inc": {"attempts": 1},
-            },
-            sort=[("due_at", 1)],
-            return_document=ReturnDocument.AFTER,
-        )
-
-    async def complete_file_branding(self, job_id, lock_token: str, result: dict):
-        if self.file_branding_col is None:
-            return False
-        now = time.time()
-        updated = await self.file_branding_col.update_one(
-            {"_id": job_id, "lock_token": lock_token},
-            {
-                "$set": {
-                    "status": "complete",
-                    "result": dict(result),
-                    "completed_at": now,
-                    "updated_at": now,
-                    "expires_at": datetime.fromtimestamp(now + (30 * 24 * 3600), timezone.utc),
-                },
-                "$unset": {"locked_until": "", "lock_token": "", "last_error": ""},
-            },
-        )
-        return updated.modified_count == 1
-
-    async def checkpoint_file_branding_upload(self, job_id, lock_token: str, upload: dict):
-        """Remember a verified cache upload so a retry never uploads it twice."""
-        if self.file_branding_col is None:
-            return False
-        updated = await self.file_branding_col.update_one(
-            {"_id": job_id, "lock_token": lock_token},
-            {
-                "$set": {
-                    "uploaded": dict(upload),
-                    "updated_at": time.time(),
-                }
-            },
-        )
-        return updated.modified_count == 1
-
-    async def update_file_branding_progress(
-        self,
-        job_id,
-        lock_token: str,
-        *,
-        stage: str,
-        current: int,
-        total: int,
-        lease_seconds=7200,
-    ):
-        """Persist live transfer progress and keep a long upload's lease alive."""
-        if self.file_branding_col is None:
-            return False
-        now = time.time()
-        updated = await self.file_branding_col.update_one(
-            {"_id": job_id, "status": "running", "lock_token": lock_token},
-            {
-                "$set": {
-                    "progress": {
-                        "stage": str(stage),
-                        "current": max(0, int(current)),
-                        "total": max(0, int(total)),
-                        "updated_at": now,
-                    },
-                    "locked_until": now + max(1800, int(lease_seconds)),
-                    "updated_at": now,
-                }
-            },
-        )
-        return updated.matched_count == 1
-
-    async def retry_file_branding(self, job_id, lock_token: str, delay_seconds: float, error: str):
-        if self.file_branding_col is None:
-            return False
-        now = time.time()
-        updated = await self.file_branding_col.update_one(
-            {"_id": job_id, "lock_token": lock_token},
-            {
-                "$set": {
-                    "status": "pending",
-                    "due_at": now + max(5.0, float(delay_seconds)),
-                    "updated_at": now,
-                    "last_error": str(error)[:300],
-                },
-                "$unset": {"locked_until": "", "lock_token": ""},
-            },
-        )
-        return updated.modified_count == 1
-
-    async def fail_file_branding(self, job_id, lock_token: str, error: str):
-        if self.file_branding_col is None:
-            return False
-        now = time.time()
-        updated = await self.file_branding_col.update_one(
-            {"_id": job_id, "lock_token": lock_token},
-            {
-                "$set": {
-                    "status": "failed",
-                    "failed_at": now,
-                    "updated_at": now,
-                    "last_error": str(error)[:300],
-                    "expires_at": datetime.fromtimestamp(now + (30 * 24 * 3600), timezone.utc),
-                },
-                "$unset": {"locked_until": "", "lock_token": ""},
-            },
-        )
-        return updated.modified_count == 1
-
-    async def file_branding_stats(self):
-        if self.file_branding_col is None:
-            return {"pending": 0, "running": 0, "complete": 0, "failed": 0}
-        statuses = ("pending", "running", "complete", "failed")
-        counts = await asyncio.gather(
-            *[self.file_branding_col.count_documents({"status": status}) for status in statuses]
-        )
-        stats = dict(zip(statuses, counts))
-        stats["active"] = await self.file_branding_col.find_one(
-            {"status": "running"},
-            {"progress": 1, "payload.original_file_name": 1},
-            sort=[("updated_at", -1)],
-        )
-        return stats
-
-    async def replace_with_branded_media(
-        self,
-        *,
-        source_file_id: str,
-        branded_media,
-        branded_file_name: str,
-        branded_channel_id: int,
-        branded_message_id: int,
-    ):
-        """Idempotently switch one movie row and registry claim to branded media."""
-        new_file_id = str(getattr(branded_media, "file_id", "") or "")
-        new_unique_id = str(getattr(branded_media, "file_unique_id", "") or "")
-        if not source_file_id or not new_file_id:
-            raise ValueError("Both source and branded Telegram file IDs are required")
-
-        registry = None
-        if self.registry_col is not None:
-            registry = await self.registry_col.find_one(
-                {
-                    "$or": [
-                        {"file_id": source_file_id},
-                        {"file_id": new_file_id},
-                    ]
-                }
-            )
-
-        location = None
-        if registry:
-            cluster = registry.get("cluster")
-            movie_id = registry.get("movie_id")
-            if isinstance(cluster, int) and movie_id and 1 <= cluster <= len(self.file_cols):
-                try:
-                    location = (
-                        cluster,
-                        await self.file_cols[cluster - 1].find_one(
-                            {
-                                "_id": ObjectId(movie_id),
-                                "$or": [
-                                    {"file_id": source_file_id},
-                                    {"file_id": new_file_id},
-                                    {"source_file_id": source_file_id},
-                                ],
-                            }
-                        ),
-                    )
-                except Exception:
-                    location = None
-        if not location or not location[1]:
-            for cluster, collection in enumerate(self.file_cols, 1):
-                document = await collection.find_one(
-                    {
-                        "$or": [
-                            {"file_id": source_file_id},
-                            {"file_id": new_file_id},
-                            {"source_file_id": source_file_id},
-                        ]
-                    }
-                )
-                if document:
-                    location = (cluster, document)
-                    break
-        if not location or not location[1]:
-            raise RuntimeError("The indexed source row no longer exists")
-
-        cluster, movie = location
-        collection = self.file_cols[cluster - 1]
-        update = {
-            "file_id": new_file_id,
-            "source_file_id": source_file_id,
-            "delivery_file_name": str(branded_file_name),
-            "branding_status": "complete",
-            "branded_channel_id": int(branded_channel_id),
-            "branded_message_id": int(branded_message_id),
-            "branded_at": time.time(),
-        }
-        if new_unique_id:
-            update["file_unique_id"] = new_unique_id
-        await collection.update_one({"_id": movie["_id"]}, {"$set": update})
-
-        if self.registry_col is not None:
-            registry_update = {
-                "file_id": new_file_id,
-                "cluster": cluster,
-                "movie_id": str(movie["_id"]),
-            }
-            if new_unique_id:
-                registry_update["file_unique_id"] = new_unique_id
-            result = await self.registry_col.update_one(
-                {"file_id": source_file_id}, {"$set": registry_update}
-            )
-            if result.matched_count == 0:
-                await self.registry_col.update_one(
-                    {"file_id": new_file_id},
-                    {"$set": registry_update},
-                    upsert=True,
-                )
-
-        self._search_cache.clear()
-        self._query_cache.clear()
-        return {
-            "cluster": cluster,
-            "movie_id": str(movie["_id"]),
-            "file_id": new_file_id,
-            "file_unique_id": new_unique_id,
-        }
 
     async def enqueue_notification_job(self, kind: str, coalesce_key: str, payload: dict, delay_seconds=0):
         """Persist a coalesced, bounded notification-pipeline job."""

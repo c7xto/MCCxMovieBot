@@ -130,8 +130,8 @@ class WorkloadControlTests(unittest.TestCase):
         expected = {
             "plugins/filter.py": ("search_slot(", "delivery_guard("),
             "plugins/group_connect.py": ("search_slot(",),
-            "plugins/start.py": ("search_slot(", "delivery_guard("),
-            "plugins/req_fsub.py": ("delivery_guard(",),
+            "plugins/start.py": ("search_slot(", "deliver_cached_file"),
+            "plugins/req_fsub.py": ("deliver_cached_file",),
         }
         for relative_path, controls in expected.items():
             source = (ROOT / relative_path).read_text(encoding="utf-8")

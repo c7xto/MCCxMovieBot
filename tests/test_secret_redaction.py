@@ -49,6 +49,7 @@ class SecretRedactionTests(unittest.TestCase):
         config = {
             "update_channel": "https://t.me/+updates-secret",
             "main_group": "https://t.me/public_group",
+            "request_channel_id": -1001234,
             "fsub_channels": [{"id": -1001, "link": "https://t.me/+gate-secret"}],
         }
         database = Database.__new__(Database)
@@ -61,6 +62,8 @@ class SecretRedactionTests(unittest.TestCase):
         self.assertEqual(ordinary["fsub_channels"], [{"id": -1001}])
         self.assertEqual(secret["update_channel"], config["update_channel"])
         self.assertEqual(secret["fsub_channels"][0]["link"], "https://t.me/+gate-secret")
+        self.assertNotIn("request_channel_id", ordinary)
+        self.assertNotIn("request_channel_id", secret)
         self.assertEqual(validate_config_restore(ordinary), {"main_group": "https://t.me/public_group"})
 
     def test_environment_migration_logs_never_include_values(self):

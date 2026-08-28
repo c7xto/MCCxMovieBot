@@ -40,17 +40,10 @@ async def group_manager_menu(client: Client, callback: CallbackQuery):
     markup = InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("📋 All Groups", callback_data="gm_list"),
+                InlineKeyboardButton("⚙ Manage Groups", callback_data="gm_settings_prompt"),
                 InlineKeyboardButton("🔎 Find", callback_data="gm_find"),
             ],
-            [
-                InlineKeyboardButton("🚫 Ban", callback_data="gm_ban_prompt"),
-                InlineKeyboardButton("✅ Unban", callback_data="gm_unban_prompt"),
-            ],
-            [
-                InlineKeyboardButton("⚙ Group Settings", callback_data="gm_settings_prompt"),
-                InlineKeyboardButton("📢 Broadcast", callback_data="gm_broadcast_prompt"),
-            ],
+            [InlineKeyboardButton("📢 Broadcast Guide", callback_data="gm_broadcast_prompt")],
             [InlineKeyboardButton(f"🔄 {toggle_label}", callback_data="gm_toggle_mode")],
             [InlineKeyboardButton("‹ Control Center", callback_data="back_to_admin")],
         ]
@@ -84,24 +77,6 @@ async def gm_list_groups(client: Client, callback: CallbackQuery):
 
     if len(groups) > 20:
         text += f"\n_...and {len(groups) - 20} more_"
-
-    await callback.message.edit_text(text, reply_markup=_BACK_BTN)
-
-
-@Client.on_callback_query(filters.regex(r"^gm_top$") & filters.user(ADMIN_ID))
-async def gm_top_groups(client: Client, callback: CallbackQuery):
-    await answer_callback_safely(callback)
-    top = await db.get_top_groups(limit=10)
-
-    if not top:
-        await callback.message.edit_text("📊 No group activity data yet.", reply_markup=_BACK_BTN)
-        return
-
-    text = "📊 **Top 10 Groups by Search Volume**\n\n"
-    for i, g in enumerate(top, 1):
-        count = g.get("search_count", 0)
-        title = g.get("title", "Unknown")[:30]
-        text += f"{i}. `{g['_id']}` — {title}\n   🔍 `{count}` searches\n"
 
     await callback.message.edit_text(text, reply_markup=_BACK_BTN)
 
@@ -166,6 +141,7 @@ async def gm_settings_prompt(client: Client, callback: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^gm_view_settings#") & filters.user(ADMIN_ID))
 async def gm_view_settings(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback)
     try:
         group_id = int(callback.data.split("#")[1])
     except (ValueError, IndexError):
@@ -176,7 +152,8 @@ async def gm_view_settings(client: Client, callback: CallbackQuery):
         return
 
     settings = group.get("settings", {})
-    auto_del = settings.get("auto_delete_time", "default")
+    auto_del = settings.get("auto_delete_time")
+    auto_del_label = f"{max(1, int(auto_del) // 60)} min override" if auto_del else "Global default"
     whitelisted = group.get("whitelisted", False)
     banned = group.get("banned", False)
 
@@ -185,26 +162,38 @@ async def gm_view_settings(client: Client, callback: CallbackQuery):
         f"🆔 `{group_id}`\n\n"
         f"🚫 Banned: `{banned}`\n"
         f"✅ Whitelisted: `{whitelisted}`\n"
-        f"⏱ Auto-delete: `{auto_del}` seconds\n"
+        f"⏱ Auto-delete: `{auto_del_label}`\n"
         f"🔍 Total searches: `{group.get('search_count', 0)}`"
     )
 
+    access_button = (
+        InlineKeyboardButton("✅ Unban", callback_data=f"gm_unban_confirm#{group_id}")
+        if banned
+        else InlineKeyboardButton("🚫 Ban", callback_data=f"gm_ban_confirm#{group_id}")
+    )
     markup = InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("✅ Whitelist", callback_data=f"gm_whitelist#{group_id}"),
-                InlineKeyboardButton("🚫 Ban", callback_data=f"gm_ban_confirm#{group_id}"),
+                InlineKeyboardButton(
+                    "⚪ Remove Whitelist" if whitelisted else "✅ Whitelist",
+                    callback_data=f"gm_whitelist#{group_id}",
+                ),
+                access_button,
             ],
-            [InlineKeyboardButton("⏱ Set Auto-Delete", callback_data=f"gm_set_autodel#{group_id}")],
+            [
+                InlineKeyboardButton(
+                    "⏱ Auto-Delete Override", callback_data=f"gm_set_autodel#{group_id}"
+                )
+            ],
             [InlineKeyboardButton("‹ Group Manager", callback_data="group_manager_menu")],
         ]
     )
     await callback.message.edit_text(text, reply_markup=markup)
-    await answer_callback_safely(callback)
 
 
 @Client.on_callback_query(filters.regex(r"^gm_whitelist#") & filters.user(ADMIN_ID))
 async def gm_whitelist_toggle(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback, "Updating group access…")
     try:
         group_id = int(callback.data.split("#")[1])
     except (ValueError, IndexError):
@@ -215,8 +204,6 @@ async def gm_whitelist_toggle(client: Client, callback: CallbackQuery):
         return
     new_val = not group.get("whitelisted", False)
     await db.update_group(group_id, {"whitelisted": new_val})
-    status = "✅ Whitelisted" if new_val else "⚪ Removed from whitelist"
-    await answer_callback_safely(callback, f"{status}", show_alert=True)
     # Refresh settings view
     callback.data = f"gm_view_settings#{group_id}"
     await gm_view_settings(client, callback)
@@ -224,12 +211,24 @@ async def gm_whitelist_toggle(client: Client, callback: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^gm_ban_confirm#") & filters.user(ADMIN_ID))
 async def gm_ban_confirm(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback, "Updating group access…")
     try:
         group_id = int(callback.data.split("#")[1])
     except (ValueError, IndexError):
         return await answer_callback_safely(callback, "❌ Malformed callback.", show_alert=True)
     await _ban_group(client, callback.message, group_id)
-    await answer_callback_safely(callback)
+
+
+@Client.on_callback_query(filters.regex(r"^gm_unban_confirm#") & filters.user(ADMIN_ID))
+async def gm_unban_confirm(client: Client, callback: CallbackQuery):
+    await answer_callback_safely(callback, "Updating group access…")
+    try:
+        group_id = int(callback.data.split("#")[1])
+    except (ValueError, IndexError):
+        return await answer_callback_safely(callback, "❌ Malformed callback.", show_alert=True)
+    await db.unban_group(group_id)
+    callback.data = f"gm_view_settings#{group_id}"
+    await gm_view_settings(client, callback)
 
 
 @Client.on_callback_query(filters.regex(r"^gm_set_autodel#") & filters.user(ADMIN_ID))
@@ -241,7 +240,7 @@ async def gm_set_autodel_prompt(client: Client, callback: CallbackQuery):
     await begin_prompt(
         callback,
         f"gm_autodel#{group_id}",
-        f"⏱ **Set Auto-Delete for group `{group_id}`**\n\n"
+        f"⏱ **Auto-Delete Override for group `{group_id}`**\n\n"
         f"Send the number of minutes (1–60).\n"
         f"Send `0` to use the global default.",
     )
