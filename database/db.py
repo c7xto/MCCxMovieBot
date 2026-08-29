@@ -1245,7 +1245,8 @@ class Database:
                     f"{hashlib.sha256(f'{source.name}:{name}'.encode()).hexdigest()[:20]}"
                 )
                 checkpoint = await checkpoint_col.find_one(
-                    {"_id": checkpoint_id}, {"last_id": 1, "complete": 1}
+                    {"_id": checkpoint_id},
+                    {"last_id": 1, "complete": 1, "conflict_count": 1},
                 )
                 if checkpoint and checkpoint.get("complete"):
                     validated[f"{source.name}:{name}"] = await source_col.count_documents({})
@@ -1254,8 +1255,11 @@ class Database:
                 if checkpoint and "last_id" in checkpoint:
                     query = {"_id": {"$gt": checkpoint["last_id"]}}
                 ops = []
-                batch_last_id = None
+                batch_last_id = checkpoint.get("last_id") if checkpoint else None
                 collection_copied = 0
+                collection_conflicts = int(
+                    (checkpoint or {}).get("conflict_count", 0) or 0
+                )
                 async for original in source_col.find(query).sort("_id", 1):
                     document = dict(original)
                     document_id = document.pop("_id")
@@ -1273,9 +1277,15 @@ class Database:
                         )
                     )
                     if len(ops) >= 2000:
-                        result = await target_col.bulk_write(ops, ordered=False)
-                        copied += result.upserted_count
-                        collection_copied += result.upserted_count
+                        inserted, conflicts = await self._write_operations_migration_batch(
+                            target_col,
+                            ops,
+                            collection=name,
+                            source=source.name,
+                        )
+                        copied += inserted
+                        collection_copied += inserted
+                        collection_conflicts += conflicts
                         await checkpoint_col.update_one(
                             {"_id": checkpoint_id},
                             {
@@ -1283,6 +1293,7 @@ class Database:
                                     "source": source.name,
                                     "collection": name,
                                     "last_id": batch_last_id,
+                                    "conflict_count": collection_conflicts,
                                     "updated_at": datetime.now(timezone.utc),
                                 }
                             },
@@ -1297,9 +1308,15 @@ class Database:
                             )
                         ops = []
                 if ops:
-                    result = await target_col.bulk_write(ops, ordered=False)
-                    copied += result.upserted_count
-                    collection_copied += result.upserted_count
+                    inserted, conflicts = await self._write_operations_migration_batch(
+                        target_col,
+                        ops,
+                        collection=name,
+                        source=source.name,
+                    )
+                    copied += inserted
+                    collection_copied += inserted
+                    collection_conflicts += conflicts
                     await checkpoint_col.update_one(
                         {"_id": checkpoint_id},
                         {
@@ -1307,6 +1324,7 @@ class Database:
                                 "source": source.name,
                                 "collection": name,
                                 "last_id": batch_last_id,
+                                "conflict_count": collection_conflicts,
                                 "updated_at": datetime.now(timezone.utc),
                             }
                         },
@@ -1315,7 +1333,19 @@ class Database:
 
                 source_count = await source_col.count_documents({})
                 target_count = await target_col.count_documents({})
-                if target_count < source_count:
+                if name == "file_registry":
+                    remaining_query = (
+                        {"_id": {"$gt": batch_last_id}}
+                        if batch_last_id is not None
+                        else {}
+                    )
+                    remaining = await source_col.count_documents(remaining_query)
+                    if remaining:
+                        raise RuntimeError(
+                            "Operations migration validation failed for file_registry: "
+                            f"{remaining} source document(s) remain after the checkpoint"
+                        )
+                elif target_count < source_count:
                     raise RuntimeError(
                         f"Operations migration validation failed for {name}: "
                         f"source={source_count}, target={target_count}"
@@ -1328,6 +1358,7 @@ class Database:
                             "complete": True,
                             "source_count": source_count,
                             "target_count": target_count,
+                            "conflict_count": collection_conflicts,
                             "completed_at": datetime.now(timezone.utc),
                         }
                     },
@@ -1350,6 +1381,47 @@ class Database:
             "✅ Dedicated operations migration complete: %s new document(s); legacy retained.",
             copied,
         )
+
+    @staticmethod
+    async def _write_operations_migration_batch(
+        target_col,
+        operations,
+        *,
+        collection: str,
+        source: str,
+    ) -> tuple[int, int]:
+        """Write one migration batch while safely merging registry identities.
+
+        Legacy registry databases can contain the same Telegram file under
+        different MongoDB ``_id`` values.  The dedicated registry correctly
+        enforces unique Telegram identities, so those rows are merge conflicts,
+        not fatal migration errors.  Unordered bulk writes already apply every
+        non-conflicting operation; we preserve the existing target record and
+        count only duplicate-key failures as merged conflicts.  Any other write
+        error remains fatal.
+        """
+        try:
+            result = await target_col.bulk_write(operations, ordered=False)
+            return int(result.upserted_count), 0
+        except BulkWriteError as exc:
+            details = exc.details or {}
+            write_errors = details.get("writeErrors") or []
+            duplicate_only = bool(write_errors) and all(
+                int(error.get("code", 0) or 0) == 11000 for error in write_errors
+            )
+            if collection != "file_registry" or not duplicate_only:
+                raise
+
+            conflicts = len(write_errors)
+            inserted = int(details.get("nUpserted", 0) or 0)
+            logger.info(
+                "Operations migration %s/%s: preserved %s existing registry "
+                "record(s) that matched a legacy identity",
+                source,
+                collection,
+                f"{conflicts:,}",
+            )
+            return inserted, conflicts
 
     async def migrate_access_gates(self):
         """Idempotently add the canonical schema while retaining old fields."""
