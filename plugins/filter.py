@@ -500,11 +500,11 @@ def _flat_file_label(file_doc: dict, max_length: int | None = None) -> str:
     else:
         title, year = _display_title(filename)
         identity = f"{title} ({year})" if year else title
-    fields.append(f"[{identity or 'Unnamed file'}]")
+    fields.append(identity or "Unnamed file")
 
     language, _ = extract_attributes(filename)
     if language not in ("", "Other"):
-        fields.append(f"[{language}]")
+        fields.append(f"• {language}")
 
     label = " ".join(fields)
     if max_length is not None and len(label) > max_length:
