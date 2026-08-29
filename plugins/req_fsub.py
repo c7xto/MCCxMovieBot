@@ -31,7 +31,8 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message
+from pyrogram.types import InlineKeyboardButton, CallbackQuery, Message
+from plugins.mobile_ui import MobileInlineKeyboardMarkup as InlineKeyboardMarkup
 from pyrogram.enums import ParseMode
 from database.db import db
 from plugins.access_policy import authorize_user_action, enforce_user_action

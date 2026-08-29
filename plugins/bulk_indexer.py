@@ -10,7 +10,8 @@ from pyrogram import Client, filters
 from pyrogram import ContinuePropagation, StopPropagation
 from pyrogram.enums import ParseMode
 from pyrogram.errors import MessageNotModified
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from pyrogram.types import Message, InlineKeyboardButton, CallbackQuery
+from plugins.mobile_ui import MobileInlineKeyboardMarkup as InlineKeyboardMarkup
 from database.db import db, AllClustersFullError, normalize_file_name
 from utils import ADMIN_ID, html_user_mention, report_internal_error
 

@@ -17,7 +17,8 @@ from pyrogram.errors import (
 )
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from pyrogram.types import Message, InlineKeyboardButton, CallbackQuery
+from plugins.mobile_ui import MobileInlineKeyboardMarkup as InlineKeyboardMarkup
 from database.db import db
 from plugins.access_policy import enforce_user_action
 from plugins.callbacks import answer_callback_safely

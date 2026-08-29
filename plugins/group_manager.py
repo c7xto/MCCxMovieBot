@@ -3,7 +3,8 @@ import asyncio
 import logging
 from dotenv import load_dotenv
 from pyrogram import Client, filters, ContinuePropagation, StopPropagation
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from pyrogram.types import Message, InlineKeyboardButton, CallbackQuery
+from plugins.mobile_ui import MobileInlineKeyboardMarkup as InlineKeyboardMarkup
 from pyrogram.enums import ParseMode
 from database.db import db
 from plugins.state import get_state, set_state, clear_state

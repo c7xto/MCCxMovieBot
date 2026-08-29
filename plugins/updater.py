@@ -24,9 +24,9 @@ from pyrogram.enums import ParseMode
 from pyrogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
-    InlineKeyboardMarkup,
     Message,
 )
+from plugins.mobile_ui import MobileInlineKeyboardMarkup as InlineKeyboardMarkup
 
 from database.db import db
 from plugins.callbacks import answer_callback_safely

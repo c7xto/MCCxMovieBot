@@ -12,7 +12,8 @@ from pathlib import Path
 
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait
-from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from pyrogram.types import CallbackQuery, InlineKeyboardButton
+from plugins.mobile_ui import MobileInlineKeyboardMarkup as InlineKeyboardMarkup
 from database.db import db
 from plugins.callbacks import answer_callback_safely
 from plugins.filter import send_smart_log

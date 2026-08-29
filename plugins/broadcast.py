@@ -6,7 +6,8 @@ from collections import deque
 
 from pyrogram import Client, filters
 from pyrogram.errors import InputUserDeactivated, MessageNotModified, UserIsBlocked
-from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from pyrogram.types import CallbackQuery, InlineKeyboardButton, Message
+from plugins.mobile_ui import MobileInlineKeyboardMarkup as InlineKeyboardMarkup
 
 from database.db import db
 from database.redis_client import redis_state

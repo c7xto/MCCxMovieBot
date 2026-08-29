@@ -3,7 +3,8 @@
 import time
 
 from pyrogram.enums import MessageEntityType
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
+from pyrogram.types import InlineKeyboardButton, MessageEntity
+from plugins.mobile_ui import MobileInlineKeyboardMarkup as InlineKeyboardMarkup
 
 from database.redis_client import redis_state
 

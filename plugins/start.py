@@ -19,7 +19,8 @@ from utils import (
     html_user_mention,
 )
 from pyrogram import Client, filters
-from pyrogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, Message
+from pyrogram.types import CallbackQuery, InlineKeyboardButton, Message
+from plugins.mobile_ui import MobileInlineKeyboardMarkup as InlineKeyboardMarkup
 from pyrogram.enums import ParseMode, ChatAction
 from database.db import db
 

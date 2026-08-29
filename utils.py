@@ -4,7 +4,8 @@ import asyncio
 import logging
 import secrets
 from dotenv import load_dotenv
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import InlineKeyboardButton
+from plugins.mobile_ui import MobileInlineKeyboardMarkup as InlineKeyboardMarkup
 try:
     from pyrogram.types import LinkPreviewOptions
     def _no_preview(): return {"link_preview_options": LinkPreviewOptions(is_disabled=True)}

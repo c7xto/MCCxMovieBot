@@ -8,7 +8,8 @@ from pyrogram import ContinuePropagation, StopPropagation
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
 from pyrogram.errors import MessageNotModified
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from pyrogram.types import Message, InlineKeyboardButton, CallbackQuery
+from plugins.mobile_ui import MobileInlineKeyboardMarkup as InlineKeyboardMarkup
 from database.db import db, validate_config_restore
 from database.redis_client import redis_state
 from plugins.state import (
@@ -63,7 +64,7 @@ def _parse_config_backup(raw: bytes) -> dict:
     return validate_config_restore(parsed)
 
 
-def _format_config_value(value, limit=120):
+def _format_config_value(value, limit=72):
     rendered = json.dumps(value, ensure_ascii=False, default=str)
     return rendered if len(rendered) <= limit else f"{rendered[: limit - 3]}..."
 
@@ -71,10 +72,15 @@ def _format_config_value(value, limit=120):
 def _format_restore_diff(current: dict, changes: dict) -> str:
     lines = ["Config restore preview", ""]
     for key in sorted(changes):
-        lines.append(
-            f"{key}: {_format_config_value(current.get(key))} -> {_format_config_value(changes[key])}"
+        lines.extend(
+            [
+                f"**{key}**",
+                f"Before: `{_format_config_value(current.get(key))}`",
+                f"After: `{_format_config_value(changes[key])}`",
+                "",
+            ]
         )
-    lines.extend(["", "Apply these changes?"])
+    lines.append("Apply these changes?")
     return "\n".join(lines)
 
 
@@ -343,7 +349,10 @@ def _cluster_status_line(health: dict) -> str:
     else:
         bar = "▱" * 10
         usage = "`Unavailable`"
-    return f"{icon} C{health.get('cluster')}  {bar}  {usage} • {label}"
+    return (
+        f"{icon} **Cluster {health.get('cluster')}** • {label}\n"
+        f"`{bar}`  {usage}"
+    )
 
 
 async def _show_analytics_page(callback, text, active):

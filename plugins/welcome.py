@@ -2,8 +2,9 @@ import logging
 from dotenv import load_dotenv
 from pyrogram import Client, filters
 from pyrogram.types import (
-    Message, InlineKeyboardMarkup, InlineKeyboardButton, ChatMemberUpdated
+    Message, InlineKeyboardButton, ChatMemberUpdated
 )
+from plugins.mobile_ui import MobileInlineKeyboardMarkup as InlineKeyboardMarkup
 from pyrogram.enums import ChatMemberStatus, ParseMode
 from database.db import db
 from utils import _no_preview, html_user_mention

@@ -4,7 +4,8 @@ import logging
 
 from pyrogram import Client, filters
 from pyrogram.errors import MessageNotModified
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from pyrogram.types import InlineKeyboardButton
+from plugins.mobile_ui import MobileInlineKeyboardMarkup as InlineKeyboardMarkup
 
 from plugins.callbacks import answer_callback_safely
 from plugins.state import clear_state, get_state_context, set_state
