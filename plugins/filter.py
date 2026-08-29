@@ -529,6 +529,7 @@ def _build_results_caption(query: str, total: int, page: int, total_pages: int, 
         [
             "",
             f"📁 <b>Files:</b> {total}  •  📚 <b>Page:</b> {page + 1} / {total_pages}",
+            "Choose a file below. Size, language, quality and codec are shown clearly.",
         ]
     )
     return "\n".join(lines)

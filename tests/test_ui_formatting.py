@@ -230,7 +230,9 @@ def test_results_caption_contains_shared_count_and_page_header():
     assert "Files:</b> 152" in caption
     assert "Page:</b> 1 / 16" in caption
     assert "👤 <b>7</b>" in caption
-    assert "Choose below" not in caption
+    assert "Choose a file below" in caption
+    assert "language, quality and codec" in caption
+    assert max(len(line) for line in caption.splitlines()) >= 70
 
 
 def test_movie_results_sort_from_largest_to_smallest():
