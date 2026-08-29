@@ -56,12 +56,23 @@ def _build_group_buttons(
     total_pages,
     delete_seconds=None,
 ):
-    """Build the same flat rows as DM, using deep links for delivery."""
+    """Build the same clean callback rows used in private search results.
+
+    The callback response opens the private delivery link.  This removes the
+    permanent external-link arrow from every row and lets Telegram wrap long
+    labels like the reference bot while preserving private file delivery.
+    """
     buttons = []
     for f in page_files:
-        delete_suffix = f"_d{int(delete_seconds)}" if delete_seconds else ""
-        bot_url = f"https://t.me/{client_username}?start=file_{f['_id']}{delete_suffix}"
-        buttons.append([InlineKeyboardButton(_flat_file_label(f), url=bot_url)])
+        delete_value = int(delete_seconds) if delete_seconds else 0
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    _flat_file_label(f),
+                    callback_data=f"grpfile#{f['_id']}#{delete_value}",
+                )
+            ]
+        )
 
     # Navigation row — pagination goes back to DM full search for group
     nav = []
@@ -373,10 +384,7 @@ async def group_search(client: Client, message: Message):
                 [
                     InlineKeyboardButton(
                         compact_label,
-                        url=(
-                            f"https://t.me/{client.me.username}?start="
-                            f"file_{file_doc['_id']}_d{_del_secs}"
-                        ),
+                        callback_data=f"grpfile#{file_doc['_id']}#{_del_secs}",
                     )
                 ]
             )
@@ -420,6 +428,27 @@ async def group_search(client: Client, message: Message):
 
 
 # ─── Group pagination callback ────────────────────────────────────────────────
+
+
+@Client.on_callback_query(filters.regex(r"^grpfile#"))
+async def open_group_file_in_private(client: Client, callback: CallbackQuery):
+    """Open a selected group result in the bot's private delivery flow."""
+    parts = callback.data.split("#", 2)
+    if len(parts) != 3 or not parts[1]:
+        await answer_callback_safely(callback, "This file button is invalid.", show_alert=True)
+        return
+
+    file_obj_id, raw_delete_seconds = parts[1], parts[2]
+    try:
+        delete_seconds = max(0, int(raw_delete_seconds))
+    except (TypeError, ValueError):
+        delete_seconds = 0
+    delete_suffix = f"_d{delete_seconds}" if delete_seconds else ""
+    deep_link = (
+        f"https://t.me/{client.me.username}?start="
+        f"file_{file_obj_id}{delete_suffix}"
+    )
+    await answer_callback_safely(callback, url=deep_link)
 
 
 @Client.on_callback_query(filters.regex(r"^grppage#"))

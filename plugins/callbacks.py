@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 _CALLBACK_DEDUP_TTL = 30
 
 
-async def answer_callback_safely(callback, text=None, *, show_alert=False) -> bool:
+async def answer_callback_safely(callback, text=None, *, show_alert=False, url=None) -> bool:
     """Answer promptly; an expired Telegram callback is harmless user input."""
     # A callback query can be answered only once.  Mark it locally so nested
     # policy/verification helpers do not make a second Telegram request and
@@ -28,8 +28,11 @@ async def answer_callback_safely(callback, text=None, *, show_alert=False) -> bo
         return True
     started = time.monotonic()
     try:
+        answer_kwargs = {"show_alert": show_alert}
+        if url:
+            answer_kwargs["url"] = url
         await telegram_call(
-            lambda: callback.answer(text, show_alert=show_alert),
+            lambda: callback.answer(text, **answer_kwargs),
             route="callback_answer",
             policy=INTERACTIVE_RETRY,
             retry_safe=False,

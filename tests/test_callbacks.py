@@ -24,6 +24,14 @@ async def test_fresh_callback_is_answered():
 
 
 @pytest.mark.asyncio
+async def test_callback_can_open_a_private_bot_deep_link():
+    callback = SimpleNamespace(data="button", answer=AsyncMock())
+    url = "https://t.me/examplebot?start=file_abc"
+    assert await answer_callback_safely(callback, url=url) is True
+    callback.answer.assert_awaited_once_with(None, show_alert=False, url=url)
+
+
+@pytest.mark.asyncio
 async def test_idless_mock_callbacks_cannot_collide_via_reused_memory_ids():
     first = SimpleNamespace(data="button", answer=AsyncMock())
     second = SimpleNamespace(data="button", answer=AsyncMock())
