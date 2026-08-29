@@ -454,18 +454,6 @@ def _listing_name(filename: str) -> tuple[str, str]:
     return name or "Unnamed file", episode
 
 
-def _smart_metadata(filename: str) -> list[str]:
-    """Return stable, non-duplicated metadata fields for a button label."""
-    language, quality = extract_attributes(filename)
-    codec = _extract_codec(filename)
-    fields = []
-    for value in (language, quality, codec):
-        if value in ("", "Other") or value in fields:
-            continue
-        fields.append(value)
-    return fields
-
-
 def _series_identity(filename: str) -> tuple[str, str]:
     """Extract only the series name and SxxExx marker.
 
@@ -498,54 +486,30 @@ def _series_identity(filename: str) -> tuple[str, str]:
 
 
 def _flat_file_label(file_doc: dict, max_length: int | None = None) -> str:
-    """Build a clean, reference-style label for one full-width file row.
+    """Build a compact, structured label without release-name clutter.
 
-    Important details use their complete names and remain in filename order.
-    Callback buttons are allowed to wrap naturally on clients with less
-    horizontal room instead of forcing every device into a cramped 40-character
-    abbreviation budget.
+    Movies show size, verified-looking title identity and language. Series add
+    the season/episode marker. Quality, codec, source and release-group tokens
+    stay out of the button because they are the main cause of mobile overflow.
     """
     filename = file_doc.get("file_name", "")
-    prefix = f"[{_fmt_size(file_doc)}]"
+    fields = [f"[{_fmt_size(file_doc)}]"]
     if _is_series(filename):
         identity, episode = _series_identity(filename)
-        prefix += f" [{episode}]"
+        fields.append(f"[{episode}]")
     else:
         title, year = _display_title(filename)
         identity = f"{title} ({year})" if year else title
-    parts = [prefix, identity or "Unnamed file", *_smart_metadata(filename)]
-    label = " ".join(part for part in parts if part)
+    fields.append(f"[{identity or 'Unnamed file'}]")
+
+    language, _ = extract_attributes(filename)
+    if language not in ("", "Other"):
+        fields.append(f"[{language}]")
+
+    label = " ".join(fields)
     if max_length is not None and len(label) > max_length:
         return label[: max(1, max_length - 1)].rstrip() + "…"
     return label
-
-
-def _build_file_links(
-    page_files: list,
-    bot_username: str,
-    delete_seconds: int | None = None,
-) -> str:
-    """Render one large, touch-friendly text link per file.
-
-    Telegram sizes inline keyboards independently from the message bubble on
-    Android.  Keeping file choices inside the message avoids that mismatch
-    while preserving the complete smart label.  Old callback handlers remain
-    available so result cards created before this update keep working.
-    """
-    username = str(bot_username or "").lstrip("@")
-    if not username:
-        return ""
-
-    suffix = f"_d{max(0, int(delete_seconds))}" if delete_seconds else ""
-    links = []
-    for file_doc in page_files:
-        file_obj_id = quote(str(file_doc.get("_id", "")), safe="")
-        if not file_obj_id:
-            continue
-        url = f"https://t.me/{username}?start=file_{file_obj_id}{suffix}"
-        label = _html(_flat_file_label(file_doc))
-        links.append(f'<b><a href="{url}">📄 {label}</a></b>')
-    return "\n\n".join(links)
 
 
 def _build_results_caption(query: str, total: int, page: int, total_pages: int, first_name: str = "") -> str:
@@ -791,11 +755,22 @@ async def deliver_cached_file(
 
 
 def _build_result_buttons(results: list, session_id: str, page: int, per_page: int = 10):
-    """Build only the compact navigation row for a text-link result page."""
+    """Build compact structured file buttons plus simple pagination."""
     total = len(results)
     total_pages = max(1, (total + per_page - 1) // per_page)
     page = max(0, min(page, total_pages - 1))
+    start_idx = page * per_page
+    page_files = results[start_idx : start_idx + per_page]
     buttons = []
+    for file_doc in page_files:
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    _flat_file_label(file_doc),
+                    callback_data=f"sendfile#{file_doc['_id']}",
+                )
+            ]
+        )
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("⬅ PREV", callback_data=f"page#{session_id}#{page - 1}"))
@@ -814,17 +789,13 @@ def _build_movie_result_buttons(results: list, session_id: str, page: int, per_p
 
 
 async def _render_results_view(client, message, session_id: str, page: int, data: dict, user_id=None):
-    """Render every successful DM search as clean in-message file links."""
+    """Render every successful DM search with structured inline file rows."""
     results = data["results"]
     query = data["query"]
     total = len(results)
     buttons, page, total_pages = _build_result_buttons(results, session_id, page)
     caption = _build_results_caption(query, total, page, total_pages, data.get("first_name", ""))
-    page_files = results[page * 10 : (page + 1) * 10]
-    file_links = _build_file_links(page_files, client.me.username)
-    if file_links:
-        caption += f"\n\n{file_links}"
-    markup = InlineKeyboardMarkup(buttons) if buttons else None
+    markup = InlineKeyboardMarkup(buttons)
 
     # Results render as plain text only now — there's no TMDB poster to
     # upgrade a status message into a photo with. The media-message branch

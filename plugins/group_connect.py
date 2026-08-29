@@ -15,7 +15,7 @@ from plugins.filter import (
     send_smart_log,
     _sort_results,
     clean_query,
-    _build_file_links,
+    _flat_file_label,
     _build_results_caption,
 )
 from plugins.search_indicator import show_search_indicator, remove_search_indicator
@@ -57,8 +57,18 @@ def _build_group_buttons(
     total_pages,
     delete_seconds=None,
 ):
-    """Build only compact group pagination for the text-link file list."""
+    """Build the same compact callback file rows used in private search."""
     buttons = []
+    for file_doc in page_files:
+        delete_value = int(delete_seconds) if delete_seconds else 0
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    _flat_file_label(file_doc),
+                    callback_data=f"grpfile#{file_doc['_id']}#{delete_value}",
+                )
+            ]
+        )
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("⬅ PREV", callback_data=f"grppage#{session_id}#{page - 1}"))
@@ -325,9 +335,6 @@ async def group_search(client: Client, message: Message):
     page_files = sorted_files[:per_page]
 
     caption = _build_caption(query, total, 0, total_pages, message.from_user.first_name or "")
-    file_links = _build_file_links(page_files, client.me.username, _del_secs)
-    if file_links:
-        caption += f"\n\n{file_links}"
     buttons = _build_group_buttons(
         page_files,
         client.me.username,
@@ -337,7 +344,7 @@ async def group_search(client: Client, message: Message):
         total_pages,
         delete_seconds=_del_secs,
     )
-    markup = InlineKeyboardMarkup(buttons) if buttons else None
+    markup = InlineKeyboardMarkup(buttons)
 
     await remove_search_indicator(indicator)
 
@@ -362,14 +369,23 @@ async def group_search(client: Client, message: Message):
             timeout=20,
         )
     except Exception as exc:
-        # Retry without pagination controls. The file links remain available
-        # inside the message, so this fallback loses no delivery choices.
+        # Retry with file rows only, avoiding pagination/session controls.
         logger.exception("Full group result-card send failed for %r: %s", query, exc)
+        compact_buttons = [
+            [
+                InlineKeyboardButton(
+                    _flat_file_label(file_doc),
+                    callback_data=f"grpfile#{file_doc['_id']}#{_del_secs}",
+                )
+            ]
+            for file_doc in page_files
+        ]
         try:
             result_msg = await asyncio.wait_for(
                 telegram_call(
                     lambda: message.reply_text(
                         text=caption,
+                        reply_markup=InlineKeyboardMarkup(compact_buttons),
                         parse_mode=ParseMode.HTML,
                         **_no_preview(),
                     ),
@@ -457,13 +473,6 @@ async def handle_group_pagination(client: Client, callback: CallbackQuery):
     page_files = results[start_idx : start_idx + per_page]
 
     caption = _build_caption(query, total, page, total_pages, data.get("first_name", ""))
-    file_links = _build_file_links(
-        page_files,
-        client.me.username,
-        data.get("auto_delete_time"),
-    )
-    if file_links:
-        caption += f"\n\n{file_links}"
     buttons = _build_group_buttons(
         page_files,
         client.me.username,
@@ -473,7 +482,7 @@ async def handle_group_pagination(client: Client, callback: CallbackQuery):
         total_pages,
         delete_seconds=data.get("auto_delete_time"),
     )
-    markup = InlineKeyboardMarkup(buttons) if buttons else None
+    markup = InlineKeyboardMarkup(buttons)
 
     try:
         await telegram_call(

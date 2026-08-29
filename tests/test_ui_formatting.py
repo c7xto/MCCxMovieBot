@@ -8,7 +8,6 @@ asyncio.set_event_loop(asyncio.new_event_loop())
 from plugins.filter import (  # noqa: E402
     _apply_result_filters,
     _build_caption,
-    _build_file_links,
     _build_movie_result_buttons,
     _build_results_caption,
     _display_title,
@@ -104,7 +103,7 @@ def test_series_label_keeps_only_series_identity_and_structured_metadata():
         "file_size": 2 * 1024 * 1024 * 1024,
     }
     label = _flat_file_label(file_doc)
-    assert label == "[2.00 GB] [S01E03] Reacher (2022) 1080p HEVC"
+    assert label == "[2.00 GB] [S01E03] [Reacher (2022)]"
     assert "Spoonful" not in label
     assert not any(char in label for char in "_-@")
     assert "mkv" not in label.lower()
@@ -115,7 +114,7 @@ def test_movie_label_uses_clean_title_year_and_fixed_metadata_order():
         "file_name": "Aavesham_2024_Malayalam_1080p_WEB-DL_x265.mkv",
         "file_size": 500 * 1024 * 1024,
     }
-    assert _flat_file_label(file_doc) == "[500.00 MB] Aavesham (2024) Malayalam 1080p HEVC"
+    assert _flat_file_label(file_doc) == "[500.00 MB] [Aavesham (2024)] [Malayalam]"
 
 
 def test_long_series_title_is_trimmed_without_hiding_quality_fields():
@@ -128,9 +127,9 @@ def test_long_series_title_is_trimmed_without_hiding_quality_fields():
     }
     label = _flat_file_label(file_doc)
     assert len(label) > 40
-    assert label.startswith("[700.00 MB] [S02E04]")
+    assert label.startswith("[700.00 MB] [S02E04] [A Very Long Series Name That Must Be Shortened]")
     assert "An Even Longer Episode Name" not in label
-    assert label.endswith("English 1080p HEVC")
+    assert label.endswith("[English]")
 
 
 def test_release_platform_is_not_mistaken_for_movie_title():
@@ -139,7 +138,7 @@ def test_release_platform_is_not_mistaken_for_movie_title():
         "file_size": 2650 * 1024 * 1024,
     }
     label = _flat_file_label(file_doc)
-    assert label == "[2.59 GB] Balan The Boy (2026) Hindi 1080p H.264"
+    assert label == "[2.59 GB] [Balan The Boy (2026)] [Hindi]"
 
 
 def test_real_release_group_suffix_cannot_leak_into_movie_title():
@@ -151,7 +150,7 @@ def test_real_release_group_suffix_cannot_leak_into_movie_title():
         "file_size": 2_842_513_107,
     }
     label = _flat_file_label(file_doc)
-    assert label == "[2.65 GB] Balan The Boy (2026) Multi Audio 1080p H.264"
+    assert label == "[2.65 GB] [Balan The Boy (2026)] [Multi Audio]"
     assert "ZEE5" not in label
     assert "XDMovies" not in label
 
@@ -180,11 +179,12 @@ def test_flat_results_show_ten_files_without_grouping():
     rows, page, total_pages = _build_movie_result_buttons(results, "session", 0)
     assert page == 0
     assert total_pages == 2
-    assert len(rows) == 1
-    assert rows[0][0].text == "NEXT ➡"
+    assert len(rows) == 11
+    assert all("[KGF Chapter 2 (2022)]" in row[0].text for row in rows[:10])
+    assert rows[-1][0].text == "NEXT ➡"
 
 
-def test_result_text_links_use_full_words_without_file_buttons():
+def test_result_buttons_use_structured_size_title_and_language_fields():
     results = [
         {
             "_id": "movie",
@@ -201,18 +201,16 @@ def test_result_text_links_use_full_words_without_file_buttons():
         },
     ]
 
-    links = _build_file_links(results, "lucasmoviebot")
     rows, _, _ = _build_movie_result_buttons(results, "session", 0)
 
-    assert rows == []
-    assert "[1.45 GB] KGF Chapter 1 (2018) Kannada 720p HEVC" in links
-    assert "S02E04" in links
-    assert "English 1080p HEVC" in links
-    assert "Kann." not in links
-    assert "https://t.me/lucasmoviebot?start=file_movie" in links
+    assert rows[0][0].text == "[1.45 GB] [KGF Chapter 1 (2018)] [Kannada]"
+    assert "[S02E04]" in rows[1][0].text
+    assert rows[1][0].text.endswith("[English]")
+    assert "1080p" not in rows[1][0].text
+    assert "HEVC" not in rows[1][0].text
 
 
-def test_group_file_links_keep_auto_delete_without_stretched_buttons():
+def test_group_file_buttons_keep_auto_delete_without_external_link_arrows():
     rows = _build_group_buttons(
         [{"_id": "0123456789abcdef01234567", "file_name": "Movie 2026.mkv", "file_size": 1}],
         "lucasmoviebot",
@@ -222,14 +220,9 @@ def test_group_file_links_keep_auto_delete_without_stretched_buttons():
         1,
         delete_seconds=900,
     )
-    assert rows == []
-    links = _build_file_links(
-        [{"_id": "0123456789abcdef01234567", "file_name": "Movie 2026.mkv", "file_size": 1}],
-        "lucasmoviebot",
-        900,
-    )
-    assert "https://t.me/lucasmoviebot?start=file_0123456789abcdef01234567_d900" in links
-    assert "Movie (2026)" in links
+    assert rows[0][0].url is None
+    assert rows[0][0].callback_data == "grpfile#0123456789abcdef01234567#900"
+    assert rows[0][0].text == "[0.00 MB] [Movie (2026)]"
 
 
 def test_results_caption_contains_shared_count_and_page_header():
