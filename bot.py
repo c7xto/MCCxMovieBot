@@ -65,15 +65,17 @@ def _verify_environment():
         )
         sys.exit(1)
 
+    service_role = os.getenv("SERVICE_ROLE", "all-in-one").strip().casefold()
     required = {
         "API_ID": os.getenv("API_ID"),
         "API_HASH": os.getenv("API_HASH"),
         "BOT_TOKEN": os.getenv("BOT_TOKEN"),
         "DATABASE_URI": os.getenv("DATABASE_URI"),
         "OPERATIONS_DATABASE_URI": os.getenv("OPERATIONS_DATABASE_URI"),
-        "REDIS_URL": os.getenv("REDIS_URL"),
         "ADMIN_ID": os.getenv("ADMIN_ID"),
     }
+    if service_role != "all-in-one":
+        required["REDIS_URL"] = os.getenv("REDIS_URL")
     missing = [name for name, value in required.items() if not value]
     if missing:
         logger.critical("Missing required environment variables: %s", ", ".join(missing))
@@ -184,7 +186,12 @@ class AutoFilterBot(Client):
 
         mark_not_ready()
         await redis_state.start()
-        logger.info("✅ Redis state plane ready.")
+        if redis_state.shared:
+            logger.info("✅ Redis shared state plane ready.")
+        else:
+            logger.info(
+                "✅ Local temporary state ready (single-process mode; Redis is optional)."
+            )
         logger.info("🔌 Validating MongoDB connections before Telegram startup...")
         if not db.dbs:
             raise RuntimeError("No MongoDB clusters configured. Check DATABASE_URI.")

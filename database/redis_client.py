@@ -66,7 +66,11 @@ class RedisState:
     def __init__(self, url: str | None = None, *, prefix: str | None = None, client=None):
         self.url = (url if url is not None else os.getenv("REDIS_URL", "")).strip()
         self.prefix = (prefix or os.getenv("REDIS_PREFIX", "mccxbot")).strip(":")
-        self._memory_mode = self.url == "memory://"
+        service_role = os.getenv("SERVICE_ROLE", "all-in-one").strip().casefold()
+        self._implicit_local_mode = (
+            not self.url and client is None and service_role == "all-in-one"
+        )
+        self._memory_mode = self.url == "memory://" or self._implicit_local_mode
         self._memory: dict[str, tuple[float, Any]] = {}
         self._memory_hashes: dict[str, tuple[float, dict[str, Any]]] = {}
         self._memory_semaphores: dict[str, dict[str, float]] = {}
@@ -89,6 +93,11 @@ class RedisState:
     def configured(self) -> bool:
         return self._memory_mode or self._client is not None
 
+    @property
+    def shared(self) -> bool:
+        """Whether state is visible to other bot processes."""
+        return self._client is not None and not self._memory_mode
+
     def require_configured(self):
         if not self.configured:
             raise RedisConfigurationError(
@@ -102,7 +111,10 @@ class RedisState:
     async def start(self):
         self.require_configured()
         if self._memory_mode:
-            if os.getenv("MCCX_ALLOW_MEMORY_REDIS_FOR_TESTS") != "1":
+            if (
+                not self._implicit_local_mode
+                and os.getenv("MCCX_ALLOW_MEMORY_REDIS_FOR_TESTS") != "1"
+            ):
                 raise RedisConfigurationError(
                     "memory:// Redis is permitted only by the hermetic unit-test suite."
                 )

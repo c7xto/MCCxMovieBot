@@ -39,12 +39,14 @@ normal source files rather than duplicated into this document.
 
 ```env
 OPERATIONS_DATABASE_URI=mongodb+srv://...
-REDIS_URL=redis://redis:6379/0
 SERVICE_ROLE=all-in-one
 ```
 
 Use `SERVICE_ROLE=all-in-one` only for a single-process hosting panel. Docker
-Compose assigns the four isolated service roles itself.
+Compose assigns the four isolated service roles itself. `REDIS_URL` is optional
+for `all-in-one`; without it, temporary state is process-local and is cleared
+on restart. Every split worker role requires Redis, and Docker Compose supplies
+`redis://redis:6379/0` automatically.
 
 ## Upgrade sequence
 

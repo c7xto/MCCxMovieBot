@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from unittest.mock import patch
 
 
 try:
@@ -28,6 +29,7 @@ from plugins.workload import (
     workload_snapshot,
 )
 from database.db import Database, search_tokens_for_name
+from database.redis_client import RedisConfigurationError, RedisState
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -52,6 +54,27 @@ class FakeRepository:
 
 
 class WorkloadControlTests(unittest.TestCase):
+    def test_all_in_one_can_use_process_local_ephemeral_state(self):
+        with patch.dict(
+            "os.environ",
+            {"SERVICE_ROLE": "all-in-one", "REDIS_URL": ""},
+            clear=False,
+        ):
+            state = RedisState()
+            asyncio.run(state.start())
+            self.assertTrue(state.configured)
+            self.assertFalse(state.shared)
+
+    def test_split_worker_still_requires_redis(self):
+        with patch.dict(
+            "os.environ",
+            {"SERVICE_ROLE": "worker-indexer", "REDIS_URL": ""},
+            clear=False,
+        ):
+            state = RedisState()
+            with self.assertRaises(RedisConfigurationError):
+                asyncio.run(state.start())
+
     def test_normalized_query_limits_length_and_tokens(self):
         self.assertEqual(validate_search_query("  War   Machine  "), "War Machine")
         with self.assertRaises(WorkloadRejected):

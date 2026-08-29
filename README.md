@@ -93,13 +93,19 @@ docker compose logs -f bot-interactive worker-indexer worker-broadcast worker-ma
 | `ADMIN_ID` | One or more comma-separated numeric admin IDs |
 | `DATABASE_URI` | Required primary MongoDB cluster |
 | `OPERATIONS_DATABASE_URI` | Required dedicated database for settings, users, registry, counters and durable jobs |
-| `REDIS_URL` | Required Redis endpoint for shared ephemeral state and coordination |
+| `REDIS_URL` | Optional for `all-in-one`; required for multi-process worker roles |
 | `SERVICE_ROLE` | `all-in-one` on a one-process panel; Compose assigns dedicated roles |
 
 `DATABASE_URI_2` through `DATABASE_URI_5` are optional. Channel IDs,
 community links and the TMDB API Read Access Token (`TMDB_BEARER_TOKEN`) are
 documented in `.env.example`; most presentation and access settings can then
 be managed live through `/admin`.
+
+When `SERVICE_ROLE=all-in-one` and `REDIS_URL` is empty, temporary search,
+pagination, callback and admin-prompt state stays safely inside that one bot
+process. Restarting clears only this temporary state; movie files, settings,
+users and durable jobs remain in MongoDB. Redis becomes mandatory when roles
+are split across containers because those processes need a shared state plane.
 
 When `OPERATIONS_DATABASE_URI` is first added, startup copies operational data in
 resumable batches, validates the copy, and leaves the old data untouched. Do
