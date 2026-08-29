@@ -512,15 +512,27 @@ def _flat_file_label(file_doc: dict, max_length: int | None = None) -> str:
     return label
 
 
+RESULTS_WIDTH_ANCHOR = "\u2800" * 24
+
+
 def _build_results_caption(query: str, total: int, page: int, total_pages: int, first_name: str = "") -> str:
-    """Build the identical results heading used in DMs and groups."""
+    """Build the identical results heading used in DMs and groups.
+
+    Telegram Android sizes a message bubble and its attached inline keyboard
+    independently. Braille-pattern blanks are visible-width but visually empty,
+    so this short capped anchor widens the summary line without adding copy.
+    """
     lines = [f"🔎 <b>Results Found For {_html(query)}</b>"]
     if first_name:
         lines.append(f"👤 <b>{_html(first_name)}</b>")
     lines.extend(
         [
             "",
-            f"📁 <b>Files:</b> {total}  •  📚 <b>Page:</b> {page + 1} / {total_pages}",
+            (
+                f"📁 <b>Files:</b> {total}  •  "
+                f"📚 <b>Page:</b> {page + 1} / {total_pages}"
+                f"{RESULTS_WIDTH_ANCHOR}"
+            ),
         ]
     )
     return "\n".join(lines)

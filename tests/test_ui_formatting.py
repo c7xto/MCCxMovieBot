@@ -13,6 +13,7 @@ from plugins.filter import (  # noqa: E402
     _display_title,
     _flat_file_label,
     _listing_name,
+    RESULTS_WIDTH_ANCHOR,
     _sort_results,
     _variant_label,
     clean_query,
@@ -232,6 +233,8 @@ def test_results_caption_contains_shared_count_and_page_header():
     assert "Page:</b> 1 / 16" in caption
     assert "👤 <b>7</b>" in caption
     assert "Choose a file below" not in caption
+    assert caption.endswith(RESULTS_WIDTH_ANCHOR)
+    assert len(RESULTS_WIDTH_ANCHOR) == 24
 
 
 def test_movie_results_sort_from_largest_to_smallest():
