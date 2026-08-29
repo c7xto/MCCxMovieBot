@@ -8,6 +8,7 @@ asyncio.set_event_loop(asyncio.new_event_loop())
 from plugins.filter import (  # noqa: E402
     _apply_result_filters,
     _build_caption,
+    _build_file_links,
     _build_movie_result_buttons,
     _build_results_caption,
     _display_title,
@@ -179,12 +180,11 @@ def test_flat_results_show_ten_files_without_grouping():
     rows, page, total_pages = _build_movie_result_buttons(results, "session", 0)
     assert page == 0
     assert total_pages == 2
-    assert len(rows) == 11  # ten files plus NEXT
-    assert all("KGF Chapter 2" in row[0].text for row in rows[:10])
-    assert rows[-1][0].text == "NEXT ➡"
+    assert len(rows) == 1
+    assert rows[0][0].text == "NEXT ➡"
 
 
-def test_result_buttons_use_full_words_and_reference_style_wrapping():
+def test_result_text_links_use_full_words_without_file_buttons():
     results = [
         {
             "_id": "movie",
@@ -201,16 +201,18 @@ def test_result_buttons_use_full_words_and_reference_style_wrapping():
         },
     ]
 
+    links = _build_file_links(results, "lucasmoviebot")
     rows, _, _ = _build_movie_result_buttons(results, "session", 0)
 
-    assert rows[0][0].text == "[1.45 GB] KGF Chapter 1 (2018) Kannada 720p HEVC"
-    assert "S02E04" in rows[1][0].text
-    assert rows[1][0].text.endswith("English 1080p HEVC")
-    assert "Kann." not in rows[0][0].text
-    assert len(rows[1][0].text) > 40
+    assert rows == []
+    assert "[1.45 GB] KGF Chapter 1 (2018) Kannada 720p HEVC" in links
+    assert "S02E04" in links
+    assert "English 1080p HEVC" in links
+    assert "Kann." not in links
+    assert "https://t.me/lucasmoviebot?start=file_movie" in links
 
 
-def test_group_file_buttons_use_callbacks_without_external_link_arrows():
+def test_group_file_links_keep_auto_delete_without_stretched_buttons():
     rows = _build_group_buttons(
         [{"_id": "0123456789abcdef01234567", "file_name": "Movie 2026.mkv", "file_size": 1}],
         "lucasmoviebot",
@@ -220,8 +222,14 @@ def test_group_file_buttons_use_callbacks_without_external_link_arrows():
         1,
         delete_seconds=900,
     )
-    assert rows[0][0].url is None
-    assert rows[0][0].callback_data == "grpfile#0123456789abcdef01234567#900"
+    assert rows == []
+    links = _build_file_links(
+        [{"_id": "0123456789abcdef01234567", "file_name": "Movie 2026.mkv", "file_size": 1}],
+        "lucasmoviebot",
+        900,
+    )
+    assert "https://t.me/lucasmoviebot?start=file_0123456789abcdef01234567_d900" in links
+    assert "Movie (2026)" in links
 
 
 def test_results_caption_contains_shared_count_and_page_header():

@@ -520,6 +520,34 @@ def _flat_file_label(file_doc: dict, max_length: int | None = None) -> str:
     return label
 
 
+def _build_file_links(
+    page_files: list,
+    bot_username: str,
+    delete_seconds: int | None = None,
+) -> str:
+    """Render one large, touch-friendly text link per file.
+
+    Telegram sizes inline keyboards independently from the message bubble on
+    Android.  Keeping file choices inside the message avoids that mismatch
+    while preserving the complete smart label.  Old callback handlers remain
+    available so result cards created before this update keep working.
+    """
+    username = str(bot_username or "").lstrip("@")
+    if not username:
+        return ""
+
+    suffix = f"_d{max(0, int(delete_seconds))}" if delete_seconds else ""
+    links = []
+    for file_doc in page_files:
+        file_obj_id = quote(str(file_doc.get("_id", "")), safe="")
+        if not file_obj_id:
+            continue
+        url = f"https://t.me/{username}?start=file_{file_obj_id}{suffix}"
+        label = _html(_flat_file_label(file_doc))
+        links.append(f'<b><a href="{url}">📄 {label}</a></b>')
+    return "\n\n".join(links)
+
+
 def _build_results_caption(query: str, total: int, page: int, total_pages: int, first_name: str = "") -> str:
     """Build the identical results heading used in DMs and groups."""
     lines = [f"🔎 <b>Results Found For {_html(query)}</b>"]
@@ -763,18 +791,11 @@ async def deliver_cached_file(
 
 
 def _build_result_buttons(results: list, session_id: str, page: int, per_page: int = 10):
-    """Build the shared, ungrouped file rows plus simple pagination."""
+    """Build only the compact navigation row for a text-link result page."""
     total = len(results)
     total_pages = max(1, (total + per_page - 1) // per_page)
     page = max(0, min(page, total_pages - 1))
-    start_idx = page * per_page
-    page_files = results[start_idx : start_idx + per_page]
-
     buttons = []
-    for f in page_files:
-        btn_text = _flat_file_label(f)
-        buttons.append([InlineKeyboardButton(btn_text, callback_data=f"sendfile#{f['_id']}")])
-
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("⬅ PREV", callback_data=f"page#{session_id}#{page - 1}"))
@@ -793,13 +814,17 @@ def _build_movie_result_buttons(results: list, session_id: str, page: int, per_p
 
 
 async def _render_results_view(client, message, session_id: str, page: int, data: dict, user_id=None):
-    """Render every successful DM search with the shared flat list UI."""
+    """Render every successful DM search as clean in-message file links."""
     results = data["results"]
     query = data["query"]
     total = len(results)
     buttons, page, total_pages = _build_result_buttons(results, session_id, page)
     caption = _build_results_caption(query, total, page, total_pages, data.get("first_name", ""))
-    markup = InlineKeyboardMarkup(buttons)
+    page_files = results[page * 10 : (page + 1) * 10]
+    file_links = _build_file_links(page_files, client.me.username)
+    if file_links:
+        caption += f"\n\n{file_links}"
+    markup = InlineKeyboardMarkup(buttons) if buttons else None
 
     # Results render as plain text only now — there's no TMDB poster to
     # upgrade a status message into a photo with. The media-message branch
@@ -827,7 +852,12 @@ async def _render_results_view(client, message, session_id: str, page: int, data
             )
         else:
             await telegram_call(
-                lambda: message.edit_text(text=caption, reply_markup=markup, parse_mode=ParseMode.HTML),
+                lambda: message.edit_text(
+                    text=caption,
+                    reply_markup=markup,
+                    parse_mode=ParseMode.HTML,
+                    **_no_preview(),
+                ),
                 route="private_search_results_edit",
                 policy=INTERACTIVE_RETRY,
                 retry_safe=True,
