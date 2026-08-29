@@ -18,7 +18,10 @@ from pyrogram.errors import (
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
 from pyrogram.types import Message, InlineKeyboardButton, CallbackQuery
-from plugins.mobile_ui import MobileInlineKeyboardMarkup as InlineKeyboardMarkup
+from plugins.mobile_ui import (
+    MobileInlineKeyboardMarkup as InlineKeyboardMarkup,
+    display_width,
+)
 from database.db import db
 from plugins.access_policy import enforce_user_action
 from plugins.callbacks import answer_callback_safely
@@ -512,32 +515,114 @@ def _flat_file_label(file_doc: dict, max_length: int | None = None) -> str:
     return label
 
 
-# Telegram Android gives attached inline keyboards their own width, independent
-# of the message bubble.  Hangul Filler is rendered as a full-width invisible
-# glyph (unlike ordinary/Braille whitespace, which some clients collapse).
-# Word Joiner keeps the capped anchor on the existing summary line.
-RESULTS_WIDTH_ANCHOR_UNITS = 30
-RESULTS_WIDTH_ANCHOR = "\u2060" + ("\u3164\u2060" * RESULTS_WIDTH_ANCHOR_UNITS)
+MOBILE_RESULT_BUTTON_WIDTH = 32
+
+_BUTTON_LANGUAGE_CODES = {
+    "Malayalam": "ML",
+    "Tamil": "TA",
+    "Telugu": "TE",
+    "Hindi": "HI",
+    "English": "EN",
+    "Kannada": "KN",
+    "Dual Audio": "DA",
+    "Multi Audio": "MA",
+}
+
+
+def _compact_button_size(file_doc: dict) -> str:
+    """Return a short size that remains unambiguous in a narrow button."""
+    size_mb = max(0, int(file_doc.get("file_size", 0) or 0)) / (1024 * 1024)
+    if size_mb >= 1024:
+        value = f"{size_mb / 1024:.2f}".rstrip("0").rstrip(".")
+        return f"{value}G"
+    if size_mb >= 10:
+        return f"{size_mb:.0f}M"
+    value = f"{size_mb:.1f}".rstrip("0").rstrip(".")
+    return f"{value}M"
+
+
+def _truncate_display_text(value: str, max_width: int) -> str:
+    """Truncate by rendered character width rather than Python length."""
+    value = str(value or "").strip()
+    if display_width(value) <= max_width:
+        return value
+    if max_width <= 1:
+        return "…" if max_width == 1 else ""
+
+    kept = []
+    used = 0
+    target = max_width - 1
+    for character in value:
+        character_width = display_width(character)
+        if used + character_width > target:
+            break
+        kept.append(character)
+        used += character_width
+    return "".join(kept).rstrip(" ([") + "…"
+
+
+def _compact_identity(identity: str, budget: int, *, preserve_year: bool) -> str:
+    """Shorten only the title while retaining a movie's release year."""
+    if display_width(identity) <= budget:
+        return identity
+    year_match = re.search(r"\s+\(((?:19|20)\d{2})\)$", identity)
+    if preserve_year and year_match:
+        year_suffix = year_match.group(0)
+        title_budget = budget - display_width(year_suffix)
+        if title_budget >= 4:
+            title = _truncate_display_text(identity[: year_match.start()], title_budget)
+            return f"{title}{year_suffix}"
+    return _truncate_display_text(identity, budget)
+
+
+def _file_button_label(file_doc: dict, max_width: int = MOBILE_RESULT_BUTTON_WIDTH) -> str:
+    """Build a phone-safe label whose natural width cannot stretch Android.
+
+    Telegram Android measures inline-keyboard text independently from the
+    message bubble.  Compact units and two-letter language codes leave the
+    title readable while keeping every callback row inside the bubble width.
+    The delivered file caption still contains the expanded metadata.
+    """
+    filename = file_doc.get("file_name", "")
+    size = _compact_button_size(file_doc)
+    language, _ = extract_attributes(filename)
+    language_code = _BUTTON_LANGUAGE_CODES.get(language, "")
+
+    if _is_series(filename):
+        identity, episode = _series_identity(filename)
+        # Season/episode is the primary discriminator. The year is expendable
+        # here and removing it keeps the actual series title recognizable.
+        identity = re.sub(r"\s+\((?:19|20)\d{2}\)$", "", identity)
+        prefix = f"{size} • {episode} • "
+        preserve_year = False
+    else:
+        title, year = _display_title(filename)
+        identity = f"{title} ({year})" if year else title
+        prefix = f"{size} • "
+        preserve_year = True
+
+    suffix = f" • {language_code}" if language_code else ""
+    identity_budget = max_width - display_width(prefix) - display_width(suffix)
+    if identity_budget < 2 and suffix:
+        suffix = ""
+        identity_budget = max_width - display_width(prefix)
+    identity = _compact_identity(identity or "Unnamed", identity_budget, preserve_year=preserve_year)
+    label = f"{prefix}{identity}{suffix}"
+    # Defensive final bound for unusual wide Unicode titles.
+    if display_width(label) > max_width:
+        label = _truncate_display_text(label, max_width)
+    return label
 
 
 def _build_results_caption(query: str, total: int, page: int, total_pages: int, first_name: str = "") -> str:
-    """Build the identical results heading used in DMs and groups.
-
-    Telegram Android sizes a message bubble and its attached inline keyboard
-    independently. A short non-collapsing invisible anchor widens the summary
-    line without adding visible copy or a separate blank line.
-    """
+    """Build the identical results heading used in DMs and groups."""
     lines = [f"🔎 <b>Results Found For {_html(query)}</b>"]
     if first_name:
         lines.append(f"👤 <b>{_html(first_name)}</b>")
     lines.extend(
         [
             "",
-            (
-                f"📁 <b>Files:</b> {total}  •  "
-                f"📚 <b>Page:</b> {page + 1} / {total_pages}"
-                f"{RESULTS_WIDTH_ANCHOR}"
-            ),
+            f"📁 <b>Files:</b> {total}  •  📚 <b>Page:</b> {page + 1} / {total_pages}",
         ]
     )
     return "\n".join(lines)
@@ -783,7 +868,7 @@ def _build_result_buttons(results: list, session_id: str, page: int, per_page: i
         buttons.append(
             [
                 InlineKeyboardButton(
-                    _flat_file_label(file_doc),
+                    _file_button_label(file_doc),
                     callback_data=f"sendfile#{file_doc['_id']}",
                 )
             ]

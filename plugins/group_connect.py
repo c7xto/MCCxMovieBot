@@ -15,7 +15,7 @@ from plugins.filter import (
     send_smart_log,
     _sort_results,
     clean_query,
-    _flat_file_label,
+    _file_button_label,
     _build_results_caption,
 )
 from plugins.search_indicator import show_search_indicator, remove_search_indicator
@@ -64,7 +64,7 @@ def _build_group_buttons(
         buttons.append(
             [
                 InlineKeyboardButton(
-                    _flat_file_label(file_doc),
+                    _file_button_label(file_doc),
                     callback_data=f"grpfile#{file_doc['_id']}#{delete_value}",
                 )
             ]
@@ -374,7 +374,7 @@ async def group_search(client: Client, message: Message):
         compact_buttons = [
             [
                 InlineKeyboardButton(
-                    _flat_file_label(file_doc),
+                    _file_button_label(file_doc),
                     callback_data=f"grpfile#{file_doc['_id']}#{_del_secs}",
                 )
             ]

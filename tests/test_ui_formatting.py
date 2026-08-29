@@ -11,10 +11,10 @@ from plugins.filter import (  # noqa: E402
     _build_movie_result_buttons,
     _build_results_caption,
     _display_title,
+    _file_button_label,
     _flat_file_label,
     _listing_name,
-    RESULTS_WIDTH_ANCHOR,
-    RESULTS_WIDTH_ANCHOR_UNITS,
+    MOBILE_RESULT_BUTTON_WIDTH,
     _sort_results,
     _variant_label,
     clean_query,
@@ -23,6 +23,7 @@ from plugins.filter import (  # noqa: E402
 from plugins.search_indicator import _select_search_sticker  # noqa: E402
 from plugins.start import _build_start_ui  # noqa: E402
 from plugins.group_connect import _build_group_buttons  # noqa: E402
+from plugins.mobile_ui import display_width  # noqa: E402
 
 
 def test_search_indicator_selects_native_animated_magnifying_sticker():
@@ -182,7 +183,7 @@ def test_flat_results_show_ten_files_without_grouping():
     assert page == 0
     assert total_pages == 2
     assert len(rows) == 11
-    assert all("KGF Chapter 2 (2022)" in row[0].text for row in rows[:10])
+    assert all("KGF Chapter" in row[0].text for row in rows[:10])
     assert rows[-1][0].text == "NEXT ➡"
 
 
@@ -205,11 +206,23 @@ def test_result_buttons_use_structured_size_title_and_language_fields():
 
     rows, _, _ = _build_movie_result_buttons(results, "session", 0)
 
-    assert rows[0][0].text == "[1.45 GB] KGF Chapter 1 (2018) • Kannada"
-    assert "[S02E04]" in rows[1][0].text
-    assert rows[1][0].text.endswith("• English")
+    assert rows[0][0].text == "1.45G • KGF Chapter… (2018) • KN"
+    assert "S02E04" in rows[1][0].text
+    assert rows[1][0].text.endswith("• EN")
     assert "1080p" not in rows[1][0].text
     assert "HEVC" not in rows[1][0].text
+    assert all(display_width(row[0].text) <= MOBILE_RESULT_BUTTON_WIDTH for row in rows)
+
+
+def test_compact_series_button_keeps_episode_title_and_language():
+    label = _file_button_label(
+        {
+            "file_name": "Estonia 2023 S01E01 720p WEBRip H264 English.mkv",
+            "file_size": int(355.71 * 1024**2),
+        }
+    )
+    assert label == "356M • S01E01 • Estonia • EN"
+    assert display_width(label) <= MOBILE_RESULT_BUTTON_WIDTH
 
 
 def test_group_file_buttons_keep_auto_delete_without_external_link_arrows():
@@ -224,7 +237,7 @@ def test_group_file_buttons_keep_auto_delete_without_external_link_arrows():
     )
     assert rows[0][0].url is None
     assert rows[0][0].callback_data == "grpfile#0123456789abcdef01234567#900"
-    assert rows[0][0].text == "[0.00 MB] Movie (2026)"
+    assert rows[0][0].text == "0M • Movie (2026)"
 
 
 def test_results_caption_contains_shared_count_and_page_header():
@@ -234,10 +247,7 @@ def test_results_caption_contains_shared_count_and_page_header():
     assert "Page:</b> 1 / 16" in caption
     assert "👤 <b>7</b>" in caption
     assert "Choose a file below" not in caption
-    assert caption.endswith(RESULTS_WIDTH_ANCHOR)
-    assert RESULTS_WIDTH_ANCHOR.count("\u3164") == RESULTS_WIDTH_ANCHOR_UNITS
-    assert RESULTS_WIDTH_ANCHOR.count("\u2060") == RESULTS_WIDTH_ANCHOR_UNITS + 1
-    assert "\n" not in RESULTS_WIDTH_ANCHOR
+    assert not any(character in caption for character in ("\u2800", "\u3164", "\u2060"))
 
 
 def test_movie_results_sort_from_largest_to_smallest():
