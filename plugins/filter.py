@@ -426,6 +426,21 @@ def _fmt_size(file_doc):
     return f"{size_mb:.2f} MB"
 
 
+def _fmt_button_size(file_doc: dict) -> str:
+    """Return a compact, still-readable size for narrow Telegram clients."""
+    size_mb = max(0, int(file_doc.get("file_size", 0) or 0)) / (1024 * 1024)
+    if size_mb >= 1000:
+        value = f"{size_mb / 1024:.2f}".rstrip("0").rstrip(".")
+        return f"{value} GB"
+    if size_mb >= 100:
+        return f"{size_mb:.0f} MB"
+    if size_mb >= 10:
+        value = f"{size_mb:.1f}".rstrip("0").rstrip(".")
+        return f"{value} MB"
+    value = f"{size_mb:.2f}".rstrip("0").rstrip(".")
+    return f"{value} MB"
+
+
 _EPISODE_TAG_RE = re.compile(
     r"(?<![A-Za-z0-9])S\s*(\d{1,2})\s*E\s*(\d{1,3})(?![A-Za-z0-9])",
     re.IGNORECASE,
@@ -457,6 +472,15 @@ def _smart_metadata(filename: str) -> list[str]:
     """Return stable, non-duplicated metadata fields for a button label."""
     language, quality = extract_attributes(filename)
     codec = _extract_codec(filename)
+    compact_languages = {
+        "Malayalam": "Malay.",
+        "English": "Eng",
+        "Kannada": "Kann.",
+        "Telugu": "Tel.",
+        "Multi Audio": "Multi",
+        "Dual Audio": "Dual",
+    }
+    language = compact_languages.get(language, language)
     fields = []
     for value in (language, quality, codec):
         if value in ("", "Other") or value in fields:
@@ -493,33 +517,52 @@ def _series_identity(filename: str) -> tuple[str, str]:
 
 
 def _compose_aligned_label(prefix: str, identity: str, metadata: list[str], max_length: int) -> str:
-    """Keep buttons phone-friendly while preserving useful variant details."""
+    """Keep buttons phone-friendly while preserving useful variant details.
+
+    Telegram clients choose their own button dimensions.  A strict text
+    budget is therefore the only reliable cross-client control.  Codec is the
+    first field removed when space is tight; language and quality remain
+    visible whenever possible, and the title is shortened around them.
+    """
     metadata = list(metadata)
     suffix = "" if not metadata else " • " + " • ".join(metadata)
+
+    # Codecs are useful but less important than a recognizable title,
+    # language and quality. Remove only that trailing field before shortening
+    # the title itself.
+    if metadata and metadata[-1] in {"HEVC", "H.264", "AV1"}:
+        if len(prefix) + 1 + len(identity) + len(suffix) > max_length:
+            metadata.pop()
+            suffix = "" if not metadata else " • " + " • ".join(metadata)
+
     available = max_length - len(prefix) - len(suffix) - 1
-    while metadata and len(identity) > available:
-        shorter_metadata = metadata[:-1]
-        shorter_suffix = "" if not shorter_metadata else " • " + " • ".join(shorter_metadata)
-        shorter_available = max_length - len(prefix) - len(shorter_suffix) - 1
-        # Drop the least important trailing field (codec first) when that
-        # preserves the full title, or when too little title would remain.
-        if len(identity) <= shorter_available or available < 8:
-            metadata = shorter_metadata
-            suffix = shorter_suffix
-            available = shorter_available
-            continue
-        break
+    # Very long series prefixes can leave no recognizable title. In that rare
+    # case retain quality and remove the language abbreviation.
+    if available < 5 and len(metadata) >= 2:
+        metadata.pop(0)
+        suffix = " • " + " • ".join(metadata)
+        available = max_length - len(prefix) - len(suffix) - 1
+
     if available < 2:
         return f"{prefix} {identity}"[:max_length]
     if len(identity) > available:
-        identity = identity[: available - 1].rstrip() + "…"
+        # A partial ``(2026`` is harder to read than omitting the year. Keep
+        # the complete title first, and retain the year only when it fits.
+        without_year = re.sub(r"\s+\((?:19|20)\d{2}\)$", "", identity)
+        if without_year and len(without_year) <= available:
+            identity = without_year
+        else:
+            identity = identity[: available - 1].rstrip(" ([") + "…"
     return f"{prefix} {identity}{suffix}"
 
 
-def _flat_file_label(file_doc: dict, max_length: int = 52) -> str:
+MOBILE_RESULT_LABEL_LIMIT = 40
+
+
+def _flat_file_label(file_doc: dict, max_length: int = MOBILE_RESULT_LABEL_LIMIT) -> str:
     """Build a consistent smart label for movie and episodic files."""
     filename = file_doc.get("file_name", "")
-    prefix = f"[{_fmt_size(file_doc)}]"
+    prefix = f"[{_fmt_button_size(file_doc)}]"
     if _is_series(filename):
         identity, episode = _series_identity(filename)
         prefix += f" [{episode}]"

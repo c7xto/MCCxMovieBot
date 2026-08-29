@@ -13,6 +13,7 @@ from plugins.filter import (  # noqa: E402
     _display_title,
     _flat_file_label,
     _listing_name,
+    MOBILE_RESULT_LABEL_LIMIT,
     _sort_results,
     _variant_label,
     clean_query,
@@ -103,7 +104,7 @@ def test_series_label_keeps_only_series_identity_and_structured_metadata():
         "file_size": 2 * 1024 * 1024 * 1024,
     }
     label = _flat_file_label(file_doc)
-    assert label == "[2.00 GB] [S01E03] Reacher • 1080p • HEVC"
+    assert label == "[2 GB] [S01E03] Reacher • 1080p • HEVC"
     assert "Spoonful" not in label
     assert not any(char in label for char in "_-@")
     assert "mkv" not in label.lower()
@@ -114,7 +115,7 @@ def test_movie_label_uses_clean_title_year_and_fixed_metadata_order():
         "file_name": "Aavesham_2024_Malayalam_1080p_WEB-DL_x265.mkv",
         "file_size": 500 * 1024 * 1024,
     }
-    assert _flat_file_label(file_doc) == "[500.00 MB] Aavesham (2024) • Malayalam • 1080p"
+    assert _flat_file_label(file_doc) == "[500 MB] Aavesham • Malay. • 1080p"
 
 
 def test_long_series_title_is_trimmed_without_hiding_quality_fields():
@@ -126,10 +127,10 @@ def test_long_series_title_is_trimmed_without_hiding_quality_fields():
         "file_size": 700 * 1024 * 1024,
     }
     label = _flat_file_label(file_doc)
-    assert len(label) <= 52
-    assert label.startswith("[700.00 MB] [S02E04]")
+    assert len(label) <= MOBILE_RESULT_LABEL_LIMIT
+    assert label.startswith("[700 MB] [S02E04]")
     assert "An Even Longer Episode Name" not in label
-    assert label.endswith("English • 1080p")
+    assert label.endswith("Eng • 1080p")
 
 
 def test_release_platform_is_not_mistaken_for_movie_title():
@@ -138,8 +139,8 @@ def test_release_platform_is_not_mistaken_for_movie_title():
         "file_size": 2650 * 1024 * 1024,
     }
     label = _flat_file_label(file_doc)
-    assert label == "[2.59 GB] Balan The Boy (2026) • Hindi • 1080p"
-    assert len(label) <= 52
+    assert label == "[2.59 GB] Balan The Boy • Hindi • 1080p"
+    assert len(label) <= MOBILE_RESULT_LABEL_LIMIT
 
 
 def test_real_release_group_suffix_cannot_leak_into_movie_title():
@@ -151,7 +152,7 @@ def test_real_release_group_suffix_cannot_leak_into_movie_title():
         "file_size": 2_842_513_107,
     }
     label = _flat_file_label(file_doc)
-    assert label == "[2.65 GB] Balan The Boy (2026) • Multi Audio • 1080p"
+    assert label == "[2.65 GB] Balan The Boy • Multi • 1080p"
     assert "ZEE5" not in label
     assert "XDMovies" not in label
 
@@ -183,6 +184,31 @@ def test_flat_results_show_ten_files_without_grouping():
     assert len(rows) == 11  # ten files plus NEXT
     assert all("KGF Chapter 2" in row[0].text for row in rows[:10])
     assert rows[-1][0].text == "NEXT ➡"
+
+
+def test_every_result_button_obeys_android_safe_text_budget():
+    results = [
+        {
+            "_id": "movie",
+            "file_name": "KGF Chapter 1 2018 Kannada 720p x265 mkv",
+            "file_size": int(1.45 * 1024**3),
+        },
+        {
+            "_id": "series",
+            "file_name": (
+                "A Very Long Series Name That Must Be Shortened S02E04 "
+                "Episode Title English 1080p x265.mkv"
+            ),
+            "file_size": 700 * 1024**2,
+        },
+    ]
+
+    rows, _, _ = _build_movie_result_buttons(results, "session", 0)
+
+    assert all(len(row[0].text) <= MOBILE_RESULT_LABEL_LIMIT for row in rows)
+    assert rows[0][0].text == "[1.45 GB] KGF Chapter 1 • Kann. • 720p"
+    assert "S02E04" in rows[1][0].text
+    assert rows[1][0].text.endswith("Eng • 1080p")
 
 
 def test_group_file_links_carry_the_group_auto_delete_override():
