@@ -512,15 +512,20 @@ def _flat_file_label(file_doc: dict, max_length: int | None = None) -> str:
     return label
 
 
-RESULTS_WIDTH_ANCHOR = "\u2800" * 24
+# Telegram Android gives attached inline keyboards their own width, independent
+# of the message bubble.  Hangul Filler is rendered as a full-width invisible
+# glyph (unlike ordinary/Braille whitespace, which some clients collapse).
+# Word Joiner keeps the capped anchor on the existing summary line.
+RESULTS_WIDTH_ANCHOR_UNITS = 30
+RESULTS_WIDTH_ANCHOR = "\u2060" + ("\u3164\u2060" * RESULTS_WIDTH_ANCHOR_UNITS)
 
 
 def _build_results_caption(query: str, total: int, page: int, total_pages: int, first_name: str = "") -> str:
     """Build the identical results heading used in DMs and groups.
 
     Telegram Android sizes a message bubble and its attached inline keyboard
-    independently. Braille-pattern blanks are visible-width but visually empty,
-    so this short capped anchor widens the summary line without adding copy.
+    independently. A short non-collapsing invisible anchor widens the summary
+    line without adding visible copy or a separate blank line.
     """
     lines = [f"🔎 <b>Results Found For {_html(query)}</b>"]
     if first_name:
