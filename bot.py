@@ -266,9 +266,9 @@ class AutoFilterBot(Client):
 
         db._search_tokens_complete = not await db.search_tokens_need_migration()
         if not db._search_tokens_complete:
-            raise RuntimeError(
-                "Legacy movie rows are missing search_tokens. Run "
-                "`python tools/migrate_search_tokens.py --apply` before startup."
+            logger.warning(
+                "Legacy movie rows are missing search_tokens; using the bounded "
+                "keyset compatibility search. New files use the indexed engine."
             )
         if not await db.analytics_counters_ready():
             logger.warning(

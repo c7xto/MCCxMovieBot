@@ -1558,7 +1558,11 @@ class Database:
                     spec for spec in indexes.values() if ("search_tokens", 1) in spec.get("key", [])
                 ]
                 if not search_token_indexes:
-                    await col.create_index("search_tokens")
+                    # Existing libraries can contain hundreds of thousands of
+                    # pre-token rows.  A sparse index keeps those rows out of
+                    # the index until they are rewritten by normal indexing,
+                    # avoiding a free-tier storage spike during startup.
+                    await col.create_index("search_tokens", sparse=True)
                 file_id_indexes = [spec for spec in indexes.values() if ("file_id", 1) in spec.get("key", [])]
                 if not file_id_indexes:
                     await col.create_index("file_id", unique=True)
@@ -3414,8 +3418,128 @@ class Database:
         )
         return files[:max_results], next_cursor if has_more else None
 
+    async def _legacy_regex_search_page(self, pattern, max_results, cursor=None):
+        """Bounded keyset search for rows created before ``search_tokens``.
+
+        This compatibility route is used only while legacy rows remain.  It
+        deliberately preserves the cursor guarantees of the indexed engine:
+        every shard has a hard deadline and pagination never calls ``skip``.
+        New and re-indexed files continue to use the multikey token index.
+        """
+        limit = max_results + 1
+        cursor = cursor if isinstance(cursor, dict) else {}
+
+        async def _search_cluster(index, col):
+            filter_mongo = {"file_name": pattern}
+            raw_after = cursor.get(str(index))
+            if raw_after:
+                try:
+                    filter_mongo["_id"] = {"$lt": ObjectId(str(raw_after))}
+                except Exception:
+                    logger.warning("Ignored malformed legacy cursor for Cluster %s", index + 1)
+            try:
+                async with asyncio.timeout(4.0):
+                    mongo_cursor = (
+                        col.find(filter_mongo).sort("_id", -1).limit(limit).max_time_ms(3000)
+                    )
+                    documents = [doc async for doc in mongo_cursor]
+                self.mark_shard_reachable(index, "legacy_search_ok")
+                return index, documents
+            except TimeoutError:
+                logger.warning(
+                    "Legacy search Cluster %s skipped after the 4s latency budget",
+                    index + 1,
+                )
+                return index, []
+            except Exception as exc:
+                self.mark_shard_error(index, exc)
+                logger.warning(
+                    "Legacy search Cluster %s failed error_type=%s",
+                    index + 1,
+                    type(exc).__name__,
+                )
+                return index, []
+
+        await self.hydrate_shard_health()
+        readable = self.readable_shard_indices()
+        cluster_results = await asyncio.gather(
+            *[_search_cluster(index, self.file_cols[index]) for index in readable]
+        )
+        merged = sorted(
+            (
+                (document["_id"], index, document)
+                for index, shard_documents in cluster_results
+                for document in shard_documents
+            ),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        consumed = merged[:max_results]
+        next_cursor = dict(cursor)
+        for _, index, document in consumed:
+            next_cursor[str(index)] = str(document["_id"])
+        files = deduplicate_search_results([document for _, _, document in consumed])
+        has_more = len(merged) > len(consumed) or any(
+            len(shard_documents) > max_results
+            for _, shard_documents in cluster_results
+        )
+        return files[:max_results], next_cursor if has_more else None
+
+    async def _legacy_search_page(self, query, max_results=40, cursor=None):
+        """Search old rows safely without expanding nearly-full movie shards."""
+        if isinstance(query, list):
+            raw_pattern = "|".join(
+                re.escape(str(item).strip()) for item in query if str(item).strip()
+            )
+            if not raw_pattern:
+                return {"results": [], "next_cursor": None}
+            results, next_cursor = await self._legacy_regex_search_page(
+                compile_regex(raw_pattern), max_results, cursor
+            )
+            return {"results": results, "next_cursor": next_cursor}
+
+        query = str(query).strip()
+        words = [word for word in query.split() if word][:12]
+        if not words:
+            return {"results": [], "next_cursor": None}
+        candidate_limit = max(80, max_results * 2)
+        candidates, next_cursor = await self._legacy_regex_search_page(
+            compile_regex(_reference_search_pattern(words)), candidate_limit, cursor
+        )
+        ranked = rank_search_results(query, candidates, max_results)
+        if ranked or cursor:
+            return {"results": ranked, "next_cursor": next_cursor}
+
+        title_words = [word for word in words if not _is_optional_search_token(word)]
+        if title_words and title_words != words:
+            candidates, next_cursor = await self._legacy_regex_search_page(
+                compile_regex(_reference_search_pattern(title_words)), candidate_limit, None
+            )
+            ranked = rank_search_results(query, candidates, max_results)
+            if ranked:
+                return {"results": ranked, "next_cursor": next_cursor}
+
+        query_identity = _fuzzy_query_identity(query)
+        for suggestion in await self.suggest_search_titles(query, limit=3):
+            if suggestion == query_identity:
+                continue
+            suggestion_words = suggestion.split()[:12]
+            if not suggestion_words:
+                continue
+            candidates, next_cursor = await self._legacy_regex_search_page(
+                compile_regex(_reference_search_pattern(suggestion_words)),
+                candidate_limit,
+                None,
+            )
+            ranked = rank_search_results(query, candidates, max_results)
+            if ranked:
+                return {"results": ranked, "next_cursor": next_cursor}
+        return {"results": [], "next_cursor": None}
+
     async def _get_search_page_uncached(self, query, max_results=40, cursor=None):
         """Use indexed Mongo candidates followed by fuzzy title ranking."""
+        if not getattr(self, "_search_tokens_complete", True):
+            return await self._legacy_search_page(query, max_results, cursor)
         if isinstance(query, list):
             token_groups = [search_tokens_for_name(str(item))[:12] for item in query if str(item).strip()]
             results, next_cursor = await self._indexed_token_search(

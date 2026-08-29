@@ -280,19 +280,20 @@ async def test_strict_search_uses_an_exact_index_token():
 
 
 @pytest.mark.asyncio
-async def test_legacy_regex_fallback_is_not_used_by_user_search():
+async def test_legacy_rows_use_bounded_compatibility_search():
     database = bare_database()
     database._search_tokens_complete = False
-    database._legacy_search_results = AsyncMock()
-    database._indexed_token_search = AsyncMock(return_value=([
-        {"file_id": "indexed", "file_name": "Aavesham 2024 Malayalam"}
-    ], None))
+    database._legacy_search_page = AsyncMock(return_value={
+        "results": [{"file_id": "legacy", "file_name": "Aavesham 2024 Malayalam"}],
+        "next_cursor": None,
+    })
+    database._indexed_token_search = AsyncMock()
 
     results = await database.get_search_results("aavesham 2024")
 
-    assert [doc["file_id"] for doc in results] == ["indexed"]
-    database._legacy_search_results.assert_not_awaited()
-    database._indexed_token_search.assert_awaited_once()
+    assert [doc["file_id"] for doc in results] == ["legacy"]
+    database._legacy_search_page.assert_awaited_once()
+    database._indexed_token_search.assert_not_awaited()
 
 
 @pytest.mark.asyncio
