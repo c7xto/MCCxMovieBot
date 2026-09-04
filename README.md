@@ -19,6 +19,10 @@ Fast Telegram movie and series search for the Malayalam Cinema Club.
 - Scans the existing library for exact and probable duplicates without deleting anything.
 - Provides a Telegram-native control center for files, groups, channels, access gates, analytics and health.
 - Tracks missing requests and automatically notifies users when matching files arrive.
+- Automatically indexes new storage-channel uploads and keeps one poster post per movie or series season. Later variants quietly update that post.
+
+For setup and private previews, see [Automatic Library](docs/AUTOMATIC_LIBRARY.md).
+Public release posts start paused; automatic indexing does not depend on enabling them.
 
 Premium plans and web streaming are deliberately outside this project's current scope.
 

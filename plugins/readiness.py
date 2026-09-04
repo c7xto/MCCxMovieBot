@@ -36,6 +36,13 @@ def is_ready() -> bool:
 
 @Client.on_message(filters.all, group=-10_000)
 async def readiness_message_gate(client: Client, message: Message):
+    from plugins.live_library import capture_source_message
+
+    if await capture_source_message(client, message):
+        # Durable source receipt precedes readiness and 120-second dedupe.
+        # Never send startup prompts or ordinary responses into the library.
+        message.stop_propagation()
+        return
     if is_ready():
         claimed = await redis_state.claim_once(
             "telegram-update-message", f"{message.chat.id}:{message.id}", 120

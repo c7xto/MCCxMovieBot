@@ -4752,12 +4752,13 @@ class Database:
             delay_seconds,
         )
 
-    async def claim_due_notification(self, lease_seconds=300):
+    async def claim_due_notification(self, lease_seconds=300, kind=None):
         if self.announcement_col is None:
             return None
         now = time.time()
         return await self.announcement_col.find_one_and_update(
             {
+                **({"kind": kind} if kind else {}),
                 "due_at": {"$lte": now},
                 "$or": [
                     {"locked_until": {"$exists": False}},

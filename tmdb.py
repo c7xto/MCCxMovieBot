@@ -22,21 +22,21 @@ _CACHE_TTL     = 24 * 3600  # 24h
 _cache = OrderedDict()  # normalized_query -> (cached_at, result_or_None)
 _session = None
 _session_lock = asyncio.Lock()
-_legacy_key_warning_emitted = False
 
 
 def _bearer_token():
-    global _legacy_key_warning_emitted
-    token = os.getenv("TMDB_BEARER_TOKEN") or os.getenv("TMDB_API_READ_TOKEN")
-    if token:
-        return token
-    legacy = os.getenv("TMDB_API_KEY")
-    if legacy and not _legacy_key_warning_emitted:
-        logger.warning(
-            "TMDB_API_KEY is deprecated; set TMDB_BEARER_TOKEN to an API Read Access Token"
-        )
-        _legacy_key_warning_emitted = True
-    return legacy
+    return os.getenv("TMDB_BEARER_TOKEN") or os.getenv("TMDB_API_READ_TOKEN")
+
+
+def tmdb_configured():
+    return bool(_bearer_token() or os.getenv("TMDB_API_KEY"))
+
+
+def _request_params(params=None):
+    result = dict(params or {})
+    if not _bearer_token() and os.getenv("TMDB_API_KEY"):
+        result["api_key"] = os.environ["TMDB_API_KEY"]
+    return result
 
 
 async def start_tmdb_client():
@@ -48,7 +48,7 @@ async def start_tmdb_client():
         if _session is not None and not _session.closed:
             return _session
         token = _bearer_token()
-        if not token:
+        if not tmdb_configured():
             return None
         connector = aiohttp.TCPConnector(
             limit=10,
@@ -65,10 +65,9 @@ async def start_tmdb_client():
         _session = aiohttp.ClientSession(
             connector=connector,
             timeout=timeout,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/json",
-            },
+            headers={"Accept": "application/json", **(
+                {"Authorization": f"Bearer {token}"} if token else {}
+            )},
             raise_for_status=False,
         )
         return _session
@@ -121,15 +120,87 @@ async def _fetch_movie_data(query):
     a real match and a confirmed no-results response."""
     session = await start_tmdb_client()
     if session is None:
-        logger.warning("⚠️ TMDB Error: bearer token is missing from .env!")
+        logger.warning("⚠️ TMDB Error: API key or access token is missing from .env!")
         return False, None
+    return await _fetch_legacy_multi(session, query)
 
+
+async def release_metadata(parsed, *, confirmed_id=None):
+    """Type-aware metadata; ambiguity is distinct from an API outage.
+
+    Return None only for an actual no-match. Transport/configuration failures
+    raise so the durable resolver retries instead of caching a false absence.
+    """
+    from plugins.release_identity import choose_match
+
+    cache_key = ("release", parsed["identity"], confirmed_id,
+                 parsed.get("season"), tuple(parsed.get("episodes", [])))
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached[0]
+
+    session = await start_tmdb_client()
+    if session is None:
+        raise RuntimeError("TMDB API key or access token is not configured")
+
+    async def fetch(path, params=None):
+        try:
+            async with session.get(
+                f"https://api.themoviedb.org/3/{path}", params=_request_params(params)
+            ) as response:
+                if response.status == 404:
+                    return None
+                if response.status != 200:
+                    raise RuntimeError(f"TMDB returned HTTP {response.status}")
+                return await response.json()
+        except (aiohttp.ClientError, TimeoutError) as error:
+            # HTTP exceptions can include the credential-bearing request URL.
+            raise RuntimeError(f"TMDB request failed ({type(error).__name__})") from None
+
+    kind = parsed["kind"]
+    if kind == "tv" and parsed.get("season") is None:
+        return None
+    if confirmed_id is None:
+        params = {"query": parsed["title"], "include_adult": "false"}
+        if kind == "movie" and parsed.get("year"):
+            params["year"] = parsed["year"]
+        data = await fetch(f"search/{kind}", params)
+        # Refuse partial result sets: a later page could contain a remake.
+        if not data or data.get("total_pages", 1) > 1:
+            return None
+        match = choose_match(parsed, data.get("results", []))
+        if not match:
+            return None
+        confirmed_id = match["id"]
+    detail = await fetch(f"{kind}/{int(confirmed_id)}")
+    if not detail:
+        return None
+    season_data = {}
+    if kind == "tv":
+        season_data = await fetch(f"tv/{int(confirmed_id)}/season/{parsed['season']}")
+        if not season_data:
+            return None
+        known = {item["episode_number"] for item in season_data.get("episodes", [])}
+        if any(number not in known for number in parsed.get("episodes", [])):
+            return None
+    poster = season_data.get("poster_path") or detail.get("poster_path")
+    result = {"id": int(confirmed_id), "kind": kind,
+            "title": detail.get("title") or detail.get("name"),
+            "year": (detail.get("release_date") or detail.get("first_air_date") or "")[:4],
+            "poster": f"https://image.tmdb.org/t/p/w500{poster}" if poster else None,
+            "overview": season_data.get("overview") or detail.get("overview", ""),
+            "genres": [genre["name"] for genre in detail.get("genres", [])],
+            "rating": float(detail.get("vote_average") or 0)}
+    _cache_set(cache_key, result)
+    return result
+
+async def _fetch_legacy_multi(session, query):
     url = "https://api.themoviedb.org/3/search/multi"
 
     try:
         async with session.get(
             url,
-            params={"query": query, "include_adult": "false"},
+            params=_request_params({"query": query, "include_adult": "false"}),
         ) as response:
             if response.status != 200:
                 logger.warning("⚠️ TMDB Error: API returned status %s", response.status)

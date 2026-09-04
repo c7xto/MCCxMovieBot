@@ -896,6 +896,8 @@ async def _render_results_view(client, message, session_id: str, page: int, data
     query = data["query"]
     total = len(results)
     buttons, page, total_pages = _build_result_buttons(results, session_id, page)
+    if data.get("release_after") and page == total_pages - 1:
+        buttons.append([InlineKeyboardButton("More files", callback_data=f"relmore#{session_id}")])
     caption = _build_results_caption(query, total, page, total_pages, data.get("first_name", ""))
     markup = InlineKeyboardMarkup(buttons)
 
@@ -1137,6 +1139,26 @@ async def handle_pagination(client: Client, callback: CallbackQuery):
         client, callback.message, session_id, page, data, user_id=callback.from_user.id
     )
     await answer_callback_safely(callback)
+
+
+@Client.on_callback_query(filters.regex(r"^relmore#"))
+@interactive_callback("release_pagination")
+async def handle_release_more(client, callback):
+    if not (await enforce_user_action(callback, "search_navigation")).allowed:
+        return
+    session_id = callback.data.split("#", 1)[1]
+    data = await db.get_search(session_id)
+    if not data or data.get("user_id") != callback.from_user.id:
+        return await answer_callback_safely(callback, "Open the release link again.", show_alert=True)
+    if not data.get("release_after"):
+        return
+    from plugins.live_library import release_file_page
+
+    async with search_slot("release_pagination"):
+        results, cursor = await release_file_page(data["release_key"], data["release_after"])
+    data.update(results=results, release_after=cursor, time=time.time())
+    await db.save_search(session_id, data)
+    await _render_results_view(client, callback.message, session_id, 0, data)
 
 
 @Client.on_callback_query(filters.regex(r"^expandseries#"))

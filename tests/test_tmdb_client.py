@@ -46,7 +46,7 @@ class FakeSession:
 class TmdbClientTests(unittest.TestCase):
     def setUp(self):
         tmdb._session = None
-        tmdb._legacy_key_warning_emitted = False
+        tmdb._cache.clear()
 
     def tearDown(self):
         if tmdb._session is not None:
@@ -95,6 +95,34 @@ class TmdbClientTests(unittest.TestCase):
         tmdb_source = (ROOT / "tmdb.py").read_text(encoding="utf-8")
         self.assertNotIn("?api_key=", tmdb_source)
         self.assertEqual(tmdb_source.count("aiohttp.ClientSession("), 1)
+
+    def test_v3_api_key_uses_params_without_bearer_header(self):
+        with (
+            patch.dict(os.environ, {"TMDB_API_KEY": "test-key"}, clear=True),
+            patch.object(tmdb.aiohttp, "TCPConnector", return_value=object()),
+            patch.object(tmdb.aiohttp, "ClientTimeout", return_value=object()),
+            patch.object(tmdb.aiohttp, "ClientSession", side_effect=FakeSession),
+        ):
+            self.assertTrue(tmdb.tmdb_configured())
+            session = asyncio.run(tmdb.start_tmdb_client())
+            self.assertNotIn("Authorization", session.kwargs["headers"])
+            ok, _ = asyncio.run(tmdb._fetch_movie_data("Alien"))
+            self.assertTrue(ok)
+            self.assertEqual(session.requests[0][1]["params"]["api_key"], "test-key")
+            original = {"year": "1979"}
+            self.assertEqual(tmdb._request_params(original), {"year": "1979", "api_key": "test-key"})
+            self.assertEqual(original, {"year": "1979"})
+
+    def test_bearer_takes_precedence_over_v3_key(self):
+        with patch.dict(os.environ, {
+            "TMDB_BEARER_TOKEN": "read-token", "TMDB_API_KEY": "test-key",
+        }, clear=True):
+            self.assertEqual(tmdb._request_params({"query": "Alien"}), {"query": "Alien"})
+
+    def test_no_credentials_means_not_configured(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(tmdb.tmdb_configured())
+            self.assertIsNone(asyncio.run(tmdb.start_tmdb_client()))
 
 
 if __name__ == "__main__":

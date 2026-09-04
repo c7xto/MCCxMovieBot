@@ -250,6 +250,12 @@ class AutoFilterBot(Client):
         except RequiredIndexError:
             raise
 
+        from plugins.live_library import store, source_ids
+
+        await store().ensure_indexes()
+        for source in source_ids(await db.get_config()):
+            await store().watch(source)
+
         if await db.registry_needs_migration():
             raise RuntimeError(
                 "Existing movie files were found but file_registry is empty. "
@@ -305,9 +311,15 @@ class AutoFilterBot(Client):
             from plugins.bulk_indexer import run_indexer_worker
 
             supervisor.spawn(run_indexer_worker(self), key="worker:indexer", owner=SERVICE_ROLE)
+            from plugins.live_library import run_live_indexer
+
+            supervisor.spawn(run_live_indexer(self), key="worker:live-indexer", owner=SERVICE_ROLE)
             logger.info("✅ Durable indexer worker started.")
         if SERVICE_ROLE in {"all-in-one", "worker-maintenance"}:
             from plugins.realtime_indexer import run_notification_worker
+            from plugins.live_library import run_release_worker
+
+            supervisor.spawn(run_release_worker(self), key="worker:smart-releases", owner=SERVICE_ROLE)
 
             supervisor.spawn(
                 db.ensure_search_catalog(),

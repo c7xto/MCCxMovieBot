@@ -187,7 +187,7 @@ async def _show_workload_rejection(client, status_msg, message):
     return await status_msg.edit_text(message)
 
 
-async def _execute_search(client, status_msg, query: str, config: dict, user_id=None, first_name=""):
+async def _execute_search(client, status_msg, query: str, config: dict, user_id=None, first_name="", release_key=None):
     """Runs a search and renders page 0 of results into status_msg.
     Shared by every /start deep-link search entry point (search_, req_
     fulfillment redirects, etc.) so they stay in sync with one implementation.
@@ -211,7 +211,13 @@ async def _execute_search(client, status_msg, query: str, config: dict, user_id=
 
     try:
         async with search_slot("start_search"):
-            results = await db.get_search_results(query)
+            release_after = None
+            if release_key:
+                from plugins.live_library import release_file_page
+
+                results, release_after = await release_file_page(release_key)
+            else:
+                results = await db.get_search_results(query)
     except WorkloadRejected as exc:
         return await _show_workload_rejection(client, status_msg, exc.public_message)
 
@@ -253,6 +259,8 @@ async def _execute_search(client, status_msg, query: str, config: dict, user_id=
         "auto_delete_time": int(config.get("auto_delete_time", 300)),
         "user_id": user_id,
         "first_name": first_name or "",
+        "release_key": release_key,
+        "release_after": release_after,
     }
     await db.save_search(session_id, session_data)
     return await route_menu(client, status_msg, session_id, 0)
@@ -380,7 +388,23 @@ async def start_handler(client: Client, message: Message):
     # 3. Deep-link dispatch — one clearly separated handler per payload type.
     if len(message.command) > 1:
         payload = message.command[1]
-        if payload.startswith("file_"):
+        if payload.startswith("release_"):
+            from plugins.live_library import store
+
+            key = payload.removeprefix("release_")
+            post = await store().posts.find_one({"_id": key}) if len(key) == 32 else None
+            if not post:
+                return await message.reply_text("This release is not available. Please search by title.")
+            meta = post["metadata"]
+            query = f"{meta['title']} {meta.get('year', '')}".strip()
+            if post.get("season") is not None:
+                query += f" S{post['season']:02d}"
+            indicator = await show_search_indicator(client, message.chat.id)
+            return await _execute_search(client, indicator, query, config,
+                                         user_id=message.from_user.id,
+                                         first_name=message.from_user.first_name,
+                                         release_key=key)
+        elif payload.startswith("file_"):
             file_payload = payload.split("file_", 1)[1]
             delete_override = None
             if "_d" in file_payload:

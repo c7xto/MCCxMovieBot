@@ -118,7 +118,9 @@ class TelegramRetryTests(unittest.TestCase):
         self.assertIn("policy=DELIVERY_RETRY", shared_delivery)
         realtime = (ROOT / "plugins/realtime_indexer.py").read_text(encoding="utf-8")
         self.assertNotIn("asyncio.Queue", realtime)
-        self.assertIn("enqueue_announcement", realtime)
+        live = (ROOT / "plugins" / "live_library.py").read_text(encoding="utf-8")
+        self.assertIn("enqueue_candidate", live)
+        self.assertNotIn("recent-announcement", realtime)
 
 
 if __name__ == "__main__":

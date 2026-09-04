@@ -261,6 +261,7 @@ async def show_releases_channel_menu(client: Client, callback: CallbackQuery):
         [
             [InlineKeyboardButton("✏ Set Channel", callback_data="edit_releaseschannel")],
             [InlineKeyboardButton("✕ Clear Channel", callback_data="releases_channel_clear")],
+            [InlineKeyboardButton("Automatic Library", callback_data="live_status")],
             [InlineKeyboardButton("‹ Preferences", callback_data="admin_cat_settings")],
         ]
     )
@@ -270,7 +271,7 @@ async def show_releases_channel_menu(client: Client, callback: CallbackQuery):
 @Client.on_callback_query(filters.regex(r"^releases_channel_clear$") & filters.user(ADMIN_ID))
 async def clear_releases_channel(client: Client, callback: CallbackQuery):
     await answer_callback_safely(callback, "New Releases channel cleared")
-    await db.update_config_fields({"update_channel_id": 0, "update_channel": ""})
+    await db.update_config_fields({"update_channel_id": 0, "update_channel": "", "release_posts_enabled": False})
     await show_releases_channel_menu(client, callback)
 
 
@@ -815,6 +816,7 @@ async def show_db_chan_menu(client: Client, callback: CallbackQuery):
                 InlineKeyboardButton("➕ Add Channel", callback_data="edit_adddb"),
                 InlineKeyboardButton("➖ Remove Channel", callback_data="edit_remdb"),
             ],
+            [InlineKeyboardButton("Live indexing & posts", callback_data="live_status")],
             [InlineKeyboardButton("‹ Control Center", callback_data="back_to_admin")],
         ]
     )
@@ -918,6 +920,8 @@ async def catch_admin_input(client: Client, message: Message):
                 {
                     "update_channel_id": verified.chat_id,
                     "update_channel": verified.link,
+                    "release_posts_enabled": False,
+                    "release_preview_destination": 0,
                 }
             )
             await respond(
@@ -938,17 +942,21 @@ async def catch_admin_input(client: Client, message: Message):
 
     elif state == "adddb":
         try:
-            ch_val = int(message.text.strip())
-            await client.get_chat(ch_val)
+            from plugins.live_library import store, validate_source
+
+            ch_val = await resolve_channel_id(client, message.text.strip())
+            await validate_source(client, ch_val)
             await db.add_db_channel(ch_val)
+            await store().watch(ch_val)
             await respond(
                 f"✅ **Database Channel `{ch_val}` Added!**\n"
                 f"Any movie uploaded there will now be auto-indexed.",
                 reply_markup=_BACK_BTN,
             )
-        except ValueError:
+        except ValueError as error:
             await respond(
-                "❌ **Invalid Channel ID**\n\nSend a number like `-100123456789`.",
+                f"❌ <b>Source Channel Not Added</b>\n\n{_html(str(error))}",
+                parse_mode=ParseMode.HTML,
                 reply_markup=_BACK_BTN,
             )
         except Exception as error:
